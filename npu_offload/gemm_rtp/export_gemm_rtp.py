@@ -201,8 +201,6 @@ def markers_for(shape, m, k, n, c_dtype="f32", a_dtype="bf16"):
 
 def find_cache(markers, cols, what):
     hits = []
-    # Fresh machines have no ~/.npu/cache yet; treat as "no candidates"
-    # rather than crashing (same outcome as an empty cache dir below).
     if not CACHE.is_dir():
         raise SystemExit(f"{what}: 0 cache candidates after purge -- "
                          f"expected exactly 1")
@@ -225,7 +223,6 @@ def find_cache(markers, cols, what):
 
 def purge(markers, cols, what):
     n = 0
-    # First run on a fresh machine: the cache dir does not exist yet.
     CACHE.mkdir(parents=True, exist_ok=True)
     for d in list(CACHE.iterdir()):
         mlir = d / "aie.mlir"
