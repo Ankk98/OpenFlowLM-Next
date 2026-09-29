@@ -1,11 +1,12 @@
 # Plan: Laya on NPU2 — the `scored_slot` readout
 
 **Status:** designed 2026-09-29. Nothing built, nothing run.
-**Spec impact:** five new requirements —
-`OPEN-NPUE-MODERNBERT` (arch=4 encoder), `OPEN-DECISION-READOUT` (the plan/answer
-layer), `OPEN-DECISION-SYSTEMONE` (the wire schema), `OPEN-DECISION-HEAD`
-(the decision head), `OPEN-DECISION-ACCURACY` (the gate). These are **declared
-here and written into `specs/open-engine/spec.md` in Phase 0**; no existing
+**Spec impact:** five new requirements, **whose verbatim text is in this plan**
+under "New requirements": `OPEN-ENC-MODERNBERT` (arch=4 encoder),
+`OPEN-DECISION-SYSTEMONE` (the wire schema), `OPEN-DECISION-READOUT` (the
+plan/answer layer), `OPEN-DECISION-HEAD` (the decision head),
+`OPEN-DECISION-ACCURACY` (the gate). They are appended to
+`specs/open-engine/spec.md` in Phase 0, before its last requirement; no existing
 requirement changes.
 **Research:** `docs/plans/laya_npu2_research.md`. Read it first — it carries the
 architecture, the tile arithmetic, the twelve traps, and the counter-evidence.
@@ -24,7 +25,7 @@ model of this class drops in without an API change:
 enum decision_readout {
   DECISION_READOUT_LETTER_SLOT,  // causal; distribution over label tokens   [not implemented]
   DECISION_READOUT_MASKED_SLOT,  // bidirectional; distribution at a mask    [not implemented]
-  DECISION_READOUT_SCORED_SLOT,  // bidirectional; one NUMBER per option    [PHASE 6-7]  <- Laya
+  DECISION_READOUT_SCORED_SLOT,  // bidirectional; one NUMBER per option    [PHASE 1, 7]  <- Laya
   DECISION_READOUT_RANK_HEAD,    // classification head on a pooled vector  [not implemented]
 };
 ```
@@ -50,14 +51,14 @@ parity against a replica making the same mistake."
 Vendor `_schemas/models.py` (and nothing else — the transport, the retries and
 the Pydantic plumbing are not the contract) under
 `specs/open-engine/plans/typesafe-systemone-0ffd094c.py`, with the commit in the
-header. Phase 6's golden fixture is generated from that file. An unpinned
+header. Phase 1's golden fixture is generated from that file. An unpinned
 upstream path is not a fixture.
 
 **Request** — `SystemOneRequest`:
 
 | field | type | required | notes |
 |---|---|---|---|
-| `state` | `string \| object \| array` | **yes** | Phase 1 ships the string form; structured is `not_implemented` |
+| `state` | `string \| object \| array` | **yes** | the string form ships (Phases 1 and 7); structured is `not_implemented` |
 | `model` | `string` | **yes** | the model tag; a *different* tag from the loaded one is refused, not served |
 | `questions` | `map<string, Question>` | **yes**, `minProperties: 1` | caller-chosen keys; the key is never sent to the model and is not used in inference |
 
@@ -97,7 +98,7 @@ Two serialisation details that "byte-for-byte" turns on:
   does not.
 
 **Bounds the ecosystem actually imposes** (llmgateway's `/v1/systemone`
-reference, 2026-09-20 — confirm both against the vendored `models.py` in Phase 6
+reference, 2026-09-20 — confirm both against the vendored `models.py` in Phase 1
 and let the vendored file win if they differ): `choice` takes **1–255** options,
 `score` takes **2–10** ordered levels. The 255 is the same number Laya's
 `k / 255.0` act feature is calibrated against (`laya/common.py:346`), which is a
@@ -123,10 +124,45 @@ These are settled. An implementer does not re-open them.
 | 3 | **`laya-multilingual` only.** | One RoPE base (160000 for both layer types), `tile_n=48` matches shipping families, default 1024 ctx. English is deferred — it forces `tile_n=16` and two thetas for no proof-of-surface. |
 | 4 | **Head on the host.** | It is 8 GEMMs against the encoder's 88, and running it on the array in the same process is not implementable against today's `Encoder` — see "Why the head runs on the host". |
 | 5 | **Dedicated process, no co-residency.** | `ShapeLease` makes the engine geometry process-wide, and two resident `hw_context` objects is explicitly unmeasured in this repo. |
-| 6 | **Extend `open_npue`; add `AutoDecisionModel` as a sibling seam.** | `SYNCED.md` says edit upstream, not the synced copy. The abstraction that needs a new interface is the *app* seam, not the engine. |
+| 6 | **Extend `open_npue` upstream; add `AutoDecisionModel` as a sibling seam.** | `SYNCED.md` says edit upstream, not the synced copy — see "Where the work happens", because Phases 2, 3, 5, 6 and 7 all land inside that synced directory. The abstraction that needs a new interface is the *app* seam, not the engine. |
 | 7 | **`oflm pull` from a `model_list.json` entry.** | Consistent with the six existing encoders. |
 | 8 | **S=1024, batch tiers 1,4,16,32,64.** | Laya's own default `max_len`. Tiers capped at 64 because host attention materialises `batch x heads x S^2 x 4` = 3.2 GB at 64. |
 | 9 | **Performance is a separate project.** | Build for correctness. `tile_n` and the pad-vs-16 trade-off are re-opened only after this ships. |
+
+## Where the work happens
+
+**Phases 2, 3, 5, 6 and 7 land inside `src/open_npue/`, which is a synced copy.**
+`src/open_npue/SYNCED.md:1-6` is unambiguous: *"This directory is a **copy**,
+written by `tools/sync_openflowlm.py` in
+[NpuEmbeddings](https://github.com/vegardberget/NpuEmbeddings). Edit it there,
+not here: the accuracy gates that make these numbers mean anything live in that
+repository, and a local edit here silently detaches this code from them."* The
+directory also carries a per-file sha256 table that a local edit invalidates, and
+upstream is Apache-2.0 while this copy is relicensed MIT — so a local edit is also
+a licensing question, not only a hygiene one.
+
+Two consequences for this plan:
+
+- **Do the work upstream, in `vegardberget/NpuEmbeddings`, then re-sync.** This
+  document describes the change; it is not the site of the change. `tools/
+  sync_openflowlm.py` is **not in this tree** — it lives upstream — so the sync is
+  a clone-and-run, not a build target here. Phase 9 item 6's note that T43/T44
+  upstream are "the same work seen from upstream" is the same fact: this
+  architecture is already being built there, and the right move is to add to that
+  work rather than to fork it.
+- **Fork-owned files are the exception and they are already named.**
+  `src/open_npue_adapter/npue_embedding.cpp` is listed in `OPEN_NPUE_SOURCES`
+  with the comment "Fork-owned, not synced: the ONLY translation unit that
+  includes the engine's header" (`src/CMakeLists.txt:344-348`). The subdirectory
+  keys in Phase 3 and the `1_Pooling/config.json` shim in Phase 9 go **there**,
+  and can land without an upstream round-trip. Likewise `npu_offload/gemm_rtp/`,
+  `src/server/`, `src/common/`, `src/include/` and `utilities/` are this tree's
+  own.
+
+If an upstream round-trip is not possible, say so in the phase report and record
+which files were edited locally — silently detaching a synced directory is the one
+outcome `SYNCED.md` exists to prevent, and the only way to prevent it here is to
+write down when it happened.
 
 ## Why the head runs on the host
 
@@ -135,7 +171,7 @@ because it is true: its four GEMMs are `(768,2304) (768,768) (768,3072)
 (3072,768)` and `design_fits(768, 3072, gated=false, qkv_n=2304)` returns true
 against `BERT-h768-bfp16`, so **an NPU head would need no new xclbin**. It is
 still not the right first shape, because "no new xclbin" is not "no new work",
-and four things stand in the way that no amount of care in Phases 2 or 3
+and four things stand in the way that no amount of care in Phases 3 or 3
 addresses:
 
 1. **`g_ffn`, `g_layers` and `g_seq` are process-wide, written once.**
@@ -343,7 +379,7 @@ Python's `json.dumps` exactly, including:
 - `ensure_ascii=False` — non-ASCII is emitted raw, not `\uXXXX`-escaped.
 - `default=str` for non-JSON-native values.
 
-Phase 6/7 ships the `state: string` path, and that path's gate is the string path
+Phase 7 ships the `state: string` path, and that path's gate is the string path
 only. The structured path is a follow-on and is **not** required to ship.
 
 ## Tokenizer — the gating dependency
@@ -392,7 +428,17 @@ Three consequences that will silently corrupt every answer if missed:
 Each phase has an exit gate that can fail. Do not start a phase until the
 previous gate passes.
 
-## Phase 0 — Fail closed on an unrecognised or absent `model_type`
+## Phase 0 — Fail closed on an unrecognised `model_type`
+
+**This is two separable things and the plan keeps them separable.** Part (a) is
+a 25-line fail-closed guard in the packer. Part (b) is the five requirement
+blocks from "New requirements", appended to `specs/open-engine/spec.md`. They
+share a number because they share a morning, not because one depends on the
+other: **(a) can and should land on its own**, and if the spec text is still being
+argued about, that is not a reason to hold the guard back. The gate below is for
+(a); (b) is reviewed as prose.
+
+### Part (a) — the guard
 
 **Problem.** `prepare_model_auto` resolves the architecture from one line:
 
@@ -450,19 +496,177 @@ if (model_type == "modernbert") {
 }
 ```
 
-The subdirectory problem is Phase 2's, and it needs a key. See "Workload
+The subdirectory problem is Phase 3's, and it needs a key. See "Workload
 handling" there. It is named in the message because the two failures are the
 same user-visible symptom.
 
-**Gate.** Packing any checkpoint with no root `config.json` raises an error
+**Gate (a).** Packing any checkpoint with no root `config.json` raises an error
 naming that path; packing one with `model_type: "modernbert"` raises an error
 naming `model_type`. `all-minilm`, `bge-*`, `nomic`, `gte`, `embeddinggemma`
 all still pack and still produce **byte-identical** containers — the guard only
 touches inputs that already failed. Re-run `utilities/test_open_npue.ps1`: six
-cases (`:51-58`), all six must pass.
+cases (`:51-58`), all six must pass. That script needs PowerShell, which is not
+installed on a Linux dev host; on Linux, run `export_gemm_rtp.py`'s pack path
+directly and diff the container against a known-good one, or defer (a) to a host
+with `pwsh`. **Do not skip the gate by asserting it.**
 
+### Part (b) — the spec text
 
-## Phase 1 — Tokenizer: Metaspace byte-BPE
+Append the five blocks from "New requirements" to
+`specs/open-engine/spec.md`, after `OPEN-DECODE-PIPELINE` and before the
+`## What it cannot reach.` closer, in the order arch, wire, readout, head,
+accuracy. Copy them verbatim — the `**Applies to:**` file lists and the
+`**Tests:**` paths are the parts a reviewer checks against reality, so an
+approximate path is a defect, not a typo.
+
+**Gate (b).** For each of the five: the ID is unique in the file; the block has
+all three metadata lines in the file's order; every path in `**Applies to:**`
+and `**Tests:**` exists or is named in this plan's file manifest; and the five
+`**Tests:**` files exist under `specs/open-engine/tests/`, each opening with
+`# Traces: <its IDs> (canonical spec: specs/open-engine/spec.md)`. That last one
+is a real gate, not a formality: the file's convention is that a requirement is
+reachable from a test, and a requirement whose test does not exist is a
+statement nobody can check.
+
+## Phase 1 — The readout and plan layer (pure host, no NPU)
+
+**This phase needs no NPU, no model, and no hardware, and that is why it is
+numbered 1.** It is pure data transformation, and it carries the plan's largest
+stated unknown — whether the wire format is right. Every later phase is
+mechanical by comparison, and the phases that can fail expensively — packer,
+design set, hardware — all come after it, so the cheapest thing that can be
+wrong is found first.
+
+**New:** `src/include/AutoDecisionModel/decision_types.hpp` and
+`src/common/AutoDecisionModel/decision_types.cpp`.
+
+```cpp
+enum decision_readout { DECISION_READOUT_LETTER_SLOT, DECISION_READOUT_MASKED_SLOT,
+                        DECISION_READOUT_SCORED_SLOT, DECISION_READOUT_RANK_HEAD };
+enum decision_kind    { DECISION_KIND_NOUL, DECISION_KIND_CHOICE, DECISION_KIND_SCORE };
+
+struct decision_question {
+  decision_kind kind = DECISION_KIND_NOUL;
+  std::string   key;           // caller-chosen name; the response is keyed by it
+  std::string   instructions;  // empty is legal
+  // choice: (label, description) in the caller's order, description may be empty
+  //        -- this is upstream's `crit` dict for a choice.
+  // score:  the ordered levels, index 0 == 0. Order IS the scale.
+  // noul:   two entries, always in semantic order [false, true], description
+  //        optional and independently defaulted per side.
+  std::vector<std::pair<std::string,std::string>> options;
+  // noul ONLY. The caller's own false/true wording. Empty means "use
+  // _DEFAULT_NOUL_LABELS". Supplying it for choice or score is an error, because
+  // upstream raises ValueError on exactly that.
+  std::vector<std::string> noul_labels;   // 0, or 2, or an error
+};
+
+struct decision_answer {
+  decision_kind kind;
+  float              noul;        // noul only
+  std::string        choice;      // choice only: the argmax label
+  float              score;       // score only: sum(i * p_i)
+  // Length is k, this row's marker count -- NOT the batch's kmax, and NOT the
+  // number of options if the head budget truncated one. Serialised as
+  // {label: p} for choice (keyed off `options`) and {index: p} for score.
+  std::vector<float> probabilities;
+  float              confidence = 0.f; // choice, score only. NEVER set for noul.
+  std::vector<float> logits;      // raw, length k
+};
+```
+
+**Rules, all enforced with a named error:**
+
+- `noul` has **no** `confidence` field in the response. (`1 - H(p)/ln 2`
+  degenerates to 1.0, so it would be a constant lie.) Serialising it is an error.
+- `choice`/`score` require **≥ 2** options. `score` options are **ordered** and
+  the order is the scale, and the ecosystem caps `score` at **10** levels and
+  `choice` at **255** — refuse above those, by name, so a request the ecosystem
+  would reject is refused here rather than answered with a wrong-shaped body.
+- `choice` supports up to **255** options. Above that, refuse by name. The cap is
+  upstream's, not ours: the `act_head` feature vector carries `k / 255.0`
+  (`laya/common.py:346`), so `k` is calibrated against 255 and a 256th option
+  pushes that feature outside the range it was fitted on.
+- `noul` takes exactly 2 options and 0 or 2 `noul_labels`; anything else is an
+  error, matching `_resolve_noul_labels`'s `set(labels) != {"false","true"}`
+  check.
+- **Question order is semantic, and so is option order.** `nlohmann::json` is a
+  `std::map`, so it sorts keys alphabetically — which silently reorders the
+  questions in a request and, worse, a choice's options among themselves, where
+  order is the answer space. Use `nlohmann::ordered_json` for anything touching
+  the request or the response, and carry option order in an array, never in an
+  object.
+
+- An unknown `type` is **dropped with a warning, not fatal** — forward
+  compatibility is an explicit requirement of the SDK behaviour.
+- `output_tokens` is **always 0**. It is the definitional property of the class.
+- `state` as a list of content parts: refuse by name, `"'state' as a list of
+  content parts is not supported"`.
+
+**Confidence — a divergence, and the schema does not settle it.** Laya ships
+**two** confidences (`laya/common.py:470-496`): `answer_confidence = max(p[:k])`,
+which is the one temperature scaling is fitted to and the one every calibration
+figure upstream is computed on, and `confidence_from_probs = 1 - H(p)/ln k`,
+which its own docstring says "carries no such guarantee" and "must not be
+compared against the same threshold". Engines in this ecosystem differ: jev-rs
+describes its `confidence` as "TypeSafe's formula" without saying which, and
+llama.cpp #29321 emits the entropy form.
+
+**Neither does TypeSafe.** The vendored schema types `confidence` as a plain
+0–1 float with no formula; the SDK's field doc says only "how certain the model
+is in this answer". The *blog* says answers carry "calibrated probabilities and
+confidence scores" — which is a claim about the product, not a definition.
+
+So this is a real choice, and the plan makes it: **emit `max(p[:k])` after
+temperature**, because it is the calibrated quantity and because a
+`confidence` field that callers will threshold on should be the one that means
+what its name says. The raw `logits` and `probabilities` are both in the
+response, so a caller that wants the entropy form can compute it in one line.
+**Record the divergence in the README**, and record it in the container too —
+this is the single most likely place for a caller to find a number that differs
+from the hosted API's.
+
+**Temperature.** One value for the whole request — a per-question temperature is
+an error (`"one value for the whole request, not per question"`). **The
+TypeSafe request schema has no temperature field at all**: it is `{state, model,
+questions}`, so a per-question or ad-hoc temperature is not merely unsupported,
+it has nowhere to live on the wire. That is the real reason for the rule.
+
+Applied on the host after the forward pass, from the **container's**
+`temperature` and `temperature_by_options` (Phase 3), not from a file: the
+bucket key is `"%s:%s" % (QTYPE_NAMES[qtype], size)` with `size` in
+`2 / 3-5 / 6-10 / 11+` (`laya/common.py:499-501`), buckets take precedence over
+the per-qtype 3-vector, and the result is clamped to `[0.5, 5.0]`
+(`TEMP_MIN`/`TEMP_MAX`, `laya/common.py:508-509`). A bucket key that is not one
+of those four sizes is **ignored with a warning**, not an error: a new upstream
+bucket size should not take the model down.
+
+**`readout` derivation.** From the container, exactly as llama.cpp derives it
+from GGUF metadata: a `scored_slot` is an arch with a decision head, a marker
+token, and non-causal attention. A model whose `readout` is not
+`DECISION_READOUT_SCORED_SLOT` **refuses by name** when this build is asked to
+serve it.
+
+**Gate.** A golden JSON fixture — the request and the exact expected response,
+plus a synthetic logit tensor — round-trips **byte-for-byte**, with
+`ordered_json` preserving question and option order. Generate the expected
+response from the **vendored** `typesafe-systemone-0ffd094c.py`, including the
+envelope, and assert:
+
+- the full body is `{model, answers, usage}` — not the bare answers;
+- `usage.output_tokens` is `0` and `usage.input_tokens` is the request's;
+- `noul` → `{type, noul}` with **no** `confidence` key present at all;
+- `choice` → `{type, choice, confidence, probabilities:{label:p}}`;
+- `score` → `{type, score, confidence, legend:{"0":…}, probabilities:{"0":…}}`
+  with **string** index keys;
+- a request naming a different `model` is refused, and the refusal is not a
+  200 with somebody else's answers in it.
+
+Unit tests in `src/common/AutoDecisionModel/` for every refusal above, and one
+that re-reads the vendored file and fails if the fixture and the vendored models
+disagree — that is what stops the pin from going stale silently.
+
+## Phase 2 — Tokenizer: Metaspace byte-BPE
 
 **State.** `src/open_npue/tokenizer_bbpe.{hpp,cpp}` and
 `bbpe_tokenizer_gen.cpp` are written, generated, compiled and linked
@@ -541,7 +745,7 @@ the vocabulary, which `:298-314` requires.
    `modernbert_rope_geglu` before the packer exists would make Phase 0's guard
    unreachable in the one path that matters, because the guard is a *packer*-side
    refusal and the runtime-side list is a separate switch. The arch string is
-   registered in Phase 2, in the same change that adds the packer.
+   registered in Phase 3, in the same change that adds the packer.
 5. Tokenise **per segment with `add_special_tokens=false`**, specials inserted
    by hand. Never one pass over the assembled string, and never apply the
    blob's post-processor prefix/suffix.
@@ -559,8 +763,7 @@ git-lfs pointer for this file (verified), so a fixture generated from it is
 testing the pointer. The generated unicode tables are already measured against
 HF's splitter, so this is a wiring check, not a re-derivation.
 
-
-## Phase 2 — The packer
+## Phase 3 — The packer
 
 Model `prepare_model_gte` (`npue_pack.cpp:1516-1900`) — it is the only packer
 that carries a *computed* RoPE set, a prose half-order key, a zero-filled bias
@@ -583,7 +786,7 @@ void prepare_model_modernbert(const std::string &model_dir, const std::string &p
 `arch == "modernbert_rope_geglu"`. Both or neither: a container the packer can
 write but the runtime refuses is a wasted pack, and one the runtime accepts
 without a packer to produce it is the arch=0 fail-open this plan exists to close.
-Pass `max_seq = 1024`, which is what the Phase 3 design is compiled at and what
+Pass `max_seq = 1024`, which is what the Phase 4 design is compiled at and what
 `set_design_seq` will be handed (`:814-823`).
 
 **Workload handling — Laya nests its config, and nothing in the current code
@@ -688,15 +891,15 @@ Four notes on that list:
   `1e-12f`** in `layer_norm_cpu` (`npue_encoder.hpp:1685`) is a false claim in
   the container: it would say 1e-5 and compute 1e-12. Two choices, both
   acceptable, pick one and say which in the phase report: (a) emit
-  `layer_norm_eps: 1e-5` for provenance and add a Phase 4 note that the host
+  `layer_norm_eps: 1e-5` for provenance and add a Phase 5 note that the host
   norm uses 1e-12, or (b) make `layer_norm_cpu` read the container's value.
   (a) is what this plan assumes; the delta is ~5e-6 relative, far under the
-  bf16 operand's 8-bit mantissa, and Phase 4's gate is a bf16 comparison.
+  bf16 operand's 8-bit mantissa, and Phase 5's gate is a bf16 comparison.
 - **`rope_theta` is provenance, not the mechanism.** The checkpoint carries
   thetas as `rope_parameters.{full_attention,sliding_attention}.rope_theta`
   (both 160000, verified) — a *nested* key, so the packer must read it from
   there, not from a top-level `rope_theta` that does not exist in this config.
-  Phase 4 builds **one** table from it.
+  Phase 5 builds **one** table from it.
 - **`"pooling":"mean"` is a fiction and `l2_normalize:false` is the honest
   half.** Laya pools by `gather` at `marker_pos`, not mean and not CLS — see
   the research doc, and `laya/common.py:327-330`. `pool_rows` accepts only
@@ -850,7 +1053,7 @@ on K marker positions (≤20) rather than rows, so there is nothing to tile.
 
 **`not_implemented` — be honest, in prose, in the container.** Minimum entries:
 the 8192-token context against a seq=1024 design; `predict_long` windowing with
-50 % overlap; the structured-`state` JSON path (Phase 1 ships strings only);
+50 % overlap; the structured-`state` JSON path (Phase 7 ships strings only);
 the Laya `Router`'s language routing; the `truncate_left` and `option_order`
 arguments of `build_sequence`; that `pooling` says `mean` because the runtime
 accepts only `cls`/`mean` and this model gathers at `marker_pos`; that
@@ -866,17 +1069,16 @@ every shared field, (b) round-trips **every** emitted tensor through
 `apply_model_shape` + `encoder_implemented` all accept it and `g_layers=22,
 g_ffn=1152, g_max_positions=1024` come out. Gate (c) is the one that catches a
 misspelled config key, and it is cheap; add it rather than discovering the
-problem in Phase 4.
+problem in Phase 5.
 Note `tools/verify_pack_parity.py` lives upstream in `vegah/Npu-Embeddings` and
 is **not vendored here** — parity must be re-established, not assumed. The
-`b_layout_hash` half of (c) is deferred to Phase 3, because Phase 3 is what
+`b_layout_hash` half of (c) is deferred to Phase 4, because Phase 4 is what
 builds the design whose hash it is: `gemm_b_layout(64, 48)` is the same function
-for every `-n 48` family, so the container's `layout_hash` and Phase 3's
-`b_layout_hash` are the same value by construction, and Phase 3's gate is where
+for every `-n 48` family, so the container's `layout_hash` and Phase 4's
+`b_layout_hash` are the same value by construction, and Phase 4's gate is where
 that gets confirmed rather than assumed.
 
-
-## Phase 3 — The design family
+## Phase 4 — The design family
 
 Add **two** families to `npu_offload/gemm_rtp/families.json` — the datapath is
 decided by measurement in Phase 7, not by inheritance, and a decision you cannot
@@ -907,6 +1109,16 @@ exactly one flag, so a reviewer must be able to tell them apart at a glance in
 `design.json`. `--emulate-bfp16` is the field it compares (`:57-58`), so reusing
 one name for both would make the checker report the second build as a stale set
 of the first.
+
+**The second family is speculative and this plan says so, so nobody later
+mistakes it for a requirement.** A build is 3–4 minutes, so building both is
+cheap insurance against inheriting a datapath that fails its gate — but Phase 6's
+measurement can still invalidate the whole approach (if host attention dominates
+at S=1024, the design needs rethinking, not a different `emulate` flag). If that
+happens, **the losing family is deleted, not kept "just in case"**: a design set
+nobody selected is a maintenance cost and a future reader's puzzle. The gate that
+selects one is Phase 7's, and until it runs, `serves: []` on both is the honest
+state.
 
 **`--batches` must move out of `common` and into every family's `args`,** and
 this is a correctness requirement, not tidiness. A family cannot override
@@ -950,15 +1162,14 @@ the two above; the registry in `all_embedding_model.hpp:37-46` carries seven
 *tags* of which six are Npue — the seventh is `embed-gemma:300m`, which is served
 by `OpenGemma` and has no design family. Each new `design.json` carries
 `streams[]` for 4 shapes × 5 tiers = 20 entries, all four N values legal,
-`b_layout_hash` matching Phase 2's container, and `tile: 48`; and the two must
+`b_layout_hash` matching Phase 3's container, and `tile: 48`; and the two must
 differ in `emulate_bfp16` and be identical in every other checked field, which
 is the checker's own comparison doing the work. Re-run the existing five to prove
 the `common` edit was not missed by one of them.
 
 Which of the two the model actually *uses* is Phase 7's gate, not this one.
 
-
-## Phase 4 — Pre-LN encoder
+## Phase 5 — Pre-LN encoder
 
 **Shape.** `GemmaNpuEncoder::encode_batch` (`npue_encoder.hpp:3825-3887`) with
 norms 2 and 4 deleted and norm 1 unconditional except at layer 0.
@@ -1025,7 +1236,7 @@ post-LN residual copy, which is why `add_norm_*` has no place here):
 h = LN1(x)  -> hbuf                        (skip at L==0)
 qkv = GEMM(qkv, hbuf)
 rope(qkv)                                  (one theta)
-qk -> scores; band mask; softmax; av -> ctx  (band arrives in Phase 5; this
+qk -> scores; band mask; softmax; av -> ctx  (band arrives in Phase 6; this
                                                phase runs full attention)
 proj = GEMM(attn_out, ctx)
 x += proj                                  (no norm)
@@ -1049,7 +1260,7 @@ precedent is that 0.999 on `enc.out` is not reachable at 32-layer depth in
 bf16 (`specs/open-whisper/spec.md:45-49`). Report the replica's number and the
 engine's number side by side; fail only on a *gap*, not on an absolute value.
 
-## Phase 5 — Band mask, and the S=1024 measurement
+## Phase 6 — Band mask, and the S=1024 measurement
 
 Two edits, both small — **and both land in functions that arch=0 through 3 also
 call**, so both need a flag that is off by default. This is the sharpest edge in
@@ -1134,142 +1345,6 @@ and in this plan.
 **Gate.** The measurement exists and is written into the repo. **Phase 7 does
 not start without it.**
 
-## Phase 6 — The readout and plan layer (pure host, no NPU)
-
-**This phase needs no NPU, no model, and no hardware.** It is pure data
-transformation, and it is where the biggest unknown lives — whether the wire
-format is right. Build it first, gate it on a golden fixture, and the hardware
-phases afterwards are mechanical.
-
-**New:** `src/include/AutoDecisionModel/decision_types.hpp` and
-`src/common/AutoDecisionModel/decision_types.cpp`.
-
-```cpp
-enum decision_readout { DECISION_READOUT_LETTER_SLOT, DECISION_READOUT_MASKED_SLOT,
-                        DECISION_READOUT_SCORED_SLOT, DECISION_READOUT_RANK_HEAD };
-enum decision_kind    { DECISION_KIND_NOUL, DECISION_KIND_CHOICE, DECISION_KIND_SCORE };
-
-struct decision_question {
-  decision_kind kind = DECISION_KIND_NOUL;
-  std::string   key;           // caller-chosen name; the response is keyed by it
-  std::string   instructions;  // empty is legal
-  // choice: (label, description) in the caller's order, description may be empty
-  //        -- this is upstream's `crit` dict for a choice.
-  // score:  the ordered levels, index 0 == 0. Order IS the scale.
-  // noul:   two entries, always in semantic order [false, true], description
-  //        optional and independently defaulted per side.
-  std::vector<std::pair<std::string,std::string>> options;
-  // noul ONLY. The caller's own false/true wording. Empty means "use
-  // _DEFAULT_NOUL_LABELS". Supplying it for choice or score is an error, because
-  // upstream raises ValueError on exactly that.
-  std::vector<std::string> noul_labels;   // 0, or 2, or an error
-};
-
-struct decision_answer {
-  decision_kind kind;
-  float              noul;        // noul only
-  std::string        choice;      // choice only: the argmax label
-  float              score;       // score only: sum(i * p_i)
-  // Length is k, this row's marker count -- NOT the batch's kmax, and NOT the
-  // number of options if the head budget truncated one. Serialised as
-  // {label: p} for choice (keyed off `options`) and {index: p} for score.
-  std::vector<float> probabilities;
-  float              confidence = 0.f; // choice, score only. NEVER set for noul.
-  std::vector<float> logits;      // raw, length k
-};
-```
-
-**Rules, all enforced with a named error:**
-
-- `noul` has **no** `confidence` field in the response. (`1 - H(p)/ln 2`
-  degenerates to 1.0, so it would be a constant lie.) Serialising it is an error.
-- `choice`/`score` require **≥ 2** options. `score` options are **ordered** and
-  the order is the scale, and the ecosystem caps `score` at **10** levels and
-  `choice` at **255** — refuse above those, by name, so a request the ecosystem
-  would reject is refused here rather than answered with a wrong-shaped body.
-- `choice` supports up to **255** options. Above that, refuse by name. The cap is
-  upstream's, not ours: the `act_head` feature vector carries `k / 255.0`
-  (`laya/common.py:346`), so `k` is calibrated against 255 and a 256th option
-  pushes that feature outside the range it was fitted on.
-- `noul` takes exactly 2 options and 0 or 2 `noul_labels`; anything else is an
-  error, matching `_resolve_noul_labels`'s `set(labels) != {"false","true"}`
-  check.
-- **Question order is semantic, and so is option order.** `nlohmann::json` is a
-  `std::map`, so it sorts keys alphabetically — which silently reorders the
-  questions in a request and, worse, a choice's options among themselves, where
-  order is the answer space. Use `nlohmann::ordered_json` for anything touching
-  the request or the response, and carry option order in an array, never in an
-  object.
-
-- An unknown `type` is **dropped with a warning, not fatal** — forward
-  compatibility is an explicit requirement of the SDK behaviour.
-- `output_tokens` is **always 0**. It is the definitional property of the class.
-- `state` as a list of content parts: refuse by name, `"'state' as a list of
-  content parts is not supported"`.
-
-**Confidence — a divergence, and the schema does not settle it.** Laya ships
-**two** confidences (`laya/common.py:470-496`): `answer_confidence = max(p[:k])`,
-which is the one temperature scaling is fitted to and the one every calibration
-figure upstream is computed on, and `confidence_from_probs = 1 - H(p)/ln k`,
-which its own docstring says "carries no such guarantee" and "must not be
-compared against the same threshold". Engines in this ecosystem differ: jev-rs
-describes its `confidence` as "TypeSafe's formula" without saying which, and
-llama.cpp #29321 emits the entropy form.
-
-**Neither does TypeSafe.** The vendored schema types `confidence` as a plain
-0–1 float with no formula; the SDK's field doc says only "how certain the model
-is in this answer". The *blog* says answers carry "calibrated probabilities and
-confidence scores" — which is a claim about the product, not a definition.
-
-So this is a real choice, and the plan makes it: **emit `max(p[:k])` after
-temperature**, because it is the calibrated quantity and because a
-`confidence` field that callers will threshold on should be the one that means
-what its name says. The raw `logits` and `probabilities` are both in the
-response, so a caller that wants the entropy form can compute it in one line.
-**Record the divergence in the README**, and record it in the container too —
-this is the single most likely place for a caller to find a number that differs
-from the hosted API's.
-
-**Temperature.** One value for the whole request — a per-question temperature is
-an error (`"one value for the whole request, not per question"`). **The
-TypeSafe request schema has no temperature field at all**: it is `{state, model,
-questions}`, so a per-question or ad-hoc temperature is not merely unsupported,
-it has nowhere to live on the wire. That is the real reason for the rule.
-
-Applied on the host after the forward pass, from the **container's**
-`temperature` and `temperature_by_options` (Phase 2), not from a file: the
-bucket key is `"%s:%s" % (QTYPE_NAMES[qtype], size)` with `size` in
-`2 / 3-5 / 6-10 / 11+` (`laya/common.py:499-501`), buckets take precedence over
-the per-qtype 3-vector, and the result is clamped to `[0.5, 5.0]`
-(`TEMP_MIN`/`TEMP_MAX`, `laya/common.py:508-509`). A bucket key that is not one
-of those four sizes is **ignored with a warning**, not an error: a new upstream
-bucket size should not take the model down.
-
-**`readout` derivation.** From the container, exactly as llama.cpp derives it
-from GGUF metadata: a `scored_slot` is an arch with a decision head, a marker
-token, and non-causal attention. A model whose `readout` is not
-`DECISION_READOUT_SCORED_SLOT` **refuses by name** when this build is asked to
-serve it.
-
-**Gate.** A golden JSON fixture — the request and the exact expected response,
-plus a synthetic logit tensor — round-trips **byte-for-byte**, with
-`ordered_json` preserving question and option order. Generate the expected
-response from the **vendored** `typesafe-systemone-0ffd094c.py`, including the
-envelope, and assert:
-
-- the full body is `{model, answers, usage}` — not the bare answers;
-- `usage.output_tokens` is `0` and `usage.input_tokens` is the request's;
-- `noul` → `{type, noul}` with **no** `confidence` key present at all;
-- `choice` → `{type, choice, confidence, probabilities:{label:p}}`;
-- `score` → `{type, score, confidence, legend:{"0":…}, probabilities:{"0":…}}`
-  with **string** index keys;
-- a request naming a different `model` is refused, and the refusal is not a
-  200 with somebody else's answers in it.
-
-Unit tests in `src/common/AutoDecisionModel/` for every refusal above, and one
-that re-reads the vendored file and fails if the fixture and the vendored models
-disagree — that is what stops the pin from going stale silently.
-
 ## Phase 7 — The decision engine
 
 `src/include/AutoDecisionModel/auto_decision_model.hpp` +
@@ -1280,7 +1355,7 @@ disagree — that is what stops the pin from going stale silently.
 
 Behind it, a `Decider` in `src/open_npue/` that:
 
-1. Builds the prompt per `build_sequence` (Phase 1's tokenizer). **One row per
+1. Builds the prompt per `build_sequence` (Phase 2's tokenizer). **One row per
    (state, question) pair** — `collate_items` flattens question groups, and each
    row is independent, so a batch of 5 questions is 5 rows through the same
    encoder. Reuse `EmbedService::plan()`'s greedy tier split
@@ -1373,12 +1448,12 @@ matters — **zero disagreements on every pair where the model had an opinion** 
 while producing a number for the rest instead of a hope.
 
 `confidence` within 1e-3, and raw logits within the bf16 tolerance established in
-Phase 4. **Argmax is the gate; logits are diagnostics** — with pre-softmax scores
+Phase 5. **Argmax is the gate; logits are diagnostics** — with pre-softmax scores
 reaching ~55 and amplifying summation order, a logit-tolerance gate would be both
 unmeetable and meaningless.
 
 **The datapath decision, made here.** Run the whole gate twice, once per family
-from Phase 3. Record both numbers. Pick the bfp16 arm only if it matches the
+from Phase 4. Record both numbers. Pick the bfp16 arm only if it matches the
 decided-stratum requirement *and* its undecided-stratum rate is not worse than
 the bf16 arm's; otherwise ship `BERT-h768-gated-i1152-bf16` and record why in the
 container's `not_implemented` and in the skill. This is the same decision
@@ -1449,7 +1524,7 @@ identical request.
    `config.json` is `multilingual/encoder/config.json`,
    `multilingual/model.safetensors`, `multilingual/tokenizer/tokenizer.json`,
    and `multilingual/rl_agent_config.json` — the last one because the **packer**
-   reads the temperature vector and buckets out of it (Phase 2); after packing,
+   reads the temperature vector and buckets out of it (Phase 3); after packing,
    the container carries them and the file is not needed again.
    `npue_checkpoint_subdir: "multilingual/encoder"` and
    `npue_tokenizer_subdir: "multilingual/tokenizer"` name them for the packer.
@@ -1468,20 +1543,55 @@ identical request.
    tol, D3 determinism over 10 draws, D4 batch/index integrity, D5 argmax
    stability, D6 model identity (an impossible tag must be refused), D7 unknown
    question type dropped-with-warning, D8 `noul` has no `confidence`, D9
-   **reference agreement** against a bundled golden fixture. Register `"decisions"`
-   in `SUITE_NAMES` and make it mutually exclusive with `--embedding` — both take
-   the `ShapeLease`.
+   **reference agreement** against a bundled golden fixture. `D` is the suite
+   initial, per the existing `E`/`A`/`L`/`V`/`T` convention, and the numbers are
+   stable once assigned.
+
+   **Five registration points, not one.** `oflm_test/__init__.py` has no
+   decorator and no plugin scan, so a new suite is an `if` ladder and adding only
+   `SUITE_NAMES` gets you a flag that dispatches to nothing:
+   1. `DecisionTask` in the `from .tasks import (…)` list (`:6-7`);
+   2. `"decisions"` in `SUITE_NAMES` (`:9`);
+   3. `parser.add_argument('--decisions', action='store_true', …)` (`:81-91`);
+   4. a `if suites["decisions"]: results.append(DecisionTask(...).run(...))`
+      block in `run_suites` (`:145-175`);
+   5. **`resolve_suites` must be restructured, not extended.** Today the
+      mutual exclusion is hardcoded around the literal `"embedding"` with a
+      `CHAT_SUITES` tuple (`:11`, `:14-42`), and `--all` means
+      "everything except embedding". A *second* exclusive suite does not fit that
+      shape: the cleanest form is an `EXCLUSIVE_SUITES = ("embedding",
+      "decisions")` tuple, `--all` meaning "everything not in it", and the
+      conflict rule generalised to "if more than one exclusive suite is
+      requested, run none of them and say so". Both take the `ShapeLease`, so
+      running them in one process is a hard conflict, not a preference.
+      Add `test_embedding_checks.py`-style coverage in
+      `utilities/oflm-test/tests/` for the new resolution rules.
 5. **`src/test/laya_decision_npu/`** — the 4-file harness
    (`test.cpp`, `CMakeLists.txt`, `Makefile`, `test.sh`), using
    `gemma_embedding`'s **standalone** CMake style, not `add_npu_test`, which
    unconditionally links the closed `q4_npu_eXpress`/`mha`/`lm_head` stack.
    Needs `-mavx2 -mfma` and the per-source `open_npue` include dir.
+
+   **Copy its structure, not its rigour.** `gemma_embedding/test.cpp` has no
+   assertions at all: it prints error metrics and `return 0` unconditionally, so
+   its verdict is a number a human reads. That is the right shape for a
+   benchmark and the wrong shape for a gate. For the assertions, copy
+   `gemma4_tool_parser/test.cpp:11-18` instead — a `CHECK(cond)` macro that
+   prints `FAIL <file>:<line>` and increments a counter, one `test_*()` per case,
+   and a non-zero exit — and register it with
+   `add_test(NAME laya_decision_npu COMMAND …)`, which is what
+   `gemma4_tool_parser/CMakeLists.txt` does and what makes it reachable from
+   `ctest`. Also note `gemma_embedding/test.sh` is a **stale leftover** that
+   references a `../../detail/` tree which no longer exists; the live path is the
+   Makefile's `test:` target, which copies `model_list.json` beside the binary
+   first. Do not treat `test.sh` as load-bearing in the new harness either.
 6. **Skill file** `.opencode/skill/open-laya-decision-kernels/SKILL.md`, per
    `AGENTS.md`. `open-phi3-nanbeige-kernels` and `open-qwen36-kernels` are the
    templates. It must record: the prompt format, the twelve traps, the
    `tile_n` reasoning, the fact that T43/T44 of `vegah/Npu-Embeddings`
    (`research/OPEN-THREADS.md`) are the same work seen from upstream, and that
    arch=4 is reusable by any ModernBERT checkpoint.
+
 
 ---
 
@@ -1501,7 +1611,8 @@ identical request.
 | `src/xclbins/BERT-h768-gated-i1152-bfp16/`, `…-bf16/` | built artefacts, both arms | 3 |
 | `src/include/AutoDecisionModel/*` | the interface | 6, 7, 8 |
 | `src/common/AutoDecisionModel/*` | the plan/answer layer + unit tests | 6 |
-| `src/open_npue/decision_engine.*` | prompt build, **host** head, readout | 7 |
+| `src/open_npue/decision_engine.{hpp,cpp}` | prompt build, **host** head, readout | 7 |
+| `src/CMakeLists.txt` | **add `decision_engine.cpp` to `OPEN_NPUE_SOURCES` explicitly** — `open_npue/` is not globbed | 7 |
 | `src/src/decision_cli.hpp`, `main.cpp`, `vm_args.hpp`, `program_args.hpp` | `oflm decide` | 8 |
 | `src/server/server.cpp`, `rest_handler.{hpp,cpp}` | route, NPU-lock enrolment, identity guard, `capabilities` | 8 |
 | `src/model_list.json`, `src/model_info.json` | registry | 9 |
@@ -1511,6 +1622,182 @@ identical request.
 | `specs/open-engine/plans/typesafe-systemone-0ffd094c.py` | the pinned wire schema (vendored, `_schemas/models.py` only) | 0, 6 |
 | `.opencode/skill/open-laya-decision-kernels/SKILL.md` | the skill | 9 |
 
+
+---
+
+# New requirements
+
+The text below is what lands in `specs/open-engine/spec.md`, in the file's own
+format: `### OPEN-…`, then `**Applies to:**` / `**Test category:**` /
+`**Tests:**`, then the normative paragraph, then `**Acceptance criteria:**`.
+IDs follow `spec.md:3`'s `Prefix OPEN` and the `OPEN-<AREA>-<THING>` shape the
+file already uses (`OPEN-QUANT-Q8`, `OPEN-PACK-PLAN`, `OPEN-PREFILL-ATTN`).
+The five are appended after `OPEN-DECODE-PIPELINE`, the current last
+requirement; the file has no table of contents, so nothing else needs updating.
+
+Each `**Tests:**` line names a file under `specs/open-engine/tests/`, and each
+of those opens with `# Traces: <these IDs> (canonical spec: specs/open-engine/spec.md)`
+— the convention 39 of the 48 existing test files follow.
+
+---
+
+### OPEN-ENC-MODERNBERT: a ModernBERT checkpoint packs to an arch-4 container and the runtime runs it
+**Applies to:** openflowlm-next (`src/open_npue/npue_pack.cpp`, `src/open_npue/npue_encoder.hpp`, `src/open_npue/tokenizer_bbpe.cpp`, `src/open_npue/bbpe_tokenizer_gen.cpp`, `src/open_npue_adapter/npue_embedding.cpp`)
+**Test category:** unit (packer, tokenizer, shape) + manual (the NPU run)
+**Tests:** `specs/open-engine/tests/test_modernbert_pack.py`
+
+A checkpoint with `model_type: "modernbert"` shall pack to a
+`modernbert_rope_geglu` container, and that container shall load and run. The
+architecture is pre-LayerNorm with a final norm, bias-free throughout, no
+position table (position enters only through RoPE), GeGLU whose packed order is
+`gate|up`, and a sliding window of `local_attention // 2` on the layers whose
+`layer_types` entry is `sliding_attention`. Layer 0's attention norm is
+`nn.Identity()` and is **skipped**, not replaced by a weight-1 norm — a norm with
+weight 1 still centres and scales.
+
+The packer emits the container keys `apply_model_shape` reads, and the runtime
+reads the tokenizer's special ids from the encoder `config.json` rather than from
+the generated blob. It shall refuse, by name, on: a `model_type` it does not
+implement; a config it cannot find; a `swiglu_halves` / `pre_tokenizer` /
+`normalizer` value it does not implement; and a requested sequence length above
+the packed `max_seq_len`.
+
+**Acceptance criteria:**
+- A synthetic `modernbert` fixture packs, and the container loads through `ShapeLease`/`apply_model_shape` with `num_layers`, `hidden`, `num_heads`, `head_dim`, `intermediate` and `max_seq_len` read back as packed.
+- `embeddings.position` and `embeddings.token_type` and every `*.bias` are zero-filled and present; `embeddings.word` is the embedding table's packed name and dtype.
+- The GeGLU gate half is packed **first**, and the container says so in `swiglu_halves`.
+- With `identity_attn_norm_layer0` set, layer 0 applies no attention norm; without it, a weight-1 norm is still refused as a substitute.
+- The band mask is off for every `sliding_attention: false` layer, off for the decision head entirely, and on for `sliding_attention: true` layers at exactly `local_attention // 2` — not `+1`.
+- A checkpoint with a nested `config.json` is packable through the subdirectory keys; one with no `config.json` is refused naming the path.
+- `bge-*`, `nomic`, `gte` and `all-minilm` still pack to byte-identical containers after every change above.
+
+---
+
+### OPEN-DECISION-SYSTEMONE: `/v1/systemone` is byte-compatible with the pinned TypeSafe schema
+**Applies to:** openflowlm-next (`src/common/AutoDecisionModel/decision_types.cpp`, `src/server/rest_handler.cpp`, `src/server/server.cpp`, `specs/open-engine/plans/typesafe-systemone-0ffd094c.py`)
+**Test category:** unit (serialisation, refusals) + integration (the route)
+**Tests:** `specs/open-engine/tests/test_systemone_wire.py`
+
+`POST /v1/systemone` shall accept a `SystemOneRequest` and return a
+`SystemOneResponse` as pinned by
+`typesafe-ai/typesafe-sdk-python @ 0ffd094c72ed9445223060b24ffd7a56aa781fb4`,
+`src/typesafe_sdk/_schemas/models.py`, vendored beside this plan. The response
+carries the full envelope — `model`, `answers`, `usage` — and `model` is the tag
+that answered, not the tag that was asked for. `usage.output_tokens` is always
+`0`, which is definitional for a non-autoregressive readout. `noul` answers carry
+no `confidence` key at all. Index-keyed maps serialise with string keys.
+
+Question order and option order are semantic and are preserved end to end: a
+`std::map`-backed JSON object is not used anywhere on this path.
+
+**Acceptance criteria:**
+- A golden request/response pair round-trips byte-for-byte against the vendored models, and a test re-reads the vendored file and fails if the fixture and it disagree.
+- The response body is `{model, answers, usage}`; `usage.output_tokens == 0`.
+- A `noul` answer has no `confidence` key; serialising one is an error.
+- A 3-level `score` emits `legend` and `probabilities` keyed `{"0","1","2"}`.
+- `choice` accepts 1–255 options and `score` 2–10 levels; outside those, the request is refused by name.
+- A request naming a model other than the loaded one is refused; the response never carries another model's answers under the asked-for name.
+- A question whose `type` is not implemented is dropped with a warning and the rest of the batch is served.
+- The route is enrolled in `requires_npu_access()` and is never served concurrently with a NPU route.
+
+---
+
+### OPEN-DECISION-READOUT: one forward pass returns a typed answer per question, or refuses by name
+**Applies to:** openflowlm-next (`src/common/AutoDecisionModel/decision_types.cpp`, `src/include/AutoDecisionModel/auto_decision_model.hpp`, `src/common/AutoDecisionModel/all_decision_model.hpp`)
+**Test category:** unit
+**Tests:** `specs/open-engine/tests/test_decision_plan.py`
+
+A decision model shall take a state plus typed questions and return a
+probability distribution per question in one forward pass, with no generation and
+no parsing. The readout kind is derived from the container, and a model whose
+readout this build does not implement **refuses by name** — it does not fall
+back to a neighbouring recipe. `output_tokens` is always `0`.
+
+`noul` renders exactly two options in the semantic order `[false, true]`; `score`
+options are ordered and the order is the scale; `choice` preserves the caller's
+option order. A criterion value that is falsy but meaningful — `0`, `False`,
+`0.0`, `[]` — is rendered, not replaced by the type's default sentence.
+
+`confidence` is `max(p[:k])` **after temperature**, the quantity Laya's
+calibration is fitted to. This is a recorded divergence: the pinned schema types
+`confidence` as a bare 0–1 float and does not define a formula, and engines in
+this ecosystem differ on which they emit.
+
+**Acceptance criteria:**
+- A 2-option `noul`, an n-option `choice` and an m-level `score` each produce the right option strings, in the right order, from the same prompt builder.
+- A `noul` criterion of `0` or `False` renders its value; only `None` and `""` fall back to the default sentence.
+- `noul_labels` is accepted on `noul` only; supplying it on `choice` or `score` is an error, matching upstream's refusal.
+- `confidence` equals `max(p[:k])` after temperature, and is absent for `noul`.
+- `probabilities` and `logits` have length `k` (this row's marker count), never the batch's `kmax`.
+- A container whose readout is not `scored_slot` is refused by name, naming the readout.
+- `output_tokens` is `0` in every response.
+
+---
+
+### OPEN-DECISION-HEAD: the decision head is arithmetically a BERT layer and runs where it can be made reproducible
+**Applies to:** openflowlm-next (`src/open_npue/decision_engine.cpp`, `src/open_npue/npue_encoder.hpp`)
+**Test category:** unit (head arithmetic against the reference) + manual (the NPU encoder run)
+**Tests:** `specs/open-engine/tests/test_decision_head.py`
+
+The head shall reproduce the checkpoint's 2-layer `nn.TransformerEncoderLayer`
+exactly: `in_proj`=qkv, `out_proj`=attn_out, `linear1`+`linear2` the FFN, **with
+biases**, `norm_first=True`, and torch-default **ReLU** — not GELU, which is the
+encoder's activation and not the head's. `h += type_emb[qtype]` is broadcast over
+the sequence before the head; the marker gather is after it. The head consumes the
+encoder's post-`final_norm` output.
+
+The head runs on the **host**. This is a placement decision, not a capability
+limit: the encoder's geometry globals are process-wide, the encoder hardcodes its
+tensor prefix, every `npu::Design` is its own `hw_context`, and one model resolves
+to one design set. The head is 8 of the model's 96 GEMMs.
+
+`act_head` is computed and discarded, and the container records why. It is not
+silently skipped: a missing tensor and a deliberately-unused one are different
+things.
+
+**Acceptance criteria:**
+- The head's per-layer output matches the reference on a fixed input, including both biases at every site and ReLU in the FFN.
+- The head's attention is **full-band**: no sliding window and no causal mask, with the padding mask only. A banded head is a wrong answer, not a slow one.
+- The head applies `1/sqrt(head_dim)` explicitly; the encoder's scale is folded into its weight at pack time and the host head's is not.
+- `qkv` is de-interleaved from `in_proj_weight` in `[Q|K|V]` order (the head is plain MHA, not the encoder's `(3, Nh, Dh)` interleave, and has no RoPE).
+- The head never calls `pool_rows`; pooling for this model is a gather at `marker_pos`, not a mean.
+- `type_emb` is indexed by `qtype` in `QTYPES` order and broadcast over the sequence.
+- `act_head` runs and its result is dropped, with the reason in the container's `not_implemented`.
+
+---
+
+### OPEN-DECISION-ACCURACY: the gate is argmax agreement, stratified by how decided the reference was
+**Applies to:** openflowlm-next (`src/test/laya_decision_npu/test.cpp`, `npu_offload/gemm_rtp/families.json`, `utilities/oflm-test/oflm_test/tasks.py`)
+**Test category:** manual (the NPU run against the PyTorch reference) + integration (the `decisions` suite)
+**Tests:** `specs/open-engine/tests/test_decision_accuracy_fixture.py`
+
+A decision model's answers shall be gated against the upstream PyTorch reference
+by **argmax agreement**, stratified by the reference's own top-2 probability gap.
+On pairs where the reference had an opinion (gap ≥ 0.20) agreement shall be
+100 %; below that threshold the agreement rate is recorded, not passed or failed.
+The threshold is calibrated from the fixture's measured gap distribution, not set
+in advance, and if no natural separation exists the plan says so and sets it
+where this port's disagreements stop clustering.
+
+The reference is run **twice** — once under the bf16 autocast that
+`rl_agent_config.json` specifies, once in fp32 — and the gap between those two
+runs is the reference's own noise floor. Raw logits are diagnostics, not a gate:
+this architecture's pre-softmax scores reach ~55 and amplify summation order, so
+a logit tolerance is both unmeetable and meaningless.
+
+**The datapath is decided here, by measurement.** `--emulate-bfp16` is not
+inherited from the four families that use it. Both arms are built, the gate runs
+on both, and the winner is named in `model_list.json` — the same decision
+`bge-small` was rebuilt for, made the same way. The losing arm's number is
+written into the repo beside the winning one's.
+
+**Acceptance criteria:**
+- On the fixture's decided stratum, argmax agreement is 100 % against the bf16-autocast reference; `confidence` within 1e-3.
+- The undecided stratum's agreement rate is recorded in the repo with the fixture, and the gap distribution that set the 0.20 threshold is recorded with it.
+- The fp32-vs-autocast reference disagreement is measured and reported as the noise floor, and every disagreement this port has with fp32 that autocast does not is treated as this port's error.
+- Raw-logit deltas are reported, not gated.
+- Both datapaths are built and gated; `model_list.json`'s `npue_design_family` names the winner, and the loser's numbers are in the repo.
+- `oflm-test --decisions` runs D1–D9 (shape, probabilities sum to 1, determinism over 10 draws, batch/index integrity, argmax stability, model identity, unknown-type drop, `noul` has no `confidence`, reference agreement) and is mutually exclusive with `--embedding`, both taking the `ShapeLease`.
 
 ---
 
@@ -1525,7 +1812,7 @@ identical request.
 - Structured (non-string) `state` and `criteria` values.
 - `letter_slot`, `masked_slot`, `rank_head` readouts — declared, refusing by
   name.
-- NPU-side attention (`whisper_fa` generalisation). Gated on Phase 5's
+- NPU-side attention (`whisper_fa` generalisation). Gated on Phase 6's
   measurement.
 - **The head on the NPU.** The first ship runs the head on the host; the NPU head
   is sequenced behind it, not forbidden. It needs per-`Encoder` geometry, a
@@ -1541,19 +1828,13 @@ identical request.
 
 # Open decisions
 
-None outstanding. Each of the five that were open has been decided and folded
-into the phase that consumes it:
+None outstanding. The five that were open are now decided, and each fact lives
+where it is used rather than in a summary of itself: the schema pin and the
+response envelope in "The wire schema, pinned" and Phase 1's gate; the
+temperature source in Phase 3's container config; the two-family datapath in
+Phase 4 and Phase 7's gate; the stratified argmax gate in `OPEN-DECISION-ACCURACY`
+and Phase 7; and the ecosystem verification in Decision 1.
 
-| was open | decided | lives in |
-|---|---|---|
-| the TypeSafe schema was an unpinned external path | pinned to `typesafe-ai/typesafe-sdk-python @ 0ffd094c72ed9445223060b24ffd7a56aa781fb4`, vendored as `typesafe-systemone-0ffd094c.py`; the **response envelope** `{model, answers, usage}` was found to be missing from the plan entirely | "The wire schema, pinned", Phase 6 gate |
-| where the temperature vector lives | **packed into the container** as `temperature` + `temperature_by_options`, in `QTYPES` order; the file is read at pack time and the dead `temperature` tensor is deliberately not packed | Phase 2 config + note, Phase 6, Phase 9 item 2 |
-| `--emulate-bfp16` was inherited rather than measured | **two families built** (`-bfp16` and `-bf16`), gate run on both in Phase 7, winner named in `model_list.json`; the loser ships built with its number recorded | Phase 3, Phase 7 gate, Phase 9 item 2 |
-| the Phase 7 gate was a flat "100 % argmax" | **stratified** by the reference's own top-2 gap: 100 % on decided pairs, a recorded rate on undecided; reference pinned to bf16-autocast with an fp32 cross-run as the noise floor | Phase 7 gate |
-| two ecosystem claims in Decision 1 were unsourced | **verified and corrected**: llmgateway and `jev-rs` are native, Mesh-LLM ports it, OpenRouter routes it, and **LiteLLM is a pass-through, not a second implementation**; the "matches llama.cpp #29321's enum exactly" claim was dropped — that PR is a CPU-only draft in `tools/laya` and was never the source of the four-way split | Decision 1, Decision 2 |
-
-Two things surfaced while doing this and are now in the plan as requirements
-rather than questions: the ecosystem caps `score` at **10** levels, and index-keyed
-maps serialise with **string** keys — both of which a "byte-compatible" claim
-turns on.
-
+Two things surfaced while closing them and are now requirements rather than
+questions: the ecosystem caps `score` at **10** levels, and index-keyed maps
+serialise with **string** keys. Both are in `OPEN-DECISION-SYSTEMONE`.
