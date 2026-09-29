@@ -30,14 +30,23 @@ through this repo. The companion implementation plan is
   else divides.
 - **The decision head is literally a BERT layer** (`in_proj`=qkv,
   `out_proj`=attn_out, `linear1`=ffn_up, `linear2`=ffn_down,
-  `dim_feedforward=4d`). It needs **no new kernel family at all** —
+  `dim_feedforward=4d`), and it needs **no new kernel family at all** —
   `BERT-h1024-bfp16` and `BERT-h768-bfp16` already exist and already fit it.
+  It still should not run on the array in the first ship: the process-wide
+  geometry globals, a hardcoded `layer.` tensor prefix, one `hw_context` per
+  `npu::Design`, and one design set per model all stand in the way, for 8.3 % of
+  the arithmetic. Host first; see key finding 3.
 - **The real blockers are not the NPU.** They are (a) a missing pre-LN +
   final-norm + per-layer-RoPE + banded-mask code path in the host runtime,
   (b) `open_npue` has **no API for anything but a pooled vector** — Laya needs
-  `[rows, options]` logits, so a new class + endpoint is required, and
+  `[rows, options]` logits, so a new class + endpoint is required,
   (c) sequence length: the design family is fixed at `seq=64` and the repo
-  *explicitly refuses to predict* throughput above it.[^10]
+  *explicitly refuses to predict* throughput above it,[^10] and
+  (d) **the checkpoint does not fit the packer's shape.** Laya ships no root
+  `config.json` (it is under `encoder/`), and nothing in the repo can express a
+  nested checkpoint; the multilingual `tokenizer.json` also trips **four**
+  separate refusals in `generate_bbpe_tokenizer_table`, not the one the first
+  draft assumed.
 - **The llama.cpp PR is not a shortcut.** ggml-org/llama.cpp#29363 is **still
   open**, CPU-only, and is architecturally dead-ended for this repo: it
   registers `LLM_ARCH_LAYA` *solely* so `llama-quantize` can load a GGUF, and
@@ -85,13 +94,29 @@ through this repo. The companion implementation plan is
    is `nn.Identity()` (11 norms for 12 layers — a weight-1 norm is *not* the
    same thing), and the 128 window is halved by the mask to ±64.[^9][^10]
 
-3. **`design_fits()` structurally forbids sharing one design set between
-   encoder and head.** Its loop returns false on *any* mismatching occurrence
-   of an op name, and the `Want` table is derived from a single
-   `(hidden, intermediate, gated_ffn)` triple.[^11] But that constraint is
-   moot: the head's geometry (hidden=d, intermediate=4d, ungated) already
-   matches two shipping families exactly, so the head needs **zero new
-   xclbins**.
+3. **The decision head needs no new xclbin, and still should not run on the
+   array.** `design_fits()` structurally forbids sharing one design set between
+   encoder and head: its loop returns false on *any* mismatching occurrence of an
+   op name, and the `Want` table is derived from a single
+   `(hidden, intermediate, gated_ffn)` triple.[^11] The head's geometry
+   (hidden=d, intermediate=4d, ungated) does match two shipping families
+   exactly, so **zero new xclbins** — but "no new xclbin" is not "no new work",
+   and four things stand in the way, none of them about geometry:
+   `g_layers`/`g_ffn`/`g_seq` are **process-wide**, written once by `ShapeLease`
+   and refused a second time (`npue_encoder.hpp:552-561`, `:784-808`); the
+   encoder needs `intermediate=1152, layers=22` and the head `3072, 2`.
+   `Encoder::stage_all()` hardcodes the `"layer." + L` prefix and loops
+   `g_layers` (`:1586-1592`), and the head's tensors are `head.layers.{H}.*`.
+   Every `npu::Design` **gets its own `hw_context`** (`npu_device.hpp:219-222`),
+   so a head design is a second context on the device. And one model resolves to
+   one design set (`npue_embedding.cpp:185`), with `Encoder`'s four
+   `npu::Design&` all bound from that one `Stack` (`:4198-4232`).
+   The head is 8 GEMMs against the encoder's 88 — **8.3 % of the arithmetic** —
+   so the honest first shape is a host head, and the NPU head is a follow-on
+   gated on a measurement that two resident contexts do not block. Note what is
+   *not* a problem: both families are `-n 48` at the same `tile_k`, so
+   `gemm_b_layout` gives them the **same `b_layout_hash`** and the layout guard
+   at `stage_all` (`:1556-1571`) passes for both.
 
 4. **Attention is not the near-term bottleneck; sequence length is.** For
    ModernBERT-large the corrected GEMM:attention FLOP ratio is 12:1 at S=512 and
@@ -478,16 +503,37 @@ assume is wrong for this model.
 `layer_types.size() != num_hidden_layers`. Laya has neither shape, so that route
 is out.
 
-The `.npue` route has a **silent fail-open** worth flagging loudly:
-`prepare_model_auto` dispatches on `model_type`, with the BERT packer as the
-*deliberate* last branch. `model_type: "modernbert"` therefore falls into it and
-produces a **valid arch-0 container** — GELU + absolute position embeddings, for
-a GeGLU + RoPE model. The runtime will load it and return wrong vectors. The
-code's own comment says this is intentional ("this is where a genuinely new
-architecture will first show up as a wrong answer rather than an error") and the
-arch field is the guard — but the guard only fires if a *packer* writes the right
-arch, which today none does. **A `model_type == "modernbert"` branch must be
-added before anything else, and it should throw until the packer exists.**
+The `.npue` route has a **fail-open, and it has two distinct shapes.**
+`prepare_model_auto` dispatches on `model_type` read from
+`<dir>/config.json`, with the BERT packer as the *deliberate* last branch — and
+`json_string_field` returns the **empty string** for a file it cannot open,
+cannot parse, or that has no string `model_type`
+(`src/open_npue/npue_pack.cpp:1909-1916`); it does not throw.
+
+**Laya has no `config.json` at its root, or under `multilingual/`.** The real
+Hub tree is `multilingual/{encoder/config.json, model.safetensors,
+rl_agent_config.json, tokenizer/tokenizer.json}`. So for a Laya checkpoint
+`model_type` is `""`, the last branch *is* entered, and the first thing it does
+is `slurp(<dir>/config.json)` and `slurp(<dir>/vocab.txt)`
+(`npue_pack.cpp:2043-2044`) — both of which throw `cannot open …`. The failure is
+loud, but it names a file the checkpoint does not have, in a directory it does
+not name.
+
+The dangerous shape is the other one: a checkpoint that *does* put a root
+`config.json` naming an architecture no packer handles falls into the BERT
+branch and packs as **arch-0** — GELU plus absolute position embeddings, for a
+GeGLU plus RoPE model. The runtime loads it and returns wrong vectors. The
+code's own comment is right about where the hazard is ("this is where a
+genuinely new architecture will first show up as a wrong answer rather than an
+error"), and the container's `arch` field is the guard that catches it — but the
+guard only fires if a packer writes the right arch, and none does for
+`modernbert` today.
+
+**A guard on `model_type` must be added before anything else, and it needs two
+arms, not one:** an empty `model_type` (missing or nested config, which needs
+a subdirectory key — nothing in the repo can express a nested checkpoint today)
+*and* `modernbert` itself. Neither is a substitute for the other.
+
 
 Also blocking both routes: Laya ships **no `config.json` at repo root** (it is
 under `encoder/`), **no `1_Pooling/config.json`** (which `resolve_pooling`
@@ -552,6 +598,27 @@ tell that the answer is wrong").[^19]
 
 ## Gaps and unknowns
 
+- **A structured-`state` path needs a Python-compatible `json.dumps`, and that
+  is not a formatting problem.** `serialize_state`/`render_criterion`
+  (`laya/common.py:74-89`) both use `ensure_ascii=False` and separators
+  `(", ", ": ")`, but reproducing them means reproducing **shortest
+  round-trip float formatting** — `repr`, not `%.17g`, which the llama.cpp port
+  got wrong on 17 of 208 decisions. A hand-rolled formatter is the wrong
+  answer here; either port `repr` faithfully with a golden test over the float
+  range, or ship the string-only path and say so in `not_implemented`.
+- **The decision head's numerical regime is unpinned in both directions.** The
+  reference runs under `amp_dtype: "bf16"` autocast (`rl_agent_config.json`),
+  so its `nn.Linear` layers are bf16 while the plan's host tail would be F32 —
+  a deliberate precision *difference* that has to be priced rather than assumed
+  away. Meanwhile the same documents report pre-softmax scores reaching ~55 and
+  a Q8_0 reviewer flipping ~90/2000 decisions from a single FFN neuron, which
+  makes a **100 % argmax** gate as unmeetable as the logit tolerance the plan
+  rejects. Neither is resolved here.
+- **The masked-marker axis is a real off-by-one waiting to happen.** The
+  reference softmaxes over the batch's `kmax` marker slots after
+  `masked_fill(~marker_mask, -1e4)`, and `answer_confidence` is `max(p[:k])` with
+  a per-row `k` (`laya/common.py:331-333`, `:483`). A "probabilities sum to 1"
+  test passes on the wrong length; the fixture has to assert it.
 - **No measurement of this path above seq 64 exists**, by the repo's own
   admission. Everything in sub-goal 6 about S=1024 is extrapolation from
   whisper's ~90 GFLOP/s at S=1500 and the repo's 2.2 TFLOPS NPU GEMM figure. The
@@ -586,23 +653,42 @@ tell that the answer is wrong").[^19]
 Ordered, with the honest cost of each step. The sequencing matters: two of these
 are cheap and unblock everything after them.
 
-1. **Add the `model_type == "modernbert"` dispatch branch to
-   `prepare_model_auto` that throws `not implemented`.** ~10 lines. Removes the
-   silent arch-0 fail-open *today*, before any other work. Per the repo's own
-   rule: *"If closed behavior is not reproduced, return an explicit not
+1. **Add two `model_type` guards to `prepare_model_auto`: an empty
+   `model_type` and `model_type == "modernbert"`.** ~25 lines. Per the repo's
+   own rule: *"If closed behavior is not reproduced, return an explicit not
    implemented error rather than silently depending on the closed component."*
+   The empty arm is the one Laya actually hits, and it needs a
+   `npue_checkpoint_subdir` model-list key to be fixable at all — nothing in the
+   repo can express a nested checkpoint today. The `modernbert` arm is the one
+   that stops a valid-looking arch-0 container, for a checkpoint that puts its
+   config at the root.
 2. **Wire the byte-level BPE tokenizer** for the English (ModernBERT-large)
    tokenizer, and generate a Metaspace blob for the multilingual one. The
    generator and tokenizer are already compiled and linked; the sibling
    Gemma/XLM-R wiring is the template. This is the single largest
    completed-but-unreachable piece of ModernBERT work already in the tree.
+   **It is four pieces of work, not one:** the multilingual
+   `tokenizer.json` trips **four** independent `fail()` gates in
+   `generate_bbpe_tokenizer_table` — the `Replace(" " → "▁")` normaliser
+   (`:100-110`, accepts only `null`/`NFC`), the `Metaspace` pre-tokeniser
+   (`:113-121`, requires `ByteLevel`), `byte_fallback: true` (`:161-166`) and
+   `unk_token: "<unk>"` (`:170-174`) — so the blob needs a version bump and
+   three of those checks need real implementations rather than deletions. The
+   added-token machinery is already correct and leftmost-longest
+   (`tokenizer_bbpe.cpp:563`, `:583`); do not re-derive it.
 3. **Write `prepare_model_modernbert()`** modeled on `prepare_model_gte` (the
    only packer carrying a *computed* RoPE set, a prose half-order key, a
    zero-filled bias, and an embedded tokenizer blob). Emit zeros for
    `embeddings.position` / `token_type` / all `*.bias` (the runtime dereferences
-   them unconditionally). Splice `Wi`'s gate half into `add_gemm_b_concat2` —
-   that helper already exists and is exactly the needed shape, but ModernBERT
-   stores `w1` fused, so it needs a row-slice variant.
+   them unconditionally). Two names are load-bearing and neither is the
+   checkpoint's: the embedding table is `embeddings.word` in **F32** (not
+   `embeddings.tok_embeddings`, and `.as<float>()` rejects BF16), and the
+   container config keys are `num_layers` / `num_heads` / `max_seq_len`
+   (`apply_model_shape` reads those exact names, `npue_encoder.hpp:552-561`; a
+   misspelled one is `throw`, not a warning).
+   Splice `Wi`'s gate half into `add_gemm_b_concat2` — that helper already
+   exists and is exactly the needed shape, but ModernBERT stores `w1` fused, so
+   it needs a row-slice variant.
 4. **Build the two encoder families** and gate the `--emulate-bfp16` decision by
    ablation, not by inheritance.
 5. **Add the pre-LN runtime path.** `run_preln()` alongside `run()`, with a
@@ -610,10 +696,27 @@ are cheap and unblock everything after them.
    `identity_ln1` flag for layer 0, and a two-table RoPE selection copied from
    `GemmaNpuEncoder`. **Bypass `add_norm_*` entirely** — they store the
    normalised value as the residual, which is wrong under pre-LN, not merely
-   slow.
+   slow. The `final_norm` site must be pushed into `s_ln`, `h_gamma` **and**
+   `h_beta` together, in **both** the staged and the `host_ln` arms, because
+   `layer_norm_cpu` indexes `h_gamma[site]`/`h_beta[site]` directly
+   (`npue_encoder.hpp:1665`, `:1606-1626`) and the two arms number their sites
+   differently. Also note the NPU activation has **three** copies —
+   `swiglu_cpu` (`:1904`), the int8 fused epilogue (`:2195-2229`) and the bf16
+   fused epilogue (`:2076-2116`), the last two verbatim copies of each other —
+   and `fuse_ffn_epilogue` is **on by default** (`:1501`). A new half-order key
+   added to `swiglu_cpu` alone leaves the default path computing the old order,
+   so `--no-fuse-ffn` and the default disagree.
 6. **Add the ±64 band mask**, clamped in `qk_impl`/`av_impl` so the MACs are
    skipped. One-line index change in `softmax_cpu` (it currently loops `(b,h)`
-   uniformly) plus a `j`-range clamp.
+   uniformly) plus a `j`-range clamp. The window is **64, not 65**: the dense
+   and sdpa masks are built from `config.sliding_window`, which is a property
+   equal to `local_attention // 2` (`configuration_modernbert.py:160-162`), and
+   reach `abs(q_idx - kv_idx) <= sliding_window` through
+   `sliding_window_bidirectional_overlay` (`masking_utils.py:143-151`); the `+1`
+   is added only on the path that feeds the eager/flash attention *interface*
+   (`modeling_modernbert.py:253`, `:294`), and Laya pins `sdpa`. This settles
+   the "only an ablation settles it" note in `npue.py:106-141` by reading the
+   transformers source rather than by ablating.
 7. **Measure at S=1024** with the existing phase timers, and replace the
    `export_gemm_rtp.py:400-406` "unknown, not assumed" warning with a number. Do
    this *before* deciding on NPU attention.
