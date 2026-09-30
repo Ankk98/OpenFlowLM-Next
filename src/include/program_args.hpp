@@ -41,6 +41,24 @@ struct program_args_t {
     // /v1/embeddings resolves to for a model that declares no prompts.
     std::string prompt_name = "";
 
+    // --- oflm decide
+    //
+    // The ENGINE to load, named explicitly rather than through the positional
+    // tag alone. A decision model and a chat model are different kinds of
+    // model, and one of the two being quietly ignored is how a request ends up
+    // answered by a language model with fluent text instead of a distribution.
+    std::string decision_model = "";
+    // A temperature OVERRIDE for every question type. NEGATIVE means "use the
+    // container's own per-type temperatures", which are packed with the
+    // checkpoint because they are part of its calibration. A negative default
+    // and not 1.0: 1.0 is a plausible value a caller might genuinely want, and
+    // a default cannot then also mean "unset".
+    float decision_temperature = -1.0f;
+    // Host threads for the decision head. 0 = half the machine. The head's work
+    // is arithmetic and parallelises differently from a design's dispatch
+    // stream, so it gets its own knob rather than sharing the server's.
+    int decision_threads = 0;
+
     // specific commands
     int img_pre_resize = 3;
 

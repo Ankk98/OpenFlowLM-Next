@@ -35,6 +35,7 @@
 #include "utils/vm_args.hpp"
 #include <boost/program_options.hpp>
 #include "benchmarking.hpp"
+#include "decision_cli.hpp"
 #include "benchmark_embed.hpp"
 
 #ifndef _WIN32
@@ -519,7 +520,7 @@ int main(int argc, char* argv[]) {
         return stable_stack ? 0 : 1;
     }
 
-    if (parsed_args.command == "run" || parsed_args.command == "serve" || parsed_args.command == "pull" || parsed_args.command == "remove" || parsed_args.command == "check" || parsed_args.command == "bench" || parsed_args.command == "bench-embed") {
+    if (parsed_args.command == "run" || parsed_args.command == "serve" || parsed_args.command == "pull" || parsed_args.command == "remove" || parsed_args.command == "check" || parsed_args.command == "bench" || parsed_args.command == "bench-embed" || parsed_args.command == "decide") {
       if (parsed_args.model_tag != "model-faker" && (!availble_models.is_model_supported(parsed_args.model_tag))) {
             header_print("ERROR", "Model not found: " << parsed_args.model_tag << "; Please check with `oflm list` and try again.");
             return 1;
@@ -632,6 +633,24 @@ int main(int argc, char* argv[]) {
                 parsed_args.model_tag, parsed_args.input_file_name, availble_models,
                 downloader, parsed_args.iterations, parsed_args.max_batch,
                 parsed_args.prompt_name, parsed_args.preemption, parsed_args.modelscope);
+        }
+        else if (parsed_args.command == "decide") {
+            // The CLI half of Phase 8, and the FIRST half: it is written and
+            // gated before the server route exists, so the route's only
+            // untested part is HTTP.
+            //
+            // The model_list entry is read through the SAME registry the
+            // other commands use, and handed in. It carries the design family
+            // and the three checkpoint subdirectory keys, and this model
+            // NESTS its files -- so an empty entry is not a degraded path, it
+            // is a refusal from the packer one layer down.
+            nlohmann::ordered_json entry;
+            if (availble_models.is_model_supported(parsed_args.model_tag)) {
+                auto [resolved, info] =
+                    availble_models.get_model_info(parsed_args.model_tag);
+                entry = info;
+            }
+            return decision_cli::run(parsed_args, entry);
         }
         else if (parsed_args.command == "run") {
             check_and_notify_new_version();

@@ -29,6 +29,7 @@ inline void print_help(po::options_description& general) {
     std::cout << "  check <model_tag>   - Check a model" << std::endl;
     std::cout << "  bench <model_tag>   - Benchmark a chat model over context lengths" << std::endl;
     std::cout << "  bench-embed <tag>   - Benchmark an embedding model over batch sizes" << std::endl;
+    std::cout << "  decide <tag>        - Answer a decision request from a JSON file" << std::endl;
     std::cout << "  list                - List all available models" << std::endl;
     std::cout << "  version             - Show version information" << std::endl;
     std::cout << "  help                - Show this help message" << std::endl;
@@ -89,6 +90,17 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
             ("embeddingmodel", po::value<std::string>(&parsed_args.embedding_model)->default_value(""),
              "Which embedding model to serve with --embed 1 "
              "(default: embed-gemma:300m)")
+            ("decisionmodel", po::value<std::string>(&parsed_args.decision_model)->default_value(""),
+            "Which decision model `decide` loads. Optional when the model tag is "
+            "given positionally, but supplying both and having them differ is "
+            "refused rather than resolved.")
+            ("decisiontemperature", po::value<float>(&parsed_args.decision_temperature)->default_value(-1.0f),
+            "Override the decision temperature for every question type. "
+            "Negative (the default) uses the container's own per-type values, "
+            "which are part of the checkpoint's calibration.")
+            ("decisionthreads", po::value<int>(&parsed_args.decision_threads)->default_value(0),
+            "Host threads for the decision head. 0 (the default) is half the "
+            "machine.")
             ("host", po::value<std::string>(&parsed_args.host)->default_value("127.0.0.1"), 
              "Set the server address (for serve command)")
             ("port,p", po::value<int>(&parsed_args.port)->default_value(-1), 
@@ -117,8 +129,23 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
              "Enable or disable Cross-Origin Resource Sharing (CORS) (for serve command)")
             ("preemption", po::value<bool>(&parsed_args.preemption)->default_value(false),
              "Enable preemption")
+            // ONE option on this field, and that is load-bearing rather than
+            // tidiness. Two boost::program_options entries sharing a
+            // `po::value` pointer EACH APPLY THEIR OWN default_value, and the
+            // second default overwrites what the first option just parsed --
+            // so `--input-file x` left the field empty. Registering an alias
+            // that way is silently broken, and it fails as "the file name is
+            // empty", which points at the caller rather than at the parser.
+            //
+            // The plan names this flag `--input-file`; the tree has called it
+            // `--prompt,-i` since before the decision surface existed and four
+            // commands read it. Renaming it would break those, so the plan's
+            // name is the thing that gives way and the help line says so.
             ("prompt,i", po::value<std::string>(&parsed_args.input_file_name)->default_value(""),
-             "Direct file input")
+             "Direct file input: the request JSON for `oflm decide` (- for "
+             "stdin), the text file for bench. Named --input-file in the "
+             "decision plan, but it has been --prompt here since before that "
+             "surface existed and renaming it would break four commands.")
             ("bench-iterations", po::value<int>(&parsed_args.iterations)->default_value(2),
              "Iterations for bench and bench-embed")
             ("max-batch", po::value<int>(&parsed_args.max_batch)->default_value(128),

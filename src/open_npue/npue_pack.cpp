@@ -2569,6 +2569,21 @@ void prepare_model_modernbert(const std::string &model_dir,
   cj += ",\"head_attention\":\"full-band: no sliding window, no causal mask, "
         "padding mask only\"";
   cj += ",\"n_qtype\":3";
+  // THE READOUT, and it is a key rather than a convention because the runtime
+  // REFUSES a container whose readout it does not implement, naming the
+  // readout. Without the key there is nothing to refuse on, and a model whose
+  // head was read out some other way would be served with a neighbouring
+  // recipe's answers -- which is the one failure this whole surface forbids.
+  //
+  // `scored_slot` is what Laya does: one logit per [MASK] marker, softmaxed
+  // across the markers of a row. It is not a "cls" or "mean" pooling and not a
+  // generation, so the two pooling keys this runtime already has are both
+  // wrong descriptions of it.
+  cj += ",\"readout\":\"scored_slot\"";
+  cj += ",\"readout_note\":\"one logit per [MASK] marker via head.layers.* -> "
+        "gather at marker_pos -> scorer, softmaxed across the row's markers. "
+        "pooling below is a fiction for this model and the decision engine "
+        "never calls pool_rows.\"";
   cj += ",\"marker_token_id\":" + cfg_raw_or("mask_token_id", "4");
   cj += ",\"cls_token_id\":" + cfg_raw_or("cls_token_id", "1");
   cj += ",\"sep_token_id\":" + cfg_raw_or("sep_token_id", "1");

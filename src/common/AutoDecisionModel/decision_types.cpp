@@ -410,6 +410,7 @@ decision_request parse_request(const json& body, double temperature) {
         " is outside [0.5, 5.0]. One value for the whole request, not per "
         "question -- and the pinned schema has no per-question temperature "
         "field at all, so this is the only place it can come from.");
+  r.temperature = temperature;
   return r;
 }
 

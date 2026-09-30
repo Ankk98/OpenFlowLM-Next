@@ -147,6 +147,24 @@ struct decision_request {
                                              ///< keyed by the tag that ANSWERED
     std::vector<decision_question> questions; ///< in wire order
     std::vector<std::string> dropped;         ///< keys of questions dropped
+    /// Tokenizer ids across every built row, filled by the model once the
+    /// prompts are assembled. It is HERE and not in render_response because the
+    /// count is a property of the prompt the model built, and a renderer that
+    /// had to be told it would report 0 for a request that had 180 tokens --
+    /// which reads as a decision model that consumed no input, which is the
+    /// one usage number a non-autoregressive model can actually be wrong about.
+    int64_t input_tokens = 0;
+    /// The request's temperature, in the pinned schema's [0.5, 5.0].
+    ///
+    /// And `temperature_overridden` beside it, because "the caller asked for
+    /// 1.0" and "the caller asked for nothing" are the same number and they
+    /// mean different things: the first replaces the container's fitted
+    /// per-type temperatures, the second leaves them alone. Inferring which from
+    /// the value would make an explicit --decisiontemperature 1.0 silently
+    /// ignored, and would make the default silently replace the calibration the
+    /// checkpoint was fitted with.
+    double temperature = 1.0;
+    bool temperature_overridden = false;
 };
 
 // ---------------------------------------------------------------------------

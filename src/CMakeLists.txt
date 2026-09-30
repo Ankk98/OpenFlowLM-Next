@@ -332,6 +332,10 @@ if(NOT OFLM_USE_HRX)
         # the refusal is one line with a container in the message rather than a
         # link error on a build that happens to be missing a feature.
         "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/decision_engine.cpp"
+        # The adapter that turns a model DIRECTORY into a Decider. The decision
+        # registry is header-only, so this is the only .cpp the decision surface
+        # adds to the build.
+        "${CMAKE_CURRENT_SOURCE_DIR}/open_npue_adapter/npue_decision.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/npue.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/npue_pack.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/npu_device.cpp"
