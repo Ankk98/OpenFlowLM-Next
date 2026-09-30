@@ -2076,6 +2076,54 @@ struct Encoder {
   // this: softmax_cpu folds the same addition into its per-row prologue, where
   // the row is already in L1 and it costs nothing, while an aie softmax kernel
   // has no second operand to take it from.
+  // THE BAND MASK'S ONE DEFINITION.
+  //
+  // `-1.0e30f`, and not `-inf` and not `-FLT_MAX`: this term is added in the
+  // SAME pass as the padding mask, which uses `-1.0e30f` (the Gemma path uses
+  // -3.4028235e38f for its own). One buffer carrying one convention means the
+  // two failure modes are indistinguishable in the code, and a band written
+  // -inf next to a padding mask written -1.0e30f would be a reader's question
+  // rather than an answer.
+  //
+  // EXACTLY 0.0f inside the band, which is what makes the safety property
+  // checkable by reading: an in-band score is the unmasked path's score plus an
+  // exact zero, so it is bit-identical, and the property does not depend on the
+  // fill value being finite -- only on the in-band term being exactly zero.
+  static constexpr float kBandFill = -1.0e30f;
+  // The band's half-width for the layer being computed, or 0.
+  //
+  // A MEMBER (`band_now`) and not the configured width (`g_band_half`), and the
+  // reason is the trap this whole mechanism is easy to fall into: the width is
+  // set on the model, `qk_impl`/`av_impl`/`softmax_cpu` are METHODS on the
+  // Encoder, and a caller that forgets to clear it between layers gets a band
+  // on the GLOBAL layers -- a silently wrong answer, because banded attention
+  // returns a correctly shaped, correctly normed vector. Every loop iteration
+  // therefore SETS it, including to 0, and the decision head has its own
+  // attention entry point in Phase 7 rather than sharing this one.
+  int64_t band_for_layer(int64_t L) const {
+    if (g_sliding_layer.empty()) return 0;
+    if (L < 0 || L >= static_cast<int64_t>(g_sliding_layer.size())) return 0;
+    return g_sliding_layer[static_cast<size_t>(L)] ? g_band_half : 0;
+  }
+
+  // The band's [lo, hi] window on j, for query position i.
+  //
+  // Computed ONCE per i, in the shared outer loop, and passed to every arm
+  // below -- not re-derived inside an unrolled arm. That placement is the
+  // reason: the AVX512, AVX2 and scalar arms are three copies of the same
+  // reduction, and a clamp written into each of them is a clamp that can be
+  // correct in two. The decision head (Phase 7) needs FULL-band attention over
+  // these same functions, and it gets it by calling with band_now == 0 rather
+  // than by instantiating a second copy.
+  int64_t band_lo(int64_t i) const {
+    const int64_t lo = i - band_now;
+    return lo < 0 ? 0 : lo;
+  }
+  int64_t band_hi(int64_t i) const {
+    const int64_t hi = i + band_now + 1;
+    return hi > g_seq ? g_seq : hi;
+  }
+
   void add_additive_mask(std::vector<float> &scores) {
     const int64_t rows_per_seq = g_heads * g_seq;
     const int64_t n_rows = static_cast<int64_t>(scores.size()) / g_seq;
@@ -2083,7 +2131,32 @@ struct Encoder {
       for (int64_t r = w; r < n_rows; r += nw) {
         float *row = scores.data() + r * g_seq;
         const float *mk = add_mask.data() + (r / rows_per_seq) * g_seq;
-        for (int64_t j = 0; j < g_seq; ++j) row[j] += mk[j];
+        // ONE arm for the whole loop, not a test per element. `band_now` is 0
+        // for every arch that has no locality term -- all six shipping
+        // encoders -- and this is the path that runs when the ARRAY softmax
+        // design is loaded, so the test has to be outside the j loop for the
+        // six of them to be untouched at all, let alone bit-identical.
+        if (!band_now) {
+          for (int64_t j = 0; j < g_seq; ++j) row[j] += mk[j];
+          continue;
+        }
+        // r decodes to b = r/rows_per_seq, h = (r/g_seq) % g_heads, i = r%g_seq.
+        // The band depends on (layer, i, j) and NOT on b or h, so i alone is
+        // the whole decode -- the head axis is free.
+        //
+        // ASSIGNED outside the band, not added to. qk_impl() clamps its j loop,
+        // so an out-of-band score is never written and still holds whatever the
+        // PREVIOUS layer left there. Adding the fill to that is correct for any
+        // finite value and depends on the stale value being finite -- across 22
+        // layers of reuse the fills would compound to -2.2e31, still inside
+        // float range, and a model with 200 banded layers would not be. Writing
+        // the fill is idempotent, and inside the band it is still `+= 0.0f`
+        // folded into the padding add, so the in-band safety property is
+        // unchanged.
+        const int64_t i = r % g_seq;
+        const int64_t jlo = band_lo(i), jhi = band_hi(i);
+        for (int64_t j = 0; j < g_seq; ++j)
+          row[j] = (j < jlo || j >= jhi) ? kBandFill : row[j] + mk[j];
       }
     });
   }
@@ -2103,7 +2176,19 @@ struct Encoder {
         // pure matmul an array kernel could run. Same single float addition
         // qk() used to do, so the result is unchanged to the bit.
         const float *mk = add_mask.data() + (r / rows_per_seq) * g_seq;
-        for (int64_t j = 0; j < g_seq; ++j) row[j] += mk[j];
+        // THE SECOND MASK PATH. Both of them need the band: `run` picks between
+        // softmax_cpu (host) and add_additive_mask (the array softmax design) on
+        // a flag, and banding only one leaves a model that is SILENTLY
+        // full-attention on all 22 of its 14 sliding layers the moment the
+        // design is loaded. See add_additive_mask for the `i` decode.
+        if (band_now) {
+          const int64_t i = r % g_seq;
+          const int64_t jlo = band_lo(i), jhi = band_hi(i);
+          for (int64_t j = 0; j < g_seq; ++j)
+            row[j] = (j < jlo || j >= jhi) ? kBandFill : row[j] + mk[j];
+        } else {
+          for (int64_t j = 0; j < g_seq; ++j) row[j] += mk[j];
+        }
 #if defined(__AVX2__)
         __m256 mx = _mm256_loadu_ps(row);
         for (int64_t j = 8; j < g_seq; j += 8)
@@ -2891,23 +2976,6 @@ struct Encoder {
     });
   }
 
-  // The band half-width for layer L, or 0.
-  //
-  // The WIDTH is g_band_half; only the ACTIVE width is a member, and the
-  // reason is the trap this whole mechanism
-  // is easy to fall into: `band_half` is set on the Encoder, `qk_impl`/`av_impl`
-  // are METHODS on the Encoder, and a caller that forgets to clear it between
-  // layers gets a band on the global layers -- a silently wrong answer, because
-  // banded attention returns a correctly shaped, correctly normed vector. Every
-  // call site therefore SETS it, including to 0, and the only thing that makes
-  // that safe is that the decision head has its own attention entry point rather
-  // than sharing this one.
-  int64_t band_for_layer(int64_t L) const {
-    if (g_sliding_layer.empty()) return 0;
-    if (L < 0 || L >= static_cast<int64_t>(g_sliding_layer.size())) return 0;
-    return g_sliding_layer[static_cast<size_t>(L)] ? g_band_half : 0;
-  }
-
   // scores[b,h,i,j] = dot(Q[b,i,h], K[b,j,h]) + mask[b,j]
   // scores[b,h,i,j] = Q[b,i,h] . K[b,j,h]. NO mask: this is the operation an
   // array kernel would perform, and the mask is a property of the batch rather
@@ -2961,7 +3029,14 @@ struct Encoder {
           const int64_t nv = NV ? NV : g_head_dim / 8;
           for (int64_t v = 0; v < nv; ++v) qv[v] = _mm256_loadu_ps(q + v * 8);
 #endif
-          for (int64_t j = 0; j < g_seq; ++j) {
+          // THE CLAMP, and it is here rather than in the mask because the mask
+          // cannot skip work: both mask paths add a term to every one of the
+          // g_seq^2 scores. Clamping HERE is what makes the MACs disappear, which
+          // is the whole point of a band -- a mask that only zeroes the
+          // out-of-band softmax weights computes the same answer and none of the
+          // saving.
+          const int64_t jlo = band_lo(i), jhi = band_hi(i);
+          for (int64_t j = jlo; j < jhi; ++j) {
             const float *k = &qkv_p[(b * g_seq + j) * 3 * g_hidden + g_hidden +
                                     h * g_head_dim];
 #if defined(__AVX512F__)
@@ -3014,6 +3089,13 @@ struct Encoder {
         for (int64_t i = 0; i < g_seq; ++i) {
           const float *a = &sc_p[(p * g_seq + i) * g_seq];
           float *o = &ctx_p[(b * g_seq + i) * g_hidden + h * g_head_dim];
+          // The same clamp as qk_impl, and it HAS to be the same: the softmax
+          // weight of an out-of-band key is exactly zero (the mask fill floors
+          // the exponential), so skipping those MACs changes the accumulation
+          // ORDER but adds nothing -- and a clamp in qk() without one here
+          // would leave a[j] == 0 multiplied in, which is a wrong answer in
+          // floating point where 0 * inf is not 0.
+          const int64_t jlo = band_lo(i), jhi = band_hi(i);
 #if defined(__AVX2__)
 #if defined(__AVX512F__)
           // A.V AT 512 BITS IS BIT-IDENTICAL TO THE 256-BIT FORM, and that is
@@ -3042,7 +3124,7 @@ struct Encoder {
           for (int64_t v = 0; v < nz; ++v) zacc[v] = _mm512_setzero_ps();
           const bool tail = (nv & 1) != 0;
           if (tail) yacc = _mm256_setzero_ps();
-          for (int64_t j = 0; j < g_seq; ++j) {
+          for (int64_t j = jlo; j < jhi; ++j) {
             const float *v = &qkv_p[(b * g_seq + j) * 3 * g_hidden +
                                     2 * g_hidden + h * g_head_dim];
             const __m512 zaj = _mm512_set1_ps(a[j]);
@@ -3060,7 +3142,7 @@ struct Encoder {
           __m256 acc[NV ? NV : kMaxHeadVecs];
           const int64_t nv = NV ? NV : g_head_dim / 8;
           for (int64_t v = 0; v < nv; ++v) acc[v] = _mm256_setzero_ps();
-          for (int64_t j = 0; j < g_seq; ++j) {
+          for (int64_t j = jlo; j < jhi; ++j) {
             const float *v = &qkv_p[(b * g_seq + j) * 3 * g_hidden +
                                     2 * g_hidden + h * g_head_dim];
             const __m256 aj = _mm256_set1_ps(a[j]);
@@ -3072,7 +3154,7 @@ struct Encoder {
 #endif
 #else
           for (int64_t d = 0; d < g_head_dim; ++d) o[d] = 0.f;
-          for (int64_t j = 0; j < g_seq; ++j) {
+          for (int64_t j = jlo; j < jhi; ++j) {
             const float *v = &qkv_p[(b * g_seq + j) * 3 * g_hidden +
                                     2 * g_hidden + h * g_head_dim];
             for (int64_t d = 0; d < g_head_dim; ++d) o[d] += a[j] * v[d];

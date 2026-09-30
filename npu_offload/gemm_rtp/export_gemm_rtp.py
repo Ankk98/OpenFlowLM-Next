@@ -87,10 +87,28 @@ from toolchain_provenance import write_toolchain_json  # noqa: E402
 #     max_seq_len rather than indexing past the table, so that one is already
 #     loud; it just fires at load rather than here.
 #   * attention runs on the HOST and is O(seq^2). F3 prices it at 2-5% of the
-#     work AT SEQ 64. Nothing here predicts what it costs at 512, and no
-#     measurement in this repo covers it -- that is a hardware question, and
-#     until it is traced the throughput of a long-seq design is unknown
-#     rather than assumed-proportional.
+#     work AT SEQ 64. MEASURED at seq 1024, batch 1, on this host (Ryzen AI Max
+#     390, AIE2P, the BERT-h768-gated-i1152-bf16 family, via
+#     utilities/laya_preln_rig.cpp and the encoder's own phase timers):
+#
+#         band +/-64   qk 0.066 s   av 0.093 s   softmax 0.19 s   wall 1.89 s
+#         no band      qk 0.007 s   av 0.014 s   softmax 0.14 s   wall 1.62 s
+#
+#     TWO RUNS PER ARM, NOT A BENCH. Interleaved and repeated properly these
+#     would be the numbers to quote; the ORDERING is far outside run-to-run
+#     noise (8x on qk, 7x on av, reproducible across three separate input
+#     lengths) and that is the only claim being made. The magnitudes are
+#     single-run figures and should be re-taken before anyone plans against them.
+#
+#     So the answer is not "attention dominates at long seq" -- it is that at
+#     seq 1024 the host attention is ~1% of the encode and the band makes it
+#     EIGHT TIMES SLOWER (the clamped j loop has a trip count the compiler
+#     cannot unroll, and the mask's per-element select is not free either). The
+#     band is a CORRECTNESS requirement for a local-attention model, not a
+#     speedup: 14 of 22 layers are wrong without it, and 18% of wall clock is
+#     the whole price. Anyone reaching for "129/1024 saves 87% of attention"
+#     as a throughput argument is quoting arithmetic about a component that is
+#     1% of the work.
 DEFAULT_SEQ = 64
 STREAM_ORDER = ["qkv", "attn_out", "ffn_up", "ffn_down"]
 

@@ -17,12 +17,15 @@
 //       -Isrc/open_npue -I/opt/xilinx/xrt/include \
 //       -L/opt/xilinx/xrt/lib64 -lxrt_coreutil
 //   PATH=/opt/xilinx/xrt/bin:$PATH ./rig <container> <designs> out.bin
-//       [nofuse] < prompts.txt
+//       [nofuse|noband] < prompts.txt
 //
-// The fourth argument, `nofuse`, turns OFF ffn epilogue fusion so the two
-// gated-activation copies can be compared byte for byte -- which is how the
-// three-copies-must-agree property in Phase 5 is actually checked rather than
-// asserted.
+// The fourth and later arguments are switches for the measurements:
+//
+//   nofuse  turn OFF ffn epilogue fusion, so the two gated-activation copies
+//           can be compared byte for byte -- which is how Phase 5's
+//           three-copies-must-agree property is checked rather than asserted.
+//   noband  zero the band after the container is read, for the unbanded
+//           control that Phase 6's measurement needs.
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -56,6 +59,28 @@ int main(int argc, char **argv) {
     // Rows 1..3 are entirely pad, and the additive mask zeroes their
     // contribution, so comparing row 0 alone is sound.
     const int64_t BT = e.use_tier(1);
+
+    // `noband` zeroes the band AFTER the container has been read, so the
+    // unbanded control differs from the banded run in exactly one thing. That
+    // control is what makes the band measurement mean anything: without it, "the
+    // engine agrees with the oracle" does not say whether the band is right or
+    // whether the band is being applied at all. The container refuses
+    // sliding_window <= 0, so this cannot be reached by editing the container --
+    // and a build-time switch is the honest way to get the control.
+    for (int i = 4; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (a == "noband") {
+        npue::enc::g_band_half = 0;
+        std::fprintf(stderr, "band       DISABLED by the rig (control run)\n");
+      } else if (a.rfind("band=", 0) == 0) {
+        // Sweep the width. Phase 6's measurement needs to know WHICH width the
+        // engine's band corresponds to, not just that a band is present: a band
+        // applied to the wrong index space is a different model that still runs.
+        npue::enc::g_band_half = std::atoll(a.c_str() + 5);
+        std::fprintf(stderr, "band       +/-%lld by the rig\n",
+                     (long long)npue::enc::g_band_half);
+      }
+    }
     std::printf("# datapath %s\n", stack.p_qkv->info().emulate_bfp16
                                      ? "bfp16-emulated" : "bf16");
     std::printf("# hidden %lld seq %lld layers %lld heads %lld inter %lld\n",
@@ -111,6 +136,16 @@ int main(int argc, char **argv) {
     auto h = e.run_dispatch(buf);
     std::fprintf(stderr, "ran %lld rows x %lld (tier %lld)\n", (long long)S,
                  (long long)H, (long long)BT);
+    // The encoder's own phase timers, which is what Phase 6's S=1024
+    // measurement is supposed to report: a single wall number says "slow" and
+    // not which half to fix, and the split is the difference between "the band
+    // did not help" and "the band did not help BECAUSE the mask, not the MACs,
+    // is where the time goes".
+    std::fprintf(stderr,
+                 "timers      npu %.4f  attn %.4f (qk %.4f  av %.4f)  "
+                 "hostln %.4f  hostsm %.4f  hostgelu %.4f  dispatches %d\n",
+                 e.t_npu, e.t_attn, e.t_qk, e.t_av, e.t_hostln, e.t_hostsm,
+                 e.t_hostgelu, e.n_dispatch);
     std::ofstream o(argv[3], std::ios::binary);
     o.write(reinterpret_cast<const char *>(h.data()),
             static_cast<std::streamsize>(h.size() * sizeof(float)));

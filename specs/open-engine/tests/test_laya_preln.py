@@ -588,3 +588,153 @@ def test_the_single_encode_entry_point_is_run_dispatch():
     assert "e.run_dispatch(buf)" in src
     body = src[src.index("void chunk(Encoder &e,"):]
     assert ".run(buf)" not in body, "a second encode entry point bypasses the dispatch"
+
+
+def _fn(src: str, header: str) -> str:
+    """One function's body, from its header to the next member declaration.
+
+    Slicing to a NAMED second header is what these tests did first and it is
+    wrong in a way that passes: `av_impl`'s doc comment sits ABOVE it, so
+    "everything up to the ctx[b,i,h] comment" is the empty string, and an
+    assertion over an empty slice is an assertion over nothing.
+    """
+    i = src.index(header)
+    j = src.find("\n  void ", i + len(header))
+    k = src.find("\n  static ", i + len(header))
+    end = min(x for x in (j, k, len(src)) if x > 0)
+    return src[i:end]
+
+
+# --------------------------------------------------------------------------
+# Phase 6: the band mask
+#
+# The band's correctness is a MEASUREMENT (utilities/laya_preln_reference.py and
+# the rig, and the numbers are in the Phase 6 commit). What is here is the
+# structure, and the structure is where a band goes wrong: a band applied to the
+# wrong layer, through the wrong path, or with the wrong width is a model that
+# runs and answers.
+# --------------------------------------------------------------------------
+
+def test_the_band_term_is_ONE_definition_used_by_both_mask_paths():
+    """Two mask paths and both must band.
+
+    `run` picks between `softmax_cpu` (host) and `add_additive_mask` (the array
+    softmax design) on a flag. Banding one leaves a model that is SILENTLY
+    full-attention on all 22 layers the moment the design is loaded -- and the
+    only symptom is that the numbers change, which is what a tuning change looks
+    like too.
+    """
+    src = mp.ENC.read_text()
+    assert "kBandFill" in src
+    # exactly two mask loops assign the fill, and they are the two paths
+    n = src.count("(j < jlo || j >= jhi) ? kBandFill")
+    assert n == 2, f"expected 2 banded mask loops, found {n}"
+    soft = src[src.index("void softmax_cpu("):]
+    assert "kBandFill" in _fn(src, "void softmax_cpu("), "softmax_cpu does not band"
+    assert "kBandFill" in _fn(src, "void add_additive_mask("), \
+        "add_additive_mask does not band"
+
+
+def test_the_band_cannot_have_gone_into_add_mask():
+    """`add_mask` is [batch, g_seq] and both paths index it with a
+    per-SEQUENCE offset -- it has no head axis and no layer axis. A band depends
+    on (layer, i, j), so putting it there would be both impossible and silently
+    wrong if it were possible. The `i` decode has to be in the loop."""
+    src = mp.ENC.read_text()
+    body = _fn(src, "void add_additive_mask(")
+    assert "const int64_t i = r % g_seq;" in body, (
+        "the band needs the query position, and r % g_seq is the whole decode: "
+        "the band depends on (layer, i, j) and not on b or h")
+    # and add_mask itself is untouched
+    assert "add_mask.resize" not in body and "add_mask.push_back" not in body
+
+
+def test_qk_and_av_BOTH_clamp_the_j_loop():
+    """The mask alone computes the same answer and NONE of the saving, because
+    it adds a term to all seq^2 scores. Skipping the MACs is the point, so both
+    reductions clamp.
+
+    And the clamp has to be in BOTH: a clamp in qk() without one in av() leaves
+    out-of-band softmax weights multiplied in, and in floating point 0 * inf is
+    not 0.
+    """
+    src = mp.ENC.read_text()
+    assert src.count("j = jlo; j < jhi") == 4, (
+        "expected qk's arm plus av's three arms (AVX512, AVX2, scalar) to clamp; "
+        f"found {src.count('j = jlo; j < jhi')}")
+    for fn in ("void qk_impl(", "void av_impl("):
+        body = _fn(src, fn)
+        assert "band_lo(i)" in body and "band_hi(i)" in body, fn
+
+
+def test_the_clamp_is_computed_ONCE_per_i_and_not_per_arm():
+    """The AVX512, AVX2 and scalar arms are three copies of the same reduction.
+    A clamp written into each is a clamp that can be correct in two -- and the
+    head (Phase 7) needs FULL-band attention over these same functions, which it
+    gets by calling with band_now == 0 rather than by instantiating a second
+    copy of either function."""
+    src = mp.ENC.read_text()
+    decl = "const int64_t jlo = band_lo(i), jhi = band_hi(i);"
+    # Four in the file: the two mask paths and the two reductions. What matters
+    # is that each FUNCTION has exactly one, and that it sits above the #if that
+    # selects the arm rather than inside an arm.
+    for fn in ("void qk_impl(", "void av_impl("):
+        body = _fn(src, fn)
+        assert body.count(decl) == 1, (
+            f"{fn} computes the clamp {body.count(decl)} times; it belongs "
+            "once, above the arm selection")
+    assert _fn(src, "void add_additive_mask(").count(decl) == 1
+    assert _fn(src, "void softmax_cpu(").count(decl) == 1
+
+
+def test_band_now_is_SET_on_every_layer_including_the_global_ones():
+    """The failure this guards is a band left set across layers: `band_half` is a
+    model property, `qk_impl` is a method, and a loop that forgets to clear it
+    bands the GLOBAL layers. That returns a correctly shaped, correctly normed
+    vector."""
+    src = mp.ENC.read_text()
+    body = src[src.index("std::vector<float> run_preln("):
+               src.index("std::vector<float> run_dispatch(")]
+    assert "band_now = band_for_layer(L);" in body
+    # inside the loop, not before it
+    loop = body.index("for (int64_t L = 0; L < g_layers; ++L) {")
+    assert body.index("band_now = band_for_layer(L);") > loop
+    # and band_for_layer returns 0 for a non-sliding layer, which is what makes
+    # "set it on every layer" equivalent to "clear it on every global layer"
+    assert "return g_sliding_layer[static_cast<size_t>(L)] ? g_band_half : 0;" in src
+
+
+def test_the_out_of_band_term_is_ASSIGNED_and_the_in_band_one_is_exact_zero():
+    """Two properties, both about what the mask pass writes.
+
+    Out of band: ASSIGNED, not added to. qk_impl() clamps, so an out-of-band
+    score is never written and still holds the previous layer's value; adding to
+    that is correct only while the stale value stays finite, and the fills
+    compound across layers.
+
+    In band: the term is exactly 0.0f, folded into the padding add, so an
+    in-band score is the unmasked path's score plus an exact zero -- which is
+    what makes "the band cannot change an in-band value" a property of reading
+    the code rather than of a tolerance."""
+    src = mp.ENC.read_text()
+    assert src.count("row[j] = (j < jlo || j >= jhi) ? kBandFill : row[j] + mk[j];") == 2
+    assert "static constexpr float kBandFill = -1.0e30f;" in src, (
+        "the band must use the SAME fill as the padding mask. -inf would sit in "
+        "one buffer next to -1.0e30f as two conventions for one job.")
+
+
+def test_an_UNBANDED_container_still_runs_the_unbanded_loop():
+    """Six shipping encoders have no locality term. `band_now` is 0 for every
+    one of them, and the loops take their original arm -- so arch=0 through 3
+    are not merely close to bit-identical, they execute the same instructions on
+    the same data."""
+    src = mp.ENC.read_text()
+    add = _fn(src, "void add_additive_mask(")
+    soft = _fn(src, "void softmax_cpu(")
+    assert "if (!band_now) {" in add
+    assert "for (int64_t j = 0; j < g_seq; ++j) row[j] += mk[j];\n          continue;" in add
+    assert "if (band_now) {" in soft
+    qk = src[src.index("void qk_impl("):src.index("void av_impl(")]
+    assert "const int64_t jlo = band_lo(i), jhi = band_hi(i);" in qk, (
+        "band_lo/band_hi return the whole range when band_now is 0, so the "
+        "unbanded path takes the same loop with the same bounds")
