@@ -815,13 +815,50 @@ std::vector<RowAnswer> Decider::decide(const std::vector<PromptRow> &rows_in,
       for (int64_t j = 0; j < kmax; ++j) p[static_cast<size_t>(j)] /= static_cast<float>(sum);
       // Returned length is k -- THIS row's own marker count. The oflm-test
       // "probabilities sum to 1" check cannot catch returning kmax.
-      A.probabilities.assign(p.begin(), p.begin() + k);
+      // Upstream unpermutes IMMEDIATELY after the softmax and before anything
+      // that indexes by option (`agent.py:1039`), so argmax, score and every
+      // probability here are in the CALLER's order. `p` is slot-ordered, and
+      // `canonical[option_order[s]] = p[s]` is upstream's
+      // `unpermute_probs` -- slot s held option option_order[s], so the inverse
+      // is a scatter, not a gather.
+      //
+      // Skipping this is silent: the probabilities still sum to 1, the
+      // confidence is still plausible, and the labels are the caller's, so
+      // nothing looks broken. Every probability is just attached to the wrong
+      // option, which is exactly the failure upstream's docstring warns about.
+      std::vector<float> q(static_cast<size_t>(k));
+      const std::vector<int> &ord = rows_in[ri].option_order;
+      if (ord.empty()) {
+        q.assign(p.begin(), p.begin() + k);
+      } else {
+        // Validated at the edge, and re-checked here because the engine is
+        // reachable without the wire parser (the rigs, and any future caller).
+        if (static_cast<int64_t>(ord.size()) != k)
+          throw std::runtime_error(
+              "option_order has " + std::to_string(ord.size()) + " entries for " +
+              std::to_string(k) + " options on a row the head actually reached. "
+              "The order is validated against the REQUEST's option count; if "
+              "these differ, the head truncated an option and the permutation "
+              "no longer describes the slots. Refusing rather than answering "
+              "with probabilities attached to the wrong options.");
+        for (int64_t s = 0; s < k; ++s) {
+          const int dst = ord[static_cast<size_t>(s)];
+          if (dst < 0 || dst >= k)
+            throw std::runtime_error("option_order entry " + std::to_string(dst) +
+                                     " is outside [0, " + std::to_string(k) + ")");
+          q[static_cast<size_t>(dst)] = p[static_cast<size_t>(s)];
+        }
+      }
+      A.probabilities = std::move(q);
       A.argmax = 0;
       for (int64_t j = 1; j < k; ++j)
-        if (p[static_cast<size_t>(j)] > p[static_cast<size_t>(A.argmax)]) A.argmax = j;
-      A.confidence = p[static_cast<size_t>(A.argmax)];
+        if (A.probabilities[static_cast<size_t>(j)] >
+            A.probabilities[static_cast<size_t>(A.argmax)])
+          A.argmax = j;
+      A.confidence = A.probabilities[static_cast<size_t>(A.argmax)];
       double sc = 0.0;
-      for (int64_t j = 0; j < k; ++j) sc += static_cast<double>(j) * p[static_cast<size_t>(j)];
+      for (int64_t j = 0; j < k; ++j)
+        sc += static_cast<double>(j) * A.probabilities[static_cast<size_t>(j)];
       A.score = static_cast<float>(sc);
       // act_head's output, sliced to this row. The row stride is act_out, not
       // n_act, because the two differ the moment a checkpoint changes it --

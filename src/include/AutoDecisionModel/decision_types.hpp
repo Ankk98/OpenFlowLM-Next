@@ -95,6 +95,22 @@ struct decision_option {
     std::string description;
 };
 
+/// Slot s shows option `order[s]` -- upstream's `for i in order`
+/// (`common.py:171`). Empty is the identity.
+///
+/// This is a NAMED function in the wire layer rather than three lines in the
+/// adapter, for two reasons. It is the definition of a wire contract, and a
+/// contract with one caller is a contract the tests cannot check. And it belongs
+/// next to the validation that guarantees `order` is a permutation, so the shape
+/// that is accepted and the shape that is applied are read in one place -- the
+/// engine does the INVERSE scatter on the probabilities, and the two are easy to
+/// confuse: a gather here would silently mislabel every option.
+///
+/// The `order` is validated by `parse_option_order`; this re-checks only what it
+/// must, because the engine is also reachable without the parser.
+std::vector<std::string> apply_option_order(const std::vector<std::string> &opts,
+                                            const std::vector<int> &order);
+
 struct decision_question {
     decision_kind kind = DECISION_KIND_NOUL;
     /// Caller-chosen name. Never sent to the model and never used in inference --
@@ -117,6 +133,20 @@ struct decision_question {
     /// the same reason upstream refuses, and a conforming client that never
     /// sends it is unaffected.
     std::vector<std::string> noul_labels;   ///< 0, or 2, or a refusal
+    /// A documented EXTENSION, and one that is NOT cosmetic: empty means
+    /// identity. Otherwise a permutation of `range(options.size())`, where
+    /// **slot s shows option `option_order[s]`** -- the sequence order the model
+    /// sees, which is the whole point, since a bidirectional encoder's option
+    /// markers attend to each other and their positions are what a caller
+    /// permutes to probe or cancel position bias.
+    ///
+    /// Upstream's `q["option_order"]`, same convention (`common.py:171` reads
+    /// `for i in order`), and it is applied to EVERY question type because
+    /// upstream applies it before the type branch.
+    ///
+    /// The pinned schema has no such field on any question type, so a conforming
+    /// client never sends it and is unaffected.
+    std::vector<int> option_order;
 };
 
 struct decision_answer {

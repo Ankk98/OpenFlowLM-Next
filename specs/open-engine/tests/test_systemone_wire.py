@@ -94,6 +94,18 @@ int main(int argc, char **argv) {
           e["description"] = op.description;
           opts.push_back(std::move(e));
         }
+        // The PROMPT order, not the caller's: the same function the adapter
+        // uses, so this test cannot pass by agreeing with a copy of the logic.
+        // `q.options` stays in the caller's order on purpose -- the response
+        // zips it with the engine's unpermuted probabilities.
+        {
+          std::vector<std::string> descs;
+          for (const auto &op : q.options) descs.push_back(op.description);
+          descs = decision::apply_option_order(descs, q.option_order);
+          json slots = json::array();
+          for (const auto &d : descs) slots.push_back(d);
+          o["prompt_options"] = std::move(slots);
+        }
         o["options"] = std::move(opts);
         out.push_back(std::move(o));
       }
@@ -583,3 +595,115 @@ def test_score_levels_keep_their_position_as_the_label(driver, tmp_path):
     opts = json.loads(run_case(driver, case, tmp_path, mode="options").stdout)[0]["options"]
     assert [o["label"] for o in opts] == ["0", "1", "2"]
     assert [o["description"] for o in opts] == ["Can wait", "This week", "Today"]
+
+
+# --------------------------------------------------------------------------
+# option_order: slot s shows option option_order[s]
+# --------------------------------------------------------------------------
+
+def _opts(case, driver, tmp_path):
+    return json.loads(run_case(driver, case, tmp_path, mode="options").stdout)[0]["options"]
+
+
+def _slots(case, driver, tmp_path):
+    """The options in SLOT order -- the order the model sees. The driver's
+    `options` mode reports both this and the caller's order, and reading the
+    caller's order would make these three tests pass with no permutation at all."""
+    return json.loads(run_case(driver, case, tmp_path,
+                               mode="options").stdout)[0]["prompt_options"]
+
+
+def test_option_order_permutes_the_prompt_slots(driver, tmp_path):
+    """Slot s shows option `option_order[s]` -- the SEQUENCE the model sees.
+
+    This is upstream's `for i in order` at common.py:171, and it permutes the
+    prompt rather than only the answer. A bidirectional encoder's option markers
+    attend to each other, so where an option sits changes what the model computes
+    for it; a permutation applied only to the readout would look like it worked
+    and measure nothing.
+    """
+    crit = {"a": "the a thing", "b": "the b thing", "c": "the c thing"}
+    case = {"state": "s", "model": "m", "questions": {
+        "q": {"type": "choice", "criteria": crit, "option_order": [2, 0, 1]}}}
+    got = run_case(driver, case, tmp_path, mode="options").stdout
+    row = json.loads(got)[0]
+
+    # slot 0 shows option 2, slot 1 shows option 0, slot 2 shows option 1
+    assert row["prompt_options"] == ["the c thing", "the a thing", "the b thing"]
+    # AND the caller's order is untouched: the response zips it with the
+    # engine's UNpermuted probabilities, so permuting it here would mislabel
+    # every option -- the exact failure the readout scatter exists to prevent.
+    assert [o["label"] for o in row["options"]] == ["a", "b", "c"]
+
+
+def test_an_absent_option_order_is_the_identity_and_an_explicit_one_is_not(
+        driver, tmp_path):
+    """Absent is the identity, and so is an identity permutation -- it produces
+    the caller's order either way.
+
+    But an explicit `[]` or `null` is REFUSED rather than read as absent. Both
+    are "present and not a permutation" upstream (`if "option_order" in qdef:`
+    then a permutation test), and reading them as absent is a silent widening of
+    the contract: a client whose serialiser emits `[]` for unset fields would
+    believe in a permutation that never happened. The whole failure mode of this
+    feature is a caller trusting a dropped permutation, so it is not widened.
+    """
+    crit = {"a": "the a thing", "b": "the b thing"}
+    base = {"state": "s", "model": "m",
+            "questions": {"q": {"type": "choice", "criteria": crit}}}
+    want = _slots(base, driver, tmp_path)
+    for order in ([0, 1],):
+        case = {"state": "s", "model": "m", "questions": {
+            "q": {"type": "choice", "criteria": crit, "option_order": order}}}
+        assert _slots(case, driver, tmp_path) == want, order
+
+    for order in ([], None):
+        case = {"state": "s", "model": "m", "questions": {
+            "q": {"type": "choice", "criteria": crit, "option_order": order}}}
+        out = run_case(driver, case, tmp_path, mode="options")
+        assert out.returncode != 0, order
+        assert "option_order" in (out.stderr + out.stdout), (order, out.stderr[-300:])
+
+
+def test_option_order_applies_to_score_and_noul_too(driver, tmp_path):
+    """Because upstream unpermutes BEFORE the type branch (agent.py:1039), so it
+    is not a choice-only feature. For a score it permutes the levels, which
+    changes the expected score, and for noul it permutes the two sides."""
+    score = {"state": "s", "model": "m", "questions": {
+        "q": {"type": "score", "criteria": ["none", "mild", "severe"],
+              "option_order": [2, 0, 1]}}}
+    assert _slots(score, driver, tmp_path) == ["severe", "none", "mild"]
+
+    noul = {"state": "s", "model": "m", "questions": {
+        "q": {"type": "noul", "criteria": {"true": "t", "false": "f"},
+              "option_order": [1, 0]}}}
+    assert _slots(noul, driver, tmp_path) == ["t", "f"]
+
+
+@pytest.mark.parametrize("order,needle", [
+    ([0, 0, 1], "permutation"),
+    ([0, 1], "3 options"),
+    ([], "3 options"),
+    (None, "must be an array"),
+    ([0, 1, 5], "permutation"),
+    ([-1, 0, 1], "permutation"),
+    ([0, 1, "2"], "non-integer"),
+    ([True, False, True], "non-integer"),
+    ("nope", "must be an array"),
+])
+def test_a_malformed_option_order_is_refused_by_name(driver, tmp_path, order, needle):
+    """A permutation is the only shape that shows every option exactly once.
+    Anything else either shows one twice or drops one, and upstream refuses it
+    BEFORE the encoder rather than answering with a plausible row.
+
+    `[True, False, True]` is upstream's own case: in Python a bool IS an int, so
+    without its `isinstance(i, bool)` guard this would pass the sorted() check
+    and silently permute by 1 and 0.
+    """
+    case = {"state": "s", "model": "m", "questions": {
+        "q": {"type": "choice",
+              "criteria": {"a": "x", "b": "y", "c": "z"},
+              "option_order": order}}}
+    out = run_case(driver, case, tmp_path)
+    assert out.returncode != 0, out.stdout
+    assert needle in (out.stderr + out.stdout), (order, out.stderr[-400:])

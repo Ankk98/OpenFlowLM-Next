@@ -229,6 +229,13 @@ std::vector<decision::decision_answer> NpueDecision::decide(
       noul_labels = q.noul_labels;   // empty means the default ["false","true"]
     }
     auto opts = dec::Decider::render_options(qt, labels, criteria, noul_labels);
+    // Slot s shows option `option_order[s]`, upstream's convention
+    // (`common.py:171`, `for i in order`). This permutes the PROMPT, not just
+    // the answer, and that distinction is the whole feature: a bidirectional
+    // encoder's option markers attend to each other, so where an option sits
+    // changes what the model computes for it. Permuting only the readout would
+    // look like it worked and measure nothing.
+    opts = decision::apply_option_order(opts, q.option_order);
     auto prompt = impl_->dec->build_prompt(type_text, q.instructions,
                                            request.state, opts, qt);
     if (prompt.markers.empty())
@@ -243,6 +250,7 @@ std::vector<decision::decision_answer> NpueDecision::decide(
     r.ids = std::move(prompt.ids);
     r.markers = std::move(prompt.markers);
     r.qtype = qt;
+    r.option_order = q.option_order;
     tokens += static_cast<int64_t>(r.ids.size());
     rows.push_back(std::move(r));
   }

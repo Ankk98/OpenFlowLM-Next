@@ -205,10 +205,85 @@ std::string noul_criterion(const json& crit, const char* side,
   return render_criterion(f);
 }
 
+std::vector<std::string> apply_option_order(const std::vector<std::string> &opts,
+                                            const std::vector<int> &order) {
+  if (order.empty()) return opts;
+  if (order.size() != opts.size())
+    throw DecisionRequestInvalid(
+        "option_order has " + std::to_string(order.size()) + " entries for " +
+        std::to_string(opts.size()) + " options. It is one slot per option.");
+  std::vector<std::string> out;
+  out.reserve(opts.size());
+  for (const int i : order) {
+    if (i < 0 || static_cast<size_t>(i) >= opts.size())
+      throw DecisionRequestInvalid("option_order entry " + std::to_string(i) +
+                                   " is outside [0, " + std::to_string(opts.size()) + ")");
+    out.push_back(opts[static_cast<size_t>(i)]);
+  }
+  return out;
+}
+
 namespace {
 
 /// Resolve `q.labels` into exactly two distinct non-empty strings, or refuse.
 ///
+/// Upstream's `option_order` validation, `agent.py:815-828`, including the
+/// reason it exists: anything other than a permutation of `range(n)` would show
+/// an option twice or not at all, and that has to be refused BEFORE the encoder
+/// rather than turned into a plausible answer.
+///
+/// Upstream accepts any sequence of `int`, and so does this, except that a JSON
+/// `true`/`false` is an `int` in Python and upstream's `isinstance(i, bool)`
+/// guard is the only thing stopping it from becoming an option index. That
+/// guard is reproduced here because without it `option_order: [true, false]`
+/// permutes 1 and 0 -- a silent swap.
+void parse_option_order(const json &q, const std::string &key,
+                        decision_question &dq) {
+  const auto it = q.find("option_order");
+  if (it == q.end()) return;   // absent is the identity, and the only identity
+  // An explicit `null` and an explicit `[]` are REFUSED, not read as "absent".
+  // Upstream's check is `if "option_order" in qdef:` followed by a permutation
+  // test, so anything present must BE a permutation -- and `null` is present.
+  // Reading them as absent is a silent widening of the contract: a client that
+  // sends `"option_order": []` because its serialiser emits empty lists for
+  // unset fields would get the identity without being told the permutation was
+  // dropped. It is a small thing to be strict about, because the whole failure
+  // mode of this feature is a caller believing in a permutation that did not
+  // happen.
+  if (!it->is_array())
+    bad("question '" + key + "': 'option_order' must be an array of option "
+        "indices, one per option.");
+  std::vector<int> order;
+  for (const auto &e : *it) {
+    // `is_number_integer()` is false for a JSON boolean in nlohmann, so
+    // `option_order: [true, false]` is refused by this line alone. Upstream needs
+    // an explicit `isinstance(i, bool)` guard for the same reason in Python,
+    // where bool IS an int -- there, `[true, false]` would otherwise permute by
+    // 1 and 0 and pass the sorted() check. Worth being explicit that the refusal
+    // is load-bearing rather than incidental.
+    if (!e.is_number_integer())
+      bad("question '" + key + "': 'option_order' holds a non-integer. A JSON "
+          "true/false is not an option index -- upstream refuses it for exactly "
+          "this reason, and accepting it would silently permute by 1 and 0.");
+    order.push_back(static_cast<int>(e.get<int64_t>()));
+  }
+  const int64_t n = static_cast<int64_t>(dq.options.size());
+  if (static_cast<int64_t>(order.size()) != n)
+    bad("question '" + key + "': 'option_order' has " +
+        std::to_string(order.size()) + " entries for " + std::to_string(n) +
+        " options. It is one slot per option, each option exactly once.");
+  std::vector<char> seen(static_cast<size_t>(n), 0);
+  for (const int v : order) {
+    if (v < 0 || v >= n || seen[static_cast<size_t>(v)])
+      bad("question '" + key + "': 'option_order' must be a permutation of "
+          "range(" + std::to_string(n) + "), got an out-of-range or repeated "
+          "index. Slot s shows option option_order[s], so a repeat would show "
+          "one option twice and drop another.");
+    seen[static_cast<size_t>(v)] = 1;
+  }
+  dq.option_order = std::move(order);
+}
+
 /// Mirrors upstream's `_resolve_noul_labels`, including its `set(labels) !=`
 /// shape: a caller that sends one key, or three, has not sent noul labels and
 /// does not know it has not.
@@ -388,6 +463,7 @@ decision_request parse_request(const json& body, double temperature) {
           break;
         }
       }
+      parse_option_order(q, key, dq);
     } catch (const DecisionRequestInvalid&) {
       throw;
     } catch (const std::exception& e) {
