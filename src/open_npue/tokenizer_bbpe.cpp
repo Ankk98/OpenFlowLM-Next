@@ -46,6 +46,7 @@
 #include "bbpe_unicode_tables.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <queue>
@@ -305,12 +306,17 @@ void BbpeTokenizer::build_index(const std::string &blob) {
   p += 8;
 
   need(4); const uint32_t version = read_u32(p); p += 4;
-  if (version != 1)
+  if (version != 1 && version != 2)
     throw std::runtime_error("tokenizer_bbpe: unsupported table version " +
-                             std::to_string(version));
+                             std::to_string(version) +
+                             ". This build reads BBPETOK1 versions 1 and 2; a "
+                             "higher version was written by a newer generator, "
+                             "and reading its tail as vocabulary would produce "
+                             "plausible ids that are wrong. Rebuild the table "
+                             "rather than guessing the layout.");
 
   need(4); normalizer = read_u32(p); p += 4;
-  if (normalizer > 1)
+  if (normalizer > 2)
     throw std::runtime_error("tokenizer_bbpe: unknown normalizer id " +
                              std::to_string(normalizer));
   need(4); add_prefix_space = read_u32(p) != 0; p += 4;
@@ -386,6 +392,68 @@ void BbpeTokenizer::build_index(const std::string &blob) {
               return a.content < b.content;
             });
 
+  // --- version 2 tail. v1 stops here, and that is the compatibility story:
+  // the new fields are APPENDED, so a v1 table is a strict prefix and a v1
+  // reader never walks off the end looking for them.
+  if (version >= 2) {
+    auto read_str = [&](std::string &dst) {
+      need(2);
+      const uint16_t len = read_u16(p); p += 2;
+      need(len);
+      dst.assign(p, len);
+      p += len;
+    };
+    need(4); pre_tokenizer = read_u32(p); p += 4;
+    if (pre_tokenizer > 1)
+      throw std::runtime_error("tokenizer_bbpe: unknown pre_tokenizer id " +
+                               std::to_string(pre_tokenizer));
+    read_str(norm_replacement);
+    need(4); prepend_scheme = read_u32(p); p += 4;
+    if (prepend_scheme > 2)
+      throw std::runtime_error("tokenizer_bbpe: unknown prepend_scheme " +
+                               std::to_string(prepend_scheme));
+    read_str(replacement);
+    need(4); metaspace_split = read_u32(p) != 0; p += 4;
+    need(4); byte_fallback = read_u32(p) != 0; p += 4;
+    need(4); fuse_unk = read_u32(p) != 0; p += 4;
+    need(4); byte_mode = read_u32(p); p += 4;
+    if (byte_mode > 1)
+      throw std::runtime_error("tokenizer_bbpe: unknown byte_mode " +
+                               std::to_string(byte_mode) +
+                               ". This build implements 0 (GPT-2 byte map) and 1 "
+                               "(raw characters with byte_fallback); the field "
+                               "says which ALPHABET the vocabulary is indexed "
+                               "by, and reading it as the other one produces ids "
+                               "that are all plausible and none of them right.");
+
+    // Two of the new fields are only meaningful together with something that
+    // uses them, and a missing value would make the corresponding stage a
+    // no-op rather than an error: Metaspace with no replacement splits on
+    // nothing, and norm == 2 with an empty replacement rewrites no spaces --
+    // which for this checkpoint means no space has a symbol and nothing
+    // tokenizes. Both are refused here, at load, by name.
+    if (pre_tokenizer == 1 && replacement.empty())
+      throw std::runtime_error(
+          "tokenizer_bbpe: the table declares the Metaspace pre-tokenizer and "
+          "carries no replacement character. Refusing rather than splitting on "
+          "nothing.");
+    if (normalizer == 2 && norm_replacement.empty())
+      throw std::runtime_error(
+          "tokenizer_bbpe: the table declares the Replace normalizer and "
+          "carries no replacement string, so a space would not be rewritten "
+          "and nothing would tokenise the way the checkpoint does.");
+  } else {
+    // v1 tables predate both flags. Recording them as false keeps every
+    // pre-existing table's behaviour bit-identical, which is the whole reason
+    // the version branches here rather than defaulting in one place.
+    pre_tokenizer = 0;
+    prepend_scheme = 0;
+    metaspace_split = false;
+    byte_fallback = false;
+    fuse_unk = false;
+    byte_mode = 0;      // every v1 table this generator wrote was ByteLevel
+  }
+
   if (id_to_token_.empty())
     throw std::runtime_error("tokenizer_bbpe: empty vocabulary");
 }
@@ -417,8 +485,16 @@ const std::string &BbpeTokenizer::token_of(int32_t id) const {
   return id_to_token_[static_cast<size_t>(id)];
 }
 
-// --- BPE over one pre-tokenized, byte-mapped word ------------------------
+// --- BPE over one pre-tokenized word ------------------------------------
+//
+// Stage 4 (build symbols) and stage 5 (merge) are SEPARATE, and that split is
+// this phase's whole finding. The merge engine is alphabet-agnostic: it takes a
+// sequence of ids and applies merges lowest-rank first. What decides the ids is
+// the vocabulary's alphabet, and there are two of them --
 
+// byte_mode 0: GPT-2 bytes_to_unicode(). The WORD has already been through the
+// map by the caller; every codepoint in it is one of the 256 printable
+// stand-ins and all 256 are vocabulary entries, which the generator checks.
 void BbpeTokenizer::bpe_word(const std::string &mapped,
                              std::vector<int32_t> &out) const {
   const std::vector<uint32_t> cps = utf8_decode(mapped);
@@ -428,15 +504,91 @@ void BbpeTokenizer::bpe_word(const std::string &mapped,
     std::string ch;
     utf8_append(ch, cp);
     auto it = token_to_id_.find(ch);
-    if (it == token_to_id_.end()) {
-      // Unreachable for valid UTF-8 input: the generator verifies that every
-      // byte which can occur in UTF-8 has a vocabulary entry, and the decoder
-      // above guarantees the input is valid. Dropped rather than guessed --
-      // there is no <unk> in this family to substitute.
+    if (it != token_to_id_.end()) {
+      symbols.push_back(it->second);
       continue;
     }
-    symbols.push_back(it->second);
+    // Unreachable: the generator checks that every byte which can occur in
+    // UTF-8 is an entry in this alphabet. A table that reaches here was written
+    // by something else.
+    throw std::runtime_error(
+        "tokenizer_bbpe: byte_mode 0 and a character is missing from the "
+        "vocabulary. The generator checks that all 256 GPT-2 byte characters "
+        "are present, so this table was not written by it.");
   }
+  bpe_symbols(symbols, out);
+}
+
+// byte_mode 1: the vocabulary is indexed by CHARACTERS, and a character nothing
+// can represent falls back to its UTF-8 BYTES -- one `<0xNN>` token per byte --
+// which is what `byte_fallback: true` promises and why it exists at all. This is
+// the SentencePiece mechanism, and the old generator's refusal message used to
+// point at tokenizer_gemma.cpp for it while being wrong about which tokenizer
+// this was.
+void BbpeTokenizer::bpe_word_raw(const std::string &word,
+                                std::vector<int32_t> &out) const {
+  const std::vector<uint32_t> cps = utf8_decode(word);
+  std::vector<int32_t> symbols;
+  symbols.reserve(cps.size());
+  bool prev_was_unk = false;
+  for (uint32_t cp : cps) {
+    std::string ch;
+    utf8_append(ch, cp);
+    auto it = token_to_id_.find(ch);
+    if (it != token_to_id_.end()) {
+      symbols.push_back(it->second);
+      prev_was_unk = false;
+      continue;
+    }
+    if (byte_fallback) {
+      // One `<0xNN>` per UTF-8 BYTE. The generator allows ONE piece to be
+      // absent, and that is sound rather than convenient: a missing piece can
+      // only be a byte whose single-byte CHARACTER already has an entry (this
+      // checkpoint has no `<0x09>` and tab is id 226), and a multi-byte
+      // character only ever contains continuation bytes >= 0x80. So this arm,
+      // which is reached only for a character with no entry of its own, cannot
+      // be the one that needs the piece that is missing.
+      bool any = false;
+      for (unsigned char b : ch) {
+        char key[8];
+        std::snprintf(key, sizeof(key), "<0x%02X>", b);
+        auto bit = token_to_id_.find(key);
+        if (bit == token_to_id_.end())
+          throw std::runtime_error(
+              std::string("tokenizer_bbpe: the vocabulary declares byte_fallback "
+                          "but has no '") + key + "' piece, and no <unk> either. "
+                          "byte_fallback is the promise that ANY byte tokenizes; "
+                          "this table does not keep it.");
+        symbols.push_back(bit->second);
+        any = true;
+      }
+      prev_was_unk = false;
+      (void)any;
+      continue;
+    }
+    if (unk_id < 0)
+      throw std::runtime_error(
+          "tokenizer_bbpe: the vocabulary has no entry for a character that "
+          "occurs in this text, records no byte_fallback to split it into "
+          "<0xNN> pieces, and names no <unk> token to substitute for it. There "
+          "is nothing correct to emit, and dropping the character would shorten "
+          "the word by one token without saying so.");
+    // `fuse_unk` decides whether a RUN of them is one token or one each, and
+    // it is RECORDED rather than assumed: this checkpoint sets it and a
+    // neighbouring one might not.
+    if (fuse_unk && prev_was_unk) continue;
+    symbols.push_back(unk_id);
+    prev_was_unk = true;
+  }
+  bpe_symbols(symbols, out);
+}
+
+// Stage 5. Doubly-linked list plus a lazily-invalidated min-heap on merge rank;
+// entries are re-checked on pop because an earlier merge may have consumed one
+// of their endpoints. This is tokenizer_gemma.cpp's engine deliberately kept as
+// the same code shape, so the two can be read against each other.
+void BbpeTokenizer::bpe_symbols(const std::vector<int32_t> &symbols,
+                                std::vector<int32_t> &out) const {
   if (symbols.empty()) return;
 
   struct Node { int32_t id; int prev, next; bool alive; };
@@ -495,69 +647,181 @@ void BbpeTokenizer::bpe_word(const std::string &mapped,
     if (nodes[i].alive) out.push_back(nodes[i].id);
 }
 
+// --- the pre-tokenizers, one function each
+//
+// Two DIFFERENT segmenters, not one with a mode. The GPT-2 regex below is a
+// character-class scanner over four classes plus a contractions list; Metaspace
+// runs no regex at all -- it cuts in front of every occurrence of one character,
+// keeps that character at the head of the piece that follows, and drops the
+// empty leading piece. Putting a Metaspace branch inside the regex scanner would
+// put a per-character test on the hot path for the checkpoints that do not use
+// it, in exchange for sharing nothing.
+
+// GPT-2:
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+void BbpeTokenizer::emit_gpt2_words(const std::vector<uint32_t> &cps,
+                                    std::vector<int32_t> &out) const {
+  const size_t n = cps.size();
+  size_t i = 0;
+  while (i < n) {
+    size_t j = i;
+    bool matched_contraction = false;
+    for (const char *c : kContractions) {
+      const size_t len = std::strlen(c);
+      if (i + len > n) continue;
+      bool eq = true;
+      for (size_t k = 0; k < len; ++k)
+        if (cps[i + k] != static_cast<uint32_t>(static_cast<unsigned char>(c[k]))) {
+          eq = false;
+          break;
+        }
+      if (eq) { j = i + len; matched_contraction = true; break; }
+    }
+    if (!matched_contraction) {
+      j = i;
+      // The regex's ` ?` is a literal U+0020, not `\s?`.
+      if (cps[j] == 0x20 && j + 1 < n && char_class(cps[j + 1]) != bbpe_uni::kSpace)
+        ++j;
+      const uint8_t k = char_class(cps[j]);
+      if (k != bbpe_uni::kSpace) {
+        while (j < n && char_class(cps[j]) == k) ++j;
+      } else {
+        // `\s+(?!\S)` then `\s+`: hold the last space back for the word
+        // that follows it, unless the run ends the text.
+        while (j < n && char_class(cps[j]) == bbpe_uni::kSpace) ++j;
+        if (j < n && j - 1 > i) --j;
+      }
+    }
+    byte_map_and_bpe(cps, i, j, out);
+    i = j;
+  }
+}
+
+// Metaspace, `split: true`.
+//
+// MEASURED against tokenizers 0.22, not derived: the boundary is "cut in front
+// of every replacement character, keep it with the piece that follows, drop the
+// empty leading piece". So "▁▁x" is ["▁", "▁x"] and "▁▁▁x" is ["▁", "▁", "▁x"] --
+// three pieces, not one and not two. The obvious alternative ("the delimiter is
+// removed and the pieces are what is left") gives ["", "", "x"], which is two
+// empty pieces and a word, and the difference is one token per leading marker.
+//
+// With `split: false` there is one piece, the whole segment.
+void BbpeTokenizer::emit_metaspace_words(const std::vector<uint32_t> &cps,
+                                         const std::vector<uint32_t> &reps,
+                                         std::vector<int32_t> &out) const {
+  if (!metaspace_split || reps.size() != 1) {
+    byte_map_and_bpe(cps, 0, cps.size(), out);
+    return;
+  }
+  const uint32_t R = reps[0];
+  size_t start = 0;
+  for (size_t i = 1; i < cps.size(); ++i) {
+    if (cps[i] != R) continue;
+    byte_map_and_bpe(cps, start, i, out);
+    start = i;
+  }
+  byte_map_and_bpe(cps, start, cps.size(), out);
+}
+
+// Stages 4 and 5: build this word's symbols in the vocabulary's alphabet, then
+// merge them. The alphabet is the only difference between the two paths, and it
+// is one branch rather than two copies of the scanner.
+void BbpeTokenizer::byte_map_and_bpe(const std::vector<uint32_t> &cps,
+                                     size_t lo, size_t hi,
+                                     std::vector<int32_t> &out) const {
+  if (hi <= lo) return;
+  std::string word;
+  word.reserve((hi - lo) * 2);
+  for (size_t k = lo; k < hi; ++k) utf8_append(word, cps[k]);
+  if (byte_mode == 0) {
+    const ByteMap &bm = byte_map();
+    std::string mapped;
+    mapped.reserve(word.size() * 2);
+    for (char ch : word)
+      utf8_append(mapped, bm.to_cp[static_cast<unsigned char>(ch)]);
+    bpe_word(mapped, out);
+  } else {
+    bpe_word_raw(word, out);
+  }
+}
+
+void BbpeTokenizer::emit_words(const std::vector<uint32_t> &cps,
+                               std::vector<int32_t> &out) const {
+  if (pre_tokenizer == 1) {
+    // Decoded ONCE per segment rather than per character in the loop above.
+    const std::vector<uint32_t> reps = utf8_decode(replacement);
+    emit_metaspace_words(cps, reps, out);
+  } else {
+    emit_gpt2_words(cps, out);
+  }
+}
+
 // --- the whole pipeline --------------------------------------------------
 
 std::vector<int32_t> BbpeTokenizer::tokenize(const std::string &text) const {
   std::vector<int32_t> out;
+  // Metaspace's prepend_scheme == "first" prepends to the FIRST segment only,
+  // and segments here are the pieces between added-token matches -- so "first"
+  // needs to know whether it has already had its turn.
+  bool first_segment = true;
 
   // Stage 1: split on added tokens. Everything between matches is an
   // ordinary piece and goes through stages 2-5; a match contributes its id
   // and nothing else.
   auto run_ordinary = [&](const std::string &piece) {
-    if (piece.empty()) return;
+    if (piece.empty()) return;   // not a segment; see first_segment below
 
     // Stage 2: normalize.
     std::vector<uint32_t> cps = utf8_decode(piece);
-    if (normalizer == 1) cps = nfc(cps);
-    if (add_prefix_space && !cps.empty() && cps[0] != 0x20)
-      cps.insert(cps.begin(), 0x20);
-
-    // Stage 3: pre-tokenize with the GPT-2 scanner.
-    const size_t n = cps.size();
-    size_t i = 0;
-    const ByteMap &bm = byte_map();
-    std::string word, mapped;
-    while (i < n) {
-      size_t j = i;
-      bool matched_contraction = false;
-      for (const char *c : kContractions) {
-        const size_t len = std::strlen(c);
-        if (i + len > n) continue;
-        bool eq = true;
-        for (size_t k = 0; k < len; ++k)
-          if (cps[i + k] != static_cast<uint32_t>(static_cast<unsigned char>(c[k]))) {
-            eq = false;
-            break;
-          }
-        if (eq) { j = i + len; matched_contraction = true; break; }
-      }
-      if (!matched_contraction) {
-        j = i;
-        // The regex's ` ?` is a literal U+0020, not `\s?`.
-        if (cps[j] == 0x20 && j + 1 < n && char_class(cps[j + 1]) != bbpe_uni::kSpace)
-          ++j;
-        const uint8_t k = char_class(cps[j]);
-        if (k != bbpe_uni::kSpace) {
-          while (j < n && char_class(cps[j]) == k) ++j;
-        } else {
-          // `\s+(?!\S)` then `\s+`: hold the last space back for the word
-          // that follows it, unless the run ends the text.
-          while (j < n && char_class(cps[j]) == bbpe_uni::kSpace) ++j;
-          if (j < n && j - 1 > i) --j;
+    if (normalizer == 1) {
+      cps = nfc(cps);
+    } else if (normalizer == 2) {
+      // Replace(literal -> literal). The generator pins the pattern to a plain
+      // STRING, so this is a substring rewrite and not a regex match -- which is
+      // the only reason this is not a regex engine.
+      //
+      // And rewriting the spaces is not cosmetic here, it is the whole reason
+      // this checkpoint has a normalizer at all: ' ' (U+0020) is NOT a
+      // vocabulary entry in this model, so a space has no symbol and nothing
+      // tokenizes until it has been rewritten. In a GPT-2 byte-level vocabulary
+      // the space would be U+0120 and this stage would not exist.
+      const std::vector<uint32_t> to = utf8_decode(norm_replacement);
+      if (!to.empty()) {
+        std::vector<uint32_t> rewritten;
+        rewritten.reserve(cps.size() + 4);
+        for (uint32_t cp : cps) {
+          if (cp == 0x20)
+            rewritten.insert(rewritten.end(), to.begin(), to.end());
+          else
+            rewritten.push_back(cp);
         }
+        cps.swap(rewritten);
       }
-
-      // Stage 4: this word's UTF-8 bytes -> printable codepoints.
-      word.clear();
-      for (size_t k = i; k < j; ++k) utf8_append(word, cps[k]);
-      mapped.clear();
-      for (char ch : word)
-        utf8_append(mapped, bm.to_cp[static_cast<unsigned char>(ch)]);
-
-      // Stage 5.
-      bpe_word(mapped, out);
-      i = j;
     }
+    if (pre_tokenizer == 1) {
+      // Stage 3 (Metaspace). The prepend is here and the boundary rule is in
+      // emit_metaspace_words; this is the whole of the prepend.
+      const std::vector<uint32_t> reps = utf8_decode(replacement);
+      if (reps.size() == 1) {
+        const uint32_t R = reps[0];
+        const bool want = prepend_scheme == 2 ||
+                          (prepend_scheme == 1 && first_segment);
+        if (want && !cps.empty() && cps[0] != R) cps.insert(cps.begin(), R);
+      }
+    } else if (add_prefix_space && !cps.empty() && cps[0] != 0x20) {
+      cps.insert(cps.begin(), 0x20);
+    }
+    // An EMPTY piece is not a segment for the purpose of prepend_scheme
+    // "first": HuggingFace skips empty splits entirely, and counting one here
+    // would spend the single prepend on nothing.
+    first_segment = false;
+
+    // Stage 3: pre-tokenize. The two scanners are separate functions rather
+    // than one with a branch per character: Metaspace runs no regex and shares
+    // no rule with the GPT-2 pattern, and merging them would put a per-character
+    // test on the hot path to serve a checkpoint shape that does not use it.
+    emit_words(cps, out);
   };
 
   // The added-token spans, left to right, leftmost-longest -- then LSTRIP,
