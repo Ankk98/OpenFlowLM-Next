@@ -259,8 +259,19 @@ void Head::forward(std::vector<float> &h, const std::vector<float> &pad,
         float *ctxb = ctx_.data() + b * S * d + h * head_dim_;
         for (int64_t i = 0; i < S; ++i) {
           const float *qi = qb + i * 3 * d;
+          // ONE HEAD'S SLICE, and `head_dim_` floats of it -- not `d`.
+          //
+          // This was `t < d`, and it is the worst bug in the phase: `acc` points
+          // at head h's slice of a d-wide row, so zeroing `d` floats from there
+          // ERASES THE OTHER Nh-1 HEADS' OUTPUTS for this (b, i). Whichever
+          // head happened to run last won the zeroing, so 11 of 12 heads'
+          // attention outputs were destroyed -- and which 11 depended on thread
+          // interleaving, which is why two identical runs disagreed.
+          //
+          // It did not crash and it did not look wrong. The model answered, with
+          // confidences near 0.5, and every number was a plausible float.
           float *acc = ctxb + i * d;
-          for (int64_t t = 0; t < d; ++t) acc[t] = 0.f;
+          for (int64_t t = 0; t < head_dim_; ++t) acc[t] = 0.f;
           // max over j, then exp, then normalise. Two passes over j per i, which
           // is the price of not needing a scratch row per (i, h).
           float mx = -INFINITY;
@@ -284,8 +295,9 @@ void Head::forward(std::vector<float> &h, const std::vector<float> &pad,
             // gather, so the row is zeroed and the caller's answer for it is
             // uniform. Upstream cannot reach this: it never builds an
             // all-padding row, because collate_items refuses when
-            // marker_mask.sum() would be zero.
-            for (int64_t t = 0; t < d; ++t) acc[t] = 0.f;
+            // marker_mask.sum() would be zero. `head_dim_` floats, for the same
+            // reason as the zeroing above: `d` would erase the other heads.
+            for (int64_t t = 0; t < head_dim_; ++t) acc[t] = 0.f;
             continue;
           }
           float sum = 0.f;

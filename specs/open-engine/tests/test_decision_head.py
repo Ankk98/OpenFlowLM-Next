@@ -96,6 +96,46 @@ int main(int argc, char **argv) {
       for (const auto &o : out) std::printf("OPT %s\n", o.c_str());
       return 0;
     }
+    if (mode == "repro") {
+      // The head is a PURE FUNCTION of its input. This was not: the attention
+      // accumulator was zeroed with `t < d` where it must be `t < head_dim_`,
+      // so each head erased the other eleven. With one worker the last head
+      // always won -- wrong but STABLE; with twelve it was wrong and UNSTABLE,
+      // and two identical `oflm decide` calls disagreed on a score by 1.5e-02.
+      //
+      // No cosine and no argmax gate can see this: every value was a plausible
+      // float and the answers were merely wrong. Only equality can.
+      npue::File mf(argv[2]);
+      // The geometry globals come from the lease; without it hidden/heads are 0
+      // and every shape check in Head's constructor fires at once.
+      npue::enc::ShapeLease lease(mf);
+      npue::dec::Head h(mf);
+      const int64_t R = 4, S = 256, D = h.hidden();
+      std::vector<float> in((size_t)(R * S * D));
+      std::vector<float> pad((size_t)(R * S));
+      unsigned sd = 12345u;
+      for (size_t i = 0; i < in.size(); ++i) {
+        sd = sd * 1664525u + 1013904223u;
+        in[i] = (float)((sd >> 8) & 0xffff) / 32768.0f - 1.0f;
+      }
+      for (int64_t i = 0; i < R * S; ++i)
+        pad[(size_t)i] = (i % S) < 200 ? 1.0f : 0.0f;
+      auto run = [&](int workers) {
+        auto a = in;
+        h.forward(a, pad, R, S, workers);
+        return a;
+      };
+      const auto w1 = run(1), w1b = run(1);
+      const auto w12 = run(12), w12b = run(12);
+      double worst = 0;
+      for (size_t i = 0; i < w1.size(); ++i) {
+        const double dd = std::fabs((double)w1[i] - (double)w12[i]);
+        if (dd > worst) worst = dd;
+      }
+      std::printf("repeat_w1 %d cross %d repeat_w12 %d maxdiff %g\n",
+                  int(w1 == w1b), int(w1 == w12), int(w12 == w12b), worst);
+      return 0;
+    }
     if (mode == "readout") {
       // stdin: k, kmax, t, then k logits
       long k, kmax; double t;
@@ -467,3 +507,46 @@ def test_act_head_is_COMPUTED_and_not_returned():
     j = max(0, i - 900)
     assert "COMPUTED AND DISCARDED" in hdr[j:i + 40], hdr[j:i + 40]
     assert "AUROC 0.30" in hdr[j:i + 40]
+
+
+# --------------------------------------------------------------------------
+# the head is a PURE FUNCTION of its input
+# --------------------------------------------------------------------------
+
+def test_the_heads_output_does_not_depend_on_its_thread_count(host, monkeypatch):
+    """Bit-identical across repeats AND across worker counts."""
+    import glob
+    import os
+    import struct
+    monkeypatch.setenv("OFLM_LAYA_CONTAINER", "")
+    cands = []
+    if os.environ.get("OFLM_LAYA_CONTAINER"):
+        cands.append(os.environ["OFLM_LAYA_CONTAINER"])
+    for root in (os.environ.get("OFLM_MODEL_PATH", ""),
+                 os.path.expanduser("~/.config/oflm/models"),
+                 os.path.expanduser("~/.oflm/models"),
+                 "/home/ankk98/models"):
+        if root and os.path.isdir(root):
+            cands += sorted(glob.glob(os.path.join(root, "**", "*.npue"),
+                                      recursive=True))
+    chosen = None
+    for c in (x for x in cands if os.path.isfile(x)):
+        try:
+            with open(c, "rb") as f:
+                f.seek(16)
+                off, ln = struct.unpack("<QQ", f.read(16))
+                blob = f.read(ln).decode("utf-8", "ignore")
+            if "modernbert" in blob:
+                chosen = c
+                break
+        except Exception:
+            continue
+    if chosen is None:
+        pytest.skip("no packed laya container on this host; set "
+                    "OFLM_LAYA_CONTAINER to run this")
+    p = _run(host, "repro", chosen)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "repeat_w1 1 cross 1 repeat_w12 1 maxdiff 0" in p.stdout, (
+        "the head's output depends on its thread count, or is not repeatable "
+        "run to run -- which is the signature of a write wider than the slice it "
+        "owns:\n" + p.stdout)
