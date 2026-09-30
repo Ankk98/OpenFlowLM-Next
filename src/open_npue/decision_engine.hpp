@@ -38,6 +38,7 @@
 #define OPENFLOWLM_DECISION_ENGINE_H
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -56,6 +57,23 @@ enum : int64_t { QTYPE_CHOICE = 0, QTYPE_SCORE = 1, QTYPE_NOUL = 2 };
 /// One (state, question) row, already tokenised. The prompt builder's output;
 /// the engine does not know how a prompt is formatted, which is deliberate --
 /// see `build_prompt` for why.
+/// Upstream's temperature bucket key, `common.py:543`:
+///   size = "2" if k <= 2 else "3-5" if k <= 5 else "6-10" if k <= 10 else "11+"
+///   key  = "<qtype name>:<size>"
+///
+/// It is keyed on k and NOT on the question type alone because the fitted
+/// temperatures are per (type, option count): a 12-option choice is a different
+/// calibration from a 2-option noul, and upstream fits them separately. Reading
+/// the map by qtype alone would silently apply a 2-option calibration to a
+/// 12-option question, which is the error the bucket exists to prevent.
+inline std::string temp_bucket(int64_t qtype, int64_t k) {
+  const char *name = "choice";
+  if (qtype == QTYPE_SCORE) name = "score";
+  else if (qtype == QTYPE_NOUL) name = "noul";
+  const char *size = k <= 2 ? "2" : k <= 5 ? "3-5" : k <= 10 ? "6-10" : "11+";
+  return std::string(name) + ":" + size;
+}
+
 struct PromptRow {
   std::vector<int32_t> ids;
   /// Where the [MASK] markers are, one per option, in `ids`. Length is this
@@ -190,8 +208,26 @@ class Decider {
   ///
   /// Serialised by a mutex: the Encoder holds one hw_context and two concurrent
   /// decides would interleave dispatches into it.
+  /// `temperature` is the PER-QTYPE base, `temperature[qtype]`.
+  ///
+  /// `temperature_is_override` says the caller means it for every row, which
+  /// bypasses the container's per-bucket `temperature_by_options`. Without the
+  /// flag a caller override would be applied as the base and then overwritten by
+  /// the bucket for exactly the option counts the checkpoint fitted -- which is
+  /// the bug this parameter exists to make impossible: an override that is
+  /// silently ignored for most of what it was sent for.
+  std::map<std::string, float> temperature_by_options_;
+
   std::vector<RowAnswer> decide(const std::vector<PromptRow> &rows,
-                                const std::vector<float> &temperature);
+                                const std::vector<float> &temperature,
+                                bool temperature_is_override = false);
+
+  /// The container's `temperature_by_options`, verbatim. Empty for this
+  /// checkpoint, which is why the plumbing is untested by the default model and
+  /// why the fixture in the handoff has to run against a synthetic one.
+  const std::map<std::string, float> &temperature_by_options() const {
+    return temperature_by_options_;
+  }
 
   int64_t max_seq() const;
   int64_t hidden() const;

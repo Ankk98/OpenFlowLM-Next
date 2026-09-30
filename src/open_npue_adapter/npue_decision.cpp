@@ -264,17 +264,16 @@ std::vector<decision::decision_answer> NpueDecision::decide(
   //
   // The flag is `temperature_overridden` and not the value, because 1.0 is both
   // "the caller asked for a neutral scale" and "the caller asked for nothing".
+  //
+  // ORDER IS THE WHOLE FIX. The container is read FIRST and the caller's
+  // override applied SECOND. It was the other way round, and the override was
+  // therefore dead: `t.assign(3, ...)` wrote the caller's value and the
+  // container block below overwrote all three of them unconditionally. With
+  // this checkpoint's `[1.0, 1.0, 1.0]` a `--decisiontemperature 3.0` run
+  // returned BYTE-IDENTICAL probabilities to the default, and nothing about the
+  // output looked wrong -- 1.0 is the neutral scale, so a discarded override
+  // produces exactly the answer a working neutral scale would.
   std::vector<float> t = impl_->temperature;
-  if (request.temperature_overridden) {
-    if (!(request.temperature >= 0.5 && request.temperature <= 5.0))
-      throw std::runtime_error(
-          "the request's temperature override is " +
-          std::to_string(request.temperature) +
-          ", outside the pinned schema's [0.5, 5.0]. parse_request already "
-          "refuses that range; this is the check that survives a caller that "
-          "set the flag by hand without going through the parser.");
-    t.assign(3, static_cast<float>(request.temperature));
-  }
   {
     npue::File probe(impl_->container);
     const std::string raw = probe.config_string("temperature");
@@ -294,9 +293,33 @@ std::vector<decision::decision_answer> NpueDecision::decide(
           "Upstream refuses a different length for the same reason: it indexes "
           "the list by question type, so a short one is an IndexError on the "
           "first score question.");
+    // The container's own values get the same [0.5, 5.0] bound the caller's do.
+    // Upstream applies that bound when it USES a temperature, and a checkpoint
+    // that ships 0.1006 for choice:11+ is exactly the case the bound exists for.
+    for (int k = 0; k < 3; ++k)
+      if (!(t[static_cast<size_t>(k)] >= 0.5f && t[static_cast<size_t>(k)] <= 5.0f))
+        throw std::runtime_error(
+            "the container's temperature[" + std::to_string(k) + "]=" +
+            std::to_string(t[static_cast<size_t>(k)]) +
+            " is outside [0.5, 5.0]. A fitted temperature below 1 sharpens the "
+            "logits rather than softening them, and upstream's own shipped "
+            "choice:11+ value of 0.1006 multiplies them ~10x -- a 0.24 top "
+            "probability published as 0.99, so a caller gating on confidence is "
+            "told a coin flip is a certainty. Refused by name rather than "
+            "applied.");
+  }
+  if (request.temperature_overridden) {
+    if (!(request.temperature >= 0.5 && request.temperature <= 5.0))
+      throw std::runtime_error(
+          "the request's temperature override is " +
+          std::to_string(request.temperature) +
+          ", outside the pinned schema's [0.5, 5.0]. parse_request already "
+          "refuses that range; this is the check that survives a caller that "
+          "set the flag by hand without going through the parser.");
+    t.assign(3, static_cast<float>(request.temperature));
   }
 
-  auto raw = impl_->dec->decide(rows, t);
+  auto raw = impl_->dec->decide(rows, t, request.temperature_overridden);
   if (raw.size() != request.questions.size())
     throw std::runtime_error(
         "the engine returned " + std::to_string(raw.size()) + " rows for " +

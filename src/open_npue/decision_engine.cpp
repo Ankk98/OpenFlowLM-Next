@@ -417,6 +417,35 @@ Decider::Decider(const Options &o)
         "'. The head reads type_emb/scorer/act_head/head.layers.*, none of "
         "which exist in another arch's container, and a refusal here is one "
         "line rather than a scatter of missing-tensor errors.");
+  // `temperature_by_options`, read here rather than in the adapter because the
+  // LOOKUP is per row and depends on k, which only the engine knows. The packer
+  // already copies it verbatim; this is where it starts being used.
+  //
+  // Every value is range-checked against upstream's [0.5, 5.0] at LOAD, not at
+  // apply. Upstream's reason (common.py:548-554) is worth repeating because it
+  // is the whole justification for the bound: a fitted temperature below 1
+  // SHARPENS, and the shipped `choice:11+` is 0.1006, which multiplies logits
+  // ~10x -- so a 0.24 top probability is published as 0.99 and a caller gating
+  // on confidence is told a coin flip is a certainty. Refusing at load names the
+  // checkpoint; refusing at apply would name it once per question.
+  {
+    const std::string raw = model_.config_string("temperature_by_options");
+    const npue::json::Value v = npue::json::parse(raw);
+    if (v.is_object()) {
+      for (const auto &kv : v.as_object()) {
+        const float tv = static_cast<float>(kv.second.as_number());
+        if (!(tv >= 0.5f && tv <= 5.0f))
+          throw std::runtime_error(
+              "temperature_by_options[\"" + kv.first + "\"]=" +
+              std::to_string(tv) + " is outside [0.5, 5.0]. A fitted "
+              "temperature below 1 sharpens the logits rather than softening "
+              "them, and upstream's own shipped choice:11+ value of 0.1006 is a "
+              "~10x sharpener that publishes a coin flip as 0.99. Refusing the "
+              "checkpoint by name is kinder than applying it per question.");
+        temperature_by_options_[kv.first] = tv;
+      }
+    }
+  }
   head_ = std::make_unique<Head>(model_);
   head_max_len_ = model_.config_int("head_max_len");
   max_seq_len_ = model_.config_int("max_seq_len");
@@ -632,7 +661,8 @@ Decider::Prompt Decider::build_prompt(const std::string &type_text,
 }
 
 std::vector<RowAnswer> Decider::decide(const std::vector<PromptRow> &rows_in,
-                                       const std::vector<float> &temperature) {
+                                       const std::vector<float> &temperature,
+                                       bool temperature_is_override) {
   if (rows_in.empty()) return {};
   std::lock_guard<std::mutex> lk(call_mu_);
   enc::Encoder &e = *stack_.lead;
@@ -796,11 +826,24 @@ std::vector<RowAnswer> Decider::decide(const std::vector<PromptRow> &rows_in,
       // every slot is padded. -1e4 is upstream's value and it is the right one.
       std::vector<float> z(static_cast<size_t>(kmax), -1.0e4f);
       for (int64_t j = 0; j < k; ++j) z[static_cast<size_t>(j)] = A.logits[static_cast<size_t>(j)];
-      const float t = temperature.empty() ? 1.0f
-                                           : temperature[static_cast<size_t>(rows_in[ri].qtype)];
+      // Per (qtype, k) bucket first, per-qtype base second -- upstream's order,
+      // `temperature_by_options.get(temp_bucket(qt, k), temperature[qt])`.
+      //
+      // The k is THIS row's marker count, not kmax, so a 2-of-5 row is
+      // calibrated as a 2-option question. That is the point of the bucket: the
+      // fitted calibration is for the number of options actually present.
+      const std::string bucket =
+          temperature_is_override ? std::string()
+                                  : temp_bucket(rows_in[ri].qtype, k);
+      float t = temperature.empty() ? 1.0f
+                                   : temperature[static_cast<size_t>(rows_in[ri].qtype)];
+      if (!temperature_is_override && !bucket.empty()) {
+        const auto it = temperature_by_options_.find(bucket);
+        if (it != temperature_by_options_.end()) t = it->second;
+      }
       if (!(t > 0.f))
         throw std::runtime_error(
-            "temperature[" + std::to_string(rows_in[ri].qtype) + "] is " +
+            "the effective temperature for bucket " + bucket + " is " +
             std::to_string(t) + ". Upstream clamps temperatures to a positive "
             "range; zero would divide by zero and a negative one would flip the "
             "argmax, so neither is a caller error to pass on silently.");

@@ -96,6 +96,17 @@ int main(int argc, char **argv) {
       for (const auto &o : out) std::printf("OPT %s\n", o.c_str());
       return 0;
     }
+    if (mode == "buckets") {
+      // `temp_bucket` is a pure function and this checkpoint's
+      // temperature_by_options is `{}`, so nothing else in the tree exercises it.
+      // A bucket key that is spelled differently from upstream's is a silently
+      // missing calibration rather than an error, which is the worst kind.
+      for (int64_t qt = 0; qt < 3; ++qt)
+        for (int64_t k : {1, 2, 3, 5, 6, 10, 11, 40})
+          std::printf("BUCKET %lld %lld %s\n", (long long)qt, (long long)k,
+                      npue::dec::temp_bucket(qt, k).c_str());
+      return 0;
+    }
     if (mode == "repro") {
       // The head is a PURE FUNCTION of its input. This was not: the attention
       // accumulator was zeroed with `t < d` where it must be `t < head_dim_`,
@@ -550,3 +561,44 @@ def test_the_heads_output_does_not_depend_on_its_thread_count(host, monkeypatch)
         "the head's output depends on its thread count, or is not repeatable "
         "run to run -- which is the signature of a write wider than the slice it "
         "owns:\n" + p.stdout)
+
+
+# --------------------------------------------------------------------------
+# temp_bucket: the per-(type, option-count) calibration key
+# --------------------------------------------------------------------------
+
+BUCKET_CASES = [
+    # (qtype, k, expected) -- upstream common.py:543-545, verbatim.
+    (0, 1, "choice:2"), (0, 2, "choice:2"), (0, 3, "choice:3-5"),
+    (0, 5, "choice:3-5"), (0, 6, "choice:6-10"), (0, 10, "choice:6-10"),
+    (0, 11, "choice:11+"), (0, 40, "choice:11+"),
+    (1, 2, "score:2"), (1, 6, "score:6-10"), (1, 11, "score:11+"), (1, 40, "score:11+"),
+    (2, 2, "noul:2"), (2, 3, "noul:3-5"),
+]
+
+
+def test_temp_bucket_matches_upstream_exactly(host):
+    """`size` is "2" if k <= 2 else "3-5" if k <= 5 else "6-10" if k <= 10 else
+    "11+", and the key is "<qtype name>:<size>".
+
+    The boundaries are the whole test: `k <= 2` rather than `k == 2` means a
+    ONE-option question lands in the same bucket as a two-option one, and an
+    off-by-one here is a silently missing calibration rather than an error.
+    """
+    out = _run(host, "buckets").stdout
+    got = {}
+    for line in out.splitlines():
+        if line.startswith("BUCKET "):
+            _, qt, k, key = line.split()
+            got[(int(qt), int(k))] = key
+    for qt, k, want in BUCKET_CASES:
+        assert got.get((qt, k)) == want, (qt, k, want, got.get((qt, k)))
+
+
+def test_the_three_qtype_names_are_distinct(host):
+    """`type_emb.weight` is [3, d] indexed by QTYPES order, so a bucket name that
+    collides across types would apply one type's calibration to another."""
+    out = _run(host, "buckets").stdout
+    names = {line.split()[3].split(":")[0]
+             for line in out.splitlines() if line.startswith("BUCKET ")}
+    assert names == {"choice", "score", "noul"}, names
