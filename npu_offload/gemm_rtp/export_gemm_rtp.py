@@ -126,6 +126,43 @@ def shapes_for(batch, hidden=384, intermediate=None, gated=False,
     }
 
 
+def _require_npu_device() -> str:
+    """Assert that `iron.zeros(device="npu")` works here, and say why if not.
+
+    NOT a fallback to "cpu", and that is the whole point. These three tensors are
+    `zeros`: they exist so the ObjectFifos have a symbol and a shape, and nothing
+    is ever written through them on the export path. Which allocator serves them
+    is decided by the tensor class mlir-aie selected at IMPORT time -- the XRT one
+    if `pyxrt` imported, a CPU-only one otherwise -- and the two are not
+    interchangeable:
+
+      * the XRT class accepts device="npu", and pretiled_array() COMPILES.
+      * the CPU-only class rejects "npu", and passing "cpu" instead makes
+        pretiled_array() try to EXECUTE the design, which fails with
+        `Cannot run kernel; DefaultNPURuntime not set`.
+
+    So "cpu" is not a degraded mode here, it is a different operation with a
+    different and much more confusing error. The check states the real cause --
+    PyXRT is not importable on this interpreter -- because the error it prevents
+    says nothing about it.
+    """
+    try:
+        iron.zeros((8,), dtype=np.float32, device="npu")
+    except Exception as e:
+        raise SystemExit(
+            "iron.zeros(device=\"npu\") is rejected on this interpreter: "
+            f"{e}\n"
+            "That means mlir-aie selected its CPU-only tensor class, which it "
+            "does when `import pyxrt` fails -- and substituting device=\"cpu\" "
+            "is NOT a fix: it makes the export try to RUN the design instead of "
+            "compiling it, which fails with `Cannot run kernel; "
+            "DefaultNPURuntime not set`.\n"
+            "Install XRT's python bindings for THIS interpreter, or put a "
+            "pyxrt*.so built for it on PYTHONPATH. See "
+            "utilities/build-design-sets.py, which looks for one.")
+    return "npu"
+
+
 def core_columns(d):
     import re
     m = d / "input_with_addresses.mlir"
@@ -454,9 +491,10 @@ def main() -> int:
             mk = markers_for(sh, args.m, args.k, args.n, c_marker, a_str)
             purge(mk, args.cols, f"{name}@b{b}")
             M, K, N = sh["M"], sh["K"], sh["N"]
-            A = iron.zeros((M, K), dtype=a_np, device="npu")
-            B = iron.zeros((K, N), dtype=a_np, device="npu")
-            C = iron.zeros(M * N, dtype=c_np, device="npu")
+            dev = _require_npu_device()
+            A = iron.zeros((M, K), dtype=a_np, device=dev)
+            B = iron.zeros((K, N), dtype=a_np, device=dev)
+            C = iron.zeros(M * N, dtype=c_np, device=dev)
             pretiled_array(A, B, C, M=M, K=K, N=N, m=args.m, k=args.k,
                            n=args.n, n_aie_cols=args.cols,
                            dtype_in_str=a_str, dtype_out_str=acc_str,

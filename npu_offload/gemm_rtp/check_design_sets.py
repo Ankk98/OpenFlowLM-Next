@@ -62,7 +62,22 @@ def expected(argv: list[str]) -> dict:
         "cols": val("--cols", int, 8),
         # --batches defaults to "just --batch". THAT DEFAULT is the one-tier
         # bug above: omit the flag and you silently get a single tier.
+        #
+        # `val` reads the FIRST occurrence, which is the family when the family
+        # carries the flag and `common` no longer does. While --batches lived in
+        # `common` these two disagreed -- the exporter took the LAST (common's)
+        # and this took the FIRST (the family's) -- so a family could name its
+        # tiers, be built with different ones, and be reported as a MISMATCH
+        # whose own advice was to move the flag back into `common` and
+        # invalidate all six existing models. The flags now live in one place
+        # per family, which is the only order both readers can agree on.
         "tiers": sorted(int(b) for b in batches.split(",")) if batches else [batch],
+        # The sequence length the design was compiled at. Two different splits of
+        # one M are indistinguishable afterwards -- the runtime inverts
+        # batch = M/seq at load time -- so it has to be RECORDED and compared,
+        # and it was not, which is why the original gate could not tell a
+        # seq-1024 design from a seq-64 one.
+        "seq": val("--seq", int, 64),
         "tg_depth": val("--tg-depth", int),
         "a_dtype": "int8" if "--int8" in argv else "bf16",
     }
@@ -79,6 +94,7 @@ def actual(d: dict) -> dict:
         "tile_n": (d.get("tile") or {}).get("n"),
         "cols": d.get("cols"),
         "tiers": sorted(d.get("tiers") or []),
+        "seq": d.get("seq"),
         "tg_depth": d.get("tg_depth"),
         "a_dtype": d.get("a_dtype", "bf16"),
     }
@@ -116,6 +132,43 @@ def main() -> int:
                       f"design.json says {g!r}")
         else:
             print(f"ok       {name}")
+
+    # The stream COUNT, which no field above covers.
+    #
+    # `expected()`/`actual()` compare declared metadata; they never look at
+    # `streams[]`, so a design built for the wrong number of tiers can declare
+    # the right tiers and carry too few instruction streams -- the runtime then
+    # finds no stream for the tier it picked and dispatches against a slot
+    # nothing bound. One stream per (shape, tier) is the invariant, and it is
+    # cheap to check here rather than at load on hardware.
+    for fam in spec["families"]:
+        name = fam["name"]
+        dj = root / name / "gemm_rtp" / "design.json"
+        if not dj.is_file():
+            continue          # already reported above
+        d = json.loads(dj.read_text(encoding="utf-8"))
+        argv = list(fam["args"]) + list(common)
+        want_tiers = expected(argv)["tiers"]
+        want = len(want_tiers) * 4          # STREAM_ORDER is qkv/ao/fu/fd
+        got = len(d.get("streams") or [])
+        if got != want:
+            bad += 1
+            print(f"MISMATCH {name}: streams[] has {got} entries, "
+                  f"{want_tiers} tiers x 4 ops needs {want}")
+        else:
+            # And the M each stream was compiled at, since that is the number
+            # that silently decides both the dispatch shape and the padding.
+            seq = expected(argv)["seq"]
+            wrong = []
+            for st in d["streams"]:
+                if int(st.get("M", -1)) != int(st["batch"]) * seq:
+                    wrong.append((st["op"], st["batch"], st.get("M")))
+            if wrong:
+                bad += 1
+                print(f"MISMATCH {name}: stream M != batch x seq ({seq}): "
+                      f"{wrong[:4]}")
+            else:
+                print(f"ok       {name} ({got} streams, seq {seq})")
 
     if bad:
         print(f"\n{bad} famil{'y' if bad == 1 else 'ies'} disagree with "

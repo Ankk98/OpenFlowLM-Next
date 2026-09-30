@@ -1131,3 +1131,110 @@ def test_a_special_id_outside_the_vocabulary_is_refused(driver, load_driver, tmp
     assert p.returncode == 1
     assert "marker_token_id" in p.stderr and "vocabulary" in p.stderr, p.stderr
 
+
+
+# --------------------------------------------------------------------------
+# the design contract
+#
+# The packer and the compiled design have to agree on ONE thing that is not in
+# either file's own metadata: the B-tiling. The container carries a
+# `layout_hash` computed by the packer; the design carries the one the compiler
+# saw. stage_all() compares them before it will dispatch and refuses on a
+# mismatch with "The bytes would be the right size and the wrong order" -- the
+# right behaviour, and a check that cannot be exercised until both sides exist.
+#
+# So this is asserted against the BUILT artifacts, and it is skipped when they are
+# not built rather than asserted from the source: a hash recomputed from the same
+# function that produced it proves nothing.
+
+
+XCLBINS = REPO / "src/xclbins"
+FAMILIES = ["BERT-h768-gated-i1152-bfp16", "BERT-h768-gated-i1152-bf16"]
+
+
+def _built(family: str) -> dict | None:
+    p = XCLBINS / family / "gemm_rtp" / "design.json"
+    if not p.is_file():
+        return None
+    return json.loads(p.read_text())
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_the_containers_layout_hash_is_the_designs(family, packed):
+    """THE PHASE-3 GATE (b), deferred to here because the hash is a property of
+    the compiled design.
+
+    Both new families are -n 48 at the same tile_k, and `gemm_b_layout` only
+    ever sees (tile_k, tile_n, "BF16") -- so all four hidden-768 families carry
+    the SAME b_layout_hash byte for byte and the guard passes for any of them.
+    That is a convenience and it is also a hazard: it means the layout hash
+    cannot distinguish these designs from each other, so it is not evidence that
+    the RIGHT design was built. What distinguishes them is intermediate,
+    gated_ffn and emulate_bfp16, and check_design_sets.py is what checks those."""
+    d = _built(family)
+    if d is None:
+        pytest.skip(f"{family} is not built; run utilities/build-design-sets.py")
+    npue, _, tensors = packed
+    h = None
+    for name, t in tensors.items():
+        if t.get("layout_hash"):
+            h = t["layout_hash"]
+            break
+    assert h, "no packed tensor carries a layout_hash -- the packer stopped tiling"
+    assert h == d["b_layout_hash"], (
+        "the container's layout_hash does not match the design's; stage_all() "
+        "will refuse with 'The bytes would be the right size and the wrong order'")
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_the_design_serves_this_geometry_and_nothing_else(family):
+    """What the layout hash CANNOT tell you: that the design's GEMM shapes are
+    this model's. intermediate 1152 is the whole reason this family exists --
+    every other hidden-768 family here is 3072 -- and it is what makes
+    ffn_up 2304 wide and ffn_down consume K=1152."""
+    d = _built(family)
+    if d is None:
+        pytest.skip(f"{family} is not built")
+    assert d["hidden"] == HIDDEN
+    assert d["intermediate"] == INTER and INTER != 3072, \
+        "if this ever equals 3072 it is not a new geometry and the family note lies"
+    assert d["gated_ffn"] is True
+    assert d["qkv_n"] == 3 * HIDDEN
+    assert d["tile"]["n"] == 48 and d["tile"]["k"] == 64 and d["tile"]["m"] == 64
+    assert d["seq"] == MAX_SEQ, "the design's seq and the container's max_seq_len must agree"
+    ns = {s["N"] for s in d["streams"]}
+    assert ns == {3 * HIDDEN, HIDDEN, 2 * INTER}, ns
+    assert {s["K"] for s in d["streams"] if s["op"] == "ffn_down"} == {INTER}
+
+
+def test_the_two_datapath_families_differ_in_exactly_one_field():
+    """They have to be A/B-able, and `serves` picks between them, so they must
+    differ in `emulate_bfp16` and agree on everything else -- or the accuracy
+    gate is comparing two designs that differ for another reason and the losing
+    arm's number means nothing."""
+    a, b = (_built(f) for f in FAMILIES)
+    if a is None or b is None:
+        pytest.skip("both families must be built to compare them")
+    # `name` is "gemm_rtp" in both. `streams` is compared below because its
+    # `src` field is a CACHE MARKER -- the content hash a stream was compiled
+    # under -- and --emulate-bfp16 changes the kernel, so every marker is
+    # SUPPOSED to differ. That is the flag showing up in the one place it can,
+    # and it is why the exclusion is scoped to that field rather than to the
+    # whole streams list.
+    ignore = {"name", "streams"}   # streams is compared field-wise below
+    for k in set(a) | set(b):
+        if k in ignore:
+            continue
+        if k == "emulate_bfp16":
+            assert a[k] is True and b[k] is False
+        else:
+            assert a[k] == b[k], f"{k}: {a[k]!r} vs {b[k]!r}"
+    # The streams agree on every GEOMETRY field and differ only in the marker.
+    for sa, sb in zip(a["streams"], b["streams"]):
+        for k in sa:
+            if k == "src":
+                assert sa[k] != sb[k], \
+                    "the two arms share a cache marker: --emulate-bfp16 did not " \
+                    "reach the compiler, so these are the same design twice"
+            else:
+                assert sa[k] == sb[k], f"{k}: {sa[k]!r} vs {sb[k]!r}"
