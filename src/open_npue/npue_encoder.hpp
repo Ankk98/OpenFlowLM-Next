@@ -222,6 +222,98 @@ inline const std::vector<float> &rope_inv_freq() {
 enum class GatedAct { Silu, GeluErf };
 extern GatedAct g_gated_act;
 
+// WHICH HALF OF THE FUSED ffn_up IS THE GATE.
+//
+// Three of the four BERT-family packers put the up half first and this runtime
+// computes `lo * act(hi)`. ModernBERT is the odd one out: it binds
+// `x, gate = Wi(h).chunk(2, dim=-1)`, so its GATE is the SECOND half -- the
+// reverse of LLaMA's convention and of arch=2/3 here -- and its packer moves
+// the gate half first so the same arithmetic applies.
+//
+// So the ORDER is a data field and not an assumption, because getting it
+// backwards still produces a model that emits fluent plausible garbage rather
+// than an error. `g_gate_order` is written in exactly one place -- the arch=4
+// arm of apply_model_shape(), from the container's `glu_halves` -- and RESET to
+// UpFirst for every other arch on the line above it, so an arch=2 container
+// loaded after an arch=4 one in the same process cannot inherit it.
+//
+// Process-wide for the same reason g_gated_act is: the geometry globals are
+// (see ShapeLease), so a per-Encoder copy would be a second source of truth for
+// one value.
+enum class GateOrder { UpFirst, GateFirst };
+extern GateOrder g_gate_order;
+
+/// Per-layer attention type, from the container's `layer_types`: 1 for
+/// sliding_attention, 0 for full_attention, one entry per layer.
+///
+/// PROCESS-WIDE, and for the reason every other geometry global here is: it is
+/// a property of the MODEL, written once by apply_model_shape() under the
+/// ShapeLease, and a per-Encoder copy would be a second source of truth for one
+/// value. `Encoder` is an aggregate -- it has no constructor to initialise a
+/// member from -- so a member here would silently be empty for every lane the
+/// clone loop builds. That is the same shape of failure as the two the clone
+/// loop's own comment records.
+extern std::vector<char> g_sliding_layer;
+
+/// arch=4's normalisation: pre-LN with a final norm. Process-wide for the same
+/// reason, and it also has to be visible to stage_all(), which allocates the
+/// final norm's slot -- so a per-Encoder member would have to be set before the
+/// Encoder exists.
+extern bool g_preln;
+/// arch=4's layer-0 attention norm is nn.Identity() upstream: no tensor exists
+/// in the checkpoint for it, and a weight-1 norm is NOT identity.
+extern bool g_identity_ln1_layer0;
+/// The +/-band half-width in TOKENS for a sliding layer, from the container's
+/// `sliding_window` (local_attention/2). It is the WIDTH, not a mask.
+extern int64_t g_band_half;
+
+// WHICH HALF IS THE UP AND WHICH IS THE GATE, as pointers into the fused [N]
+// row. The product is always `up * act(gate)` -- so ONE of these two is the
+// destination and the other is read-only, and that asymmetry is why the pair is
+// named for the halves rather than for their POSITION.
+//
+// The two helpers exist so that the THREE copies of the gated activation cannot
+// disagree about the order: swiglu_cpu(), the bf16 fused epilogue and the int8
+// fused epilogue are verbatim copies of each other, and the failure this
+// prevents is exact -- a new half-order key added to swiglu_cpu alone leaves
+// `--no-fuse-ffn` and the DEFAULT path computing different orders, and because
+// `fuse_ffn_epilogue` is on by default the default is what runs. The difference
+// would be a wrong answer rather than a rounding difference.
+//
+// NAMED, NOT NUMBERED, AND THAT IS THE POINT. A first helper called
+// `gate_first_half` that returns the first half is one rename away from being
+// assigned to the destination, and assigning the GATE half as the destination
+// computes `gate * act(up)` -- which is a model, a wrong one, and the mistake
+// this pair of helpers was introduced to prevent. Naming the halves by role
+// makes `up_half(v, i)[j] * act(gate_half(v, i)[j])` read as the formula it is.
+//
+// The SIMD arms stay inline in each copy -- they are intrinsics, and routing
+// them through a function costs the unrolling that made them worth writing --
+// so each copy's vector path takes its pointers from here and only the SCALAR
+// tails share `gated_pair`.
+//
+// An in-place and a read-only overload, because the three copies differ:
+// swiglu_cpu() writes into a SEPARATE output buffer and so takes const
+// pointers, while the two fused epilogues narrow the row IN PLACE and need to
+// write through theirs. Overloads rather than a const_cast at each call site,
+// because a const_cast here would be a claim nobody checked.
+inline float *up_half(float *v, int64_t inter) {
+  return g_gate_order == GateOrder::GateFirst ? v + inter : v;
+}
+inline const float *up_half(const float *v, int64_t inter) {
+  return g_gate_order == GateOrder::GateFirst ? v + inter : v;
+}
+inline const float *gate_half(const float *v, int64_t inter) {
+  return g_gate_order == GateOrder::GateFirst ? v : v + inter;
+}
+/// The scalar product, in ONE place. `act` is a template parameter so the SiLU
+/// and exact-GELU arms do not each acquire a copy of the other.
+template <typename Act>
+inline float gated_pair(const float *up_half, const float *gate_half, int64_t j,
+                        Act act) {
+  return up_half[j] * act(gate_half[j]);
+}
+
 // Exact erf GELU: 0.5*x*(1+erf(x/sqrt(2))), computed in double like the
 // numpy oracle (reference/encoder_gte.py's gelu_exact* both erf in float64)
 // and rounded once at the end. Scalar on purpose: correctness first, and the
@@ -739,6 +831,120 @@ inline void apply_model_shape(npue::File &m) {
           " entries, expected head_dim/2 = " +
           std::to_string(g_head_dim / 2));
     g_rope = true;
+  }
+
+  // Reset the state that only SOME arches carry, so an arch=2 container loaded
+  // after an arch=4 one in the same process cannot inherit it. The geometry
+  // globals above already have this discipline (see g_rope); this is the same
+  // reset for arch=4's two.
+  g_sliding_layer.clear();
+  g_gate_order = GateOrder::UpFirst;
+  g_preln = false;
+  g_identity_ln1_layer0 = false;
+  g_band_half = 0;
+
+  // arch=4 (ModernBERT / mmBERT). Everything this arm sets is either a
+  // DIFFERENCE between the two normalisations, or a fact only this
+  // architecture has. Nothing here is inherited, and every one of them turns a
+  // plausible wrong answer rather than an error -- which is the reason the whole
+  // arch is keyed off the container's `arch` string rather than inferred from
+  // its shapes.
+  if (arch == "modernbert_rope_geglu") {
+    const std::string pet = m.config_string("position_embedding_type");
+    if (pet != "rope")
+      throw std::runtime_error(
+          "container arch is modernbert_rope_geglu but position_embedding_type "
+          "is '" + pet + "', expected 'rope'. This architecture carries NO "
+          "position table at all -- position enters only through RoPE -- so "
+          "reading a table would add a second, wrong source of position.");
+    if (!g_gated_ffn)
+      throw std::runtime_error(
+          "container arch is modernbert_rope_geglu but gated_ffn is not true");
+    // THE HALF ORDER. ModernBERT binds `x, gate = Wi(h).chunk(2, dim=-1)`, so
+    // its gate is the SECOND half -- the reverse of arch=2/3 -- and the packer
+    // moved it first. Read, never inferred: getting this backwards produces a
+    // model that still answers, just wrongly, and the key is descriptive prose
+    // after a marker so only the PREFIX is meaningful.
+    const std::string halves = m.config_string("glu_halves");
+    if (halves.rfind("gate_first|up_second", 0) != 0)
+      throw std::runtime_error(
+          "unrecognised glu_halves ordering '" + halves + "' -- expected it to "
+          "begin 'gate_first|up_second'. ModernBERT's gate is the second half "
+          "of Wi (chunk(2, -1) -> x, gate) and the packer moved it first; "
+          "refusing rather than computing the other model.");
+    g_gate_order = GateOrder::GateFirst;
+
+    // PRE-LAYERNORM with a final norm, and layer 0's attention norm SKIPPED.
+    // Both are booleans the container states, and both are refusal-worthy: a
+    // missing one means this build would run the post-LN loop over a pre-LN
+    // model, which re-centres the residual stream twice per layer and returns
+    // vectors of the right length and the wrong values.
+    if (!config_flag(m, "pre_layernorm", false))
+      throw std::runtime_error(
+          "modernbert_rope_geglu container does not declare pre_layernorm. "
+          "This build's post-LN loop stores the NORMALISED value as the "
+          "residual, which is correct under post-LN and wrong under pre-LN -- a "
+          "correctness bug and not a slow path. Refusing rather than running "
+          "the wrong one.");
+    if (!config_flag(m, "final_norm", false))
+      throw std::runtime_error(
+          "modernbert_rope_geglu container does not declare final_norm. The "
+          "head consumes the encoder's POST-final-norm output -- upstream reads "
+          "last_hidden_state -- so omitting it feeds the head the residual "
+          "stream instead.");
+    if (!config_flag(m, "identity_attn_norm_layer0", false))
+      throw std::runtime_error(
+          "modernbert_rope_geglu container does not declare "
+          "identity_attn_norm_layer0. Layer 0's attention norm is nn.Identity() "
+          "upstream, and a weight-1 norm is NOT that: it still subtracts the "
+          "mean and divides by the standard deviation.");
+    g_preln = true;
+    g_identity_ln1_layer0 = true;
+    // The band's WIDTH, and it is local_attention/2 with no +1: transformers'
+    // `config.sliding_window + 1` is a FlashAttention inclusive-boundary
+    // convention and the dense mask this checkpoint pins reaches
+    // `abs(q - kv) <= config.sliding_window`. The packer records which it did
+    // in `sliding_window_note`, and refuses a checkpoint whose two thetas
+    // differ, so the width here is unambiguous -- but an ODD local_attention
+    // would silently become a half-token band, so it is refused rather than
+    // rounded.
+    g_band_half = m.config_int("sliding_window");
+    if (g_band_half <= 0)
+      throw std::runtime_error(
+          "modernbert_rope_geglu container has sliding_window " +
+          std::to_string(g_band_half) + "; a non-positive band would band "
+          "nothing while still reading as a local model");
+    // RoPE: one theta, one table. mmBERT has 160000 for BOTH layer types and
+    // its packer REFUSES a checkpoint whose two differ, so there is no
+    // per-layer selection to get wrong here -- and if there were, it would be a
+    // 1.9e-02 relfro error at layer 0, silently.
+    g_rope_theta = m.config_double("rope_theta");
+    if (g_rope_theta <= 0.0)
+      throw std::runtime_error(
+          "modernbert_rope_geglu container has a non-positive rope_theta");
+    g_rope = true;
+    // AND the per-layer attention types, so the band mask knows which layers are
+    // local. Read from the container rather than re-derived from
+    // global_attn_every_n_layers: 22 explicit entries beat a rule, and a
+    // container whose list and rule disagree has already been refused at pack
+    // time.
+    {
+      const npue::json::Value v =
+          npue::json::parse(m.config_string("layer_types"));
+      size_t n = 0;
+      for (const auto &e : v.as_array()) {
+        const std::string t = e.as_string();
+        if (t != "full_attention" && t != "sliding_attention")
+          throw std::runtime_error("layer_types[" + std::to_string(n) +
+                                   "] is '" + t + "'");
+        g_sliding_layer.push_back(t == "sliding_attention" ? 1 : 0);
+        ++n;
+      }
+      if (static_cast<int64_t>(n) != g_layers)
+        throw std::runtime_error(
+            "layer_types has " + std::to_string(n) + " entries, num_layers is " +
+            std::to_string(g_layers));
+    }
   }
 
   // The gated activation is DATA (tasks/0135 made the write-only key
@@ -1591,6 +1797,26 @@ struct Encoder {
   bool fuse_ffn_epilogue = true;
   double t_hostln = 0.0, t_hostsm = 0.0, t_hostgelu = 0.0;
 
+  // arch=4 (ModernBERT). The MODEL facts -- pre-LN, the identity layer-0 norm,
+  // the band width and the per-layer attention types -- are the globals above,
+  // written once by apply_model_shape() under the ShapeLease. What is left here
+  // is the state that belongs to ONE encode in progress, and the split is not
+  // cosmetic:
+  //
+  //   `band_now` is the width ACTIVE FOR THE LAYER BEING COMPUTED, set by every
+  //   loop iteration -- including to 0 on the global layers. A layer that
+  //   forgets is a silently wrong answer rather than a slow one, so the
+  //   configured width (g_band_half, a constant for the process) is a DIFFERENT
+  //   member from the active one, and the loop never mutates the configuration.
+  int64_t band_now = 0;
+  // The NORM OUTPUT, separate from the residual stream. Under post-LN one
+  // buffer is enough because the normalised value IS the next residual; under
+  // pre-LN storing it there is a correctness bug and the next block would add
+  // to an already-centred stream -- the residual re-centred twice per layer.
+  // run() never touches this, which is why run_preln() is a separate function
+  // rather than a flag inside run().
+  std::vector<float> hbuf;
+
 
   // Where the time goes. A single number for the whole encode says "slow";
   // this says which half to fix.
@@ -1706,6 +1932,14 @@ struct Encoder {
         ln_host(p + "ln1.weight", p + "ln1.bias");
         ln_host(p + "ln2.weight", p + "ln2.bias");
       }
+      // arch=4's final norm. BOTH arms, and that is the whole point: the two
+      // number their sites differently (this one pushes s_ln.size()+1 and
+      // layer_norm() converts with `slot - 1`; the staged arm pushes the device
+      // slot directly), so a site added to one arm only is an out-of-range READ
+      // in the other -- and layer_norm_cpu indexes h_gamma[site] and h_beta[site]
+      // with no bounds check, so it is a silent wrong number rather than a
+      // crash. See the block below.
+      if (g_preln) ln_host("final_norm.weight", "final_norm.bias");
       return bytes;
     }
     ln_one("embeddings.ln.weight", "embeddings.ln.bias");
@@ -1714,8 +1948,18 @@ struct Encoder {
       ln_one(p + "ln1.weight", p + "ln1.bias");
       ln_one(p + "ln2.weight", p + "ln2.bias");
     }
+    if (g_preln) ln_one("final_norm.weight", "final_norm.bias");
     return bytes;
   }
+
+  // The final norm's site index, computed rather than written down.
+  //
+  // It is the next free index after the per-layer ln1/ln2 loop: site 0 is the
+  // embeddings norm, then 2 per layer. Written as the arithmetic because a
+  // literal here and a literal in stage_all() are two places for the numbering
+  // to disagree, and the disagreement is an out-of-bounds read in
+  // layer_norm_cpu rather than an error.
+  size_t final_norm_site() const { return 1 + 2 * static_cast<size_t>(g_layers); }
 
   // `lap` charges the elapsed time to a bucket and returns the new mark, so
   // each stage is attributed without a timer call being able to drift.
@@ -2000,14 +2244,20 @@ struct Encoder {
       const int64_t lo_r = std::min<int64_t>(n_rows, chunk * w);
       const int64_t hi_r = std::min<int64_t>(n_rows, lo_r + chunk);
       for (int64_t r = lo_r; r < hi_r; ++r) {
-        const float *lo = x.data() + r * 2 * inter;
-        const float *hi = lo + inter;
+        // WHICH HALF IS THE GATE is g_gate_order, resolved by the two helpers
+        // every copy of this activation uses. See up_half's comment for why
+        // there are three copies and ONE pair of helpers rather than one copy
+        // and three edits.
+        const float *row = x.data() + r * 2 * inter;
+        const float *up = up_half(row, inter);
+        const float *gate = gate_half(row, inter);
         float *dst = out.data() + r * inter;
-        // arch=3 (tasks/0136): exact-erf GELU on the gate half, same halves
-        // order. The SiLU arm below is byte-for-byte what arch=2 always ran.
+        // arch=3 (tasks/0136): exact-erf GELU on the gate half. The SiLU arm
+        // below is byte-for-byte what arch=2 always ran, and the two are
+        // distinguished by the ACTIVATION only -- never by which half is which.
         if (g_gated_act == GatedAct::GeluErf) {
           for (int64_t j = 0; j < inter; ++j)
-            dst[j] = lo[j] * gelu_erf_exact(hi[j]);
+            dst[j] = gated_pair(up, gate, j, gelu_erf_exact);
           continue;
         }
         int64_t j = 0;
@@ -2016,23 +2266,23 @@ struct Encoder {
         const __m256 argfloor = _mm256_set1_ps(-120.0f);
         const __m256 one = _mm256_set1_ps(1.0f);
         for (; j + 8 <= inter; j += 8) {
-          __m256 xv = _mm256_loadu_ps(hi + j);
+          __m256 xv = _mm256_loadu_ps(gate + j);
           __m256 a = _mm256_max_ps(
               _mm256_mul_ps(_mm256_sub_ps(_mm256_setzero_ps(), xv), log2e),
               argfloor);
           __m256 e = exp2_avx2(a);
           __m256 s = _mm256_div_ps(xv, _mm256_add_ps(one, e));
-          __m256 loV = _mm256_loadu_ps(lo + j);
-          _mm256_storeu_ps(dst + j, _mm256_mul_ps(loV, s));
+          __m256 upV = _mm256_loadu_ps(up + j);
+          _mm256_storeu_ps(dst + j, _mm256_mul_ps(upV, s));
         }
 #endif
         for (; j < inter; ++j) {
-          const float xv = hi[j];
+          const float xv = gate[j];
           float a = -xv * 1.4426950408889634f;
           if (a < -120.0f) a = -120.0f;
           const float e = std::exp2(a);
           const float s = xv / (1.0f + e);
-          dst[j] = lo[j] * s;
+          dst[j] = up[j] * s;
         }
       }
     });
@@ -2173,33 +2423,47 @@ struct Encoder {
         } else if (g_gated_act == GatedAct::GeluErf) {
           // arch=3 (tasks/0136): exact-erf GELU on the gate half. The SiLU
           // arm below is byte-for-byte what arch=2 always ran.
+          //
+          // THE HALF ORDER IS DATA (arch=4), and this is the copy that runs in
+          // PRODUCTION -- `fuse_ffn_epilogue` defaults to true. So it changed in
+          // the same commit as the other two, which is not tidiness: a
+          // half-order key honoured by swiglu_cpu() alone would leave
+          // --no-fuse-ffn and the default computing different models, and the
+          // difference is a gate swap rather than a rounding difference. See
+          // up_half's comment for the rest.
           const int64_t inter = N / 2;
-          const float *hi = v + inter;
+          // WRITTEN through: the fused epilogues narrow the row IN PLACE, so
+          // the UP half is the destination and the gate half is read-only.
+          float *up = up_half(v, inter);
+          const float *gate = gate_half(v, inter);
           for (int64_t k = 0; k < inter; ++k)
-            v[k] = v[k] * gelu_erf_exact(hi[k]);
+            up[k] = gated_pair(up, gate, k, gelu_erf_exact);
         } else {
           const int64_t inter = N / 2;
-          const float *hi = v + inter;
+          // WRITTEN through: the fused epilogues narrow the row IN PLACE, so
+          // the UP half is the destination and the gate half is read-only.
+          float *up = up_half(v, inter);
+          const float *gate = gate_half(v, inter);
           int64_t k = 0;
 #if defined(__AVX2__)
           const __m256 log2e = _mm256_set1_ps(1.4426950408889634f);
           const __m256 argfloor = _mm256_set1_ps(-120.0f);
           const __m256 one = _mm256_set1_ps(1.0f);
           for (; k + 8 <= inter; k += 8) {
-            __m256 xv = _mm256_loadu_ps(hi + k);
+            __m256 xv = _mm256_loadu_ps(gate + k);
             __m256 a = _mm256_max_ps(
                 _mm256_mul_ps(_mm256_sub_ps(_mm256_setzero_ps(), xv), log2e),
                 argfloor);
             __m256 e = exp2_avx2(a);
             __m256 sg = _mm256_div_ps(xv, _mm256_add_ps(one, e));
-            _mm256_storeu_ps(v + k, _mm256_mul_ps(_mm256_loadu_ps(v + k), sg));
+            _mm256_storeu_ps(up + k, _mm256_mul_ps(_mm256_loadu_ps(up + k), sg));
           }
 #endif
           for (; k < inter; ++k) {
-            const float xv = hi[k];
+            const float xv = gate[k];
             float a = -xv * 1.4426950408889634f;
             if (a < -120.0f) a = -120.0f;
-            v[k] = v[k] * (xv / (1.0f + std::exp2f(a)));
+            up[k] = up[k] * (xv / (1.0f + std::exp2f(a)));
           }
         }
         bf16_fill(dst + r * out_n, v, static_cast<size_t>(out_n));
@@ -2310,37 +2574,46 @@ struct Encoder {
             // arch=3 (tasks/0136): no int8 gte container exists yet
             // (pack_npue refuses --int8 for arch=3), but if one arrives this
             // arm must not silently run SiLU over a GELU model.
+            //
+            // THE HALF ORDER IS DATA (arch=4): the third of the three copies,
+            // and the two above say they were COPIED VERBATIM from here. All
+            // three moved in one change because that coupling is the point.
             if (g_gated_act == GatedAct::GeluErf) {
               const int64_t inter = n / 2;
-              const float *hi = v + inter;
+              // WRITTEN through -- in place, as above.
+              float *up = up_half(v, inter);
+              const float *gate = gate_half(v, inter);
               for (int64_t j = 0; j < inter; ++j)
-                v[j] = v[j] * gelu_erf_exact(hi[j]);
+                up[j] = gated_pair(up, gate, j, gelu_erf_exact);
               return;
             }
             // SwiGLU, narrowing 2*inter -> inter in place. Identical
-            // intrinsics to swiglu_cpu, including its -120 argument floor.
+            // intrinsics to swiglu_cpu, including its -120 argument floor, and
+            // the half order through the same two helpers.
             const int64_t inter = n / 2;
-            const float *hi = v + inter;
+            // WRITTEN through -- in place, as above.
+            float *up = up_half(v, inter);
+            const float *gate = gate_half(v, inter);
             int64_t j = 0;
 #if defined(__AVX2__)
             const __m256 log2e = _mm256_set1_ps(1.4426950408889634f);
             const __m256 argfloor = _mm256_set1_ps(-120.0f);
             const __m256 one = _mm256_set1_ps(1.0f);
             for (; j + 8 <= inter; j += 8) {
-              __m256 xv = _mm256_loadu_ps(hi + j);
+              __m256 xv = _mm256_loadu_ps(gate + j);
               __m256 a = _mm256_max_ps(
                   _mm256_mul_ps(_mm256_sub_ps(_mm256_setzero_ps(), xv), log2e),
                   argfloor);
               __m256 e = Encoder::exp2_avx2(a);
               __m256 sg = _mm256_div_ps(xv, _mm256_add_ps(one, e));
-              _mm256_storeu_ps(v + j, _mm256_mul_ps(_mm256_loadu_ps(v + j), sg));
+              _mm256_storeu_ps(up + j, _mm256_mul_ps(_mm256_loadu_ps(up + j), sg));
             }
 #endif
             for (; j < inter; ++j) {
-              const float xv = hi[j];
+              const float xv = gate[j];
               float a = -xv * 1.4426950408889634f;
               if (a < -120.0f) a = -120.0f;
-              v[j] = v[j] * (xv / (1.0f + std::exp2f(a)));
+              up[j] = up[j] * (xv / (1.0f + std::exp2f(a)));
             }
           },
           a_scale.data(), wscale, bias, inv_smooth_next.data(), fuse->dst,
@@ -2618,6 +2891,23 @@ struct Encoder {
     });
   }
 
+  // The band half-width for layer L, or 0.
+  //
+  // The WIDTH is g_band_half; only the ACTIVE width is a member, and the
+  // reason is the trap this whole mechanism
+  // is easy to fall into: `band_half` is set on the Encoder, `qk_impl`/`av_impl`
+  // are METHODS on the Encoder, and a caller that forgets to clear it between
+  // layers gets a band on the global layers -- a silently wrong answer, because
+  // banded attention returns a correctly shaped, correctly normed vector. Every
+  // call site therefore SETS it, including to 0, and the only thing that makes
+  // that safe is that the decision head has its own attention entry point rather
+  // than sharing this one.
+  int64_t band_for_layer(int64_t L) const {
+    if (g_sliding_layer.empty()) return 0;
+    if (L < 0 || L >= static_cast<int64_t>(g_sliding_layer.size())) return 0;
+    return g_sliding_layer[static_cast<size_t>(L)] ? g_band_half : 0;
+  }
+
   // scores[b,h,i,j] = dot(Q[b,i,h], K[b,j,h]) + mask[b,j]
   // scores[b,h,i,j] = Q[b,i,h] . K[b,j,h]. NO mask: this is the operation an
   // array kernel would perform, and the mask is a property of the batch rather
@@ -2893,6 +3183,150 @@ struct Encoder {
           rotate_pair(row_base + g_hidden + h * g_head_dim, cs, sn);   // K
         }
       }
+    });
+  }
+
+  // THE PRE-LAYERNORM LOOP (arch=4). A separate function and not a flag inside
+  // run(), for one reason that is a correctness bug rather than a style choice:
+  //
+  //   add_norm_quant / add_norm_bf16 end with `_mm256_storeu_ps(res + j, yv)` --
+  //   they store the NORMALISED value as the residual. Under post-LN that is
+  //   correct, because the next block's input IS the normalised residual. Under
+  //   pre-LN it is wrong: the next block would add to an already-centred stream,
+  //   and the residual stream would be re-centred twice per layer. Neither
+  //   helper can be reused here, so neither is, and the two residual adds below
+  //   are deliberately un-fused.
+  //
+  // The loop, against run()'s:
+  //
+  //   h = LN1(x) -> hbuf                       (skipped at layer 0)
+  //   qkv = GEMM(qkv, hbuf); rope(qkv)
+  //   qk -> scores; mask; softmax; av -> ctx
+  //   proj = GEMM(attn_out, ctx);  x += proj    <- run(): add_norm(x, proj)
+  //   h = LN2(x) -> hbuf
+  //   up = GEMM(ffn_up, hbuf); gated = geglu(up)
+  //   down = GEMM(ffn_down, gated);  x += down   <- run(): add_norm(x, down)
+  //   ...and after the last layer:
+  //   return LN_final(x)
+  //
+  // The returned value is AFTER final_norm, and that is what the decision head
+  // consumes: upstream reads `self.encoder(...).last_hidden_state`, which is
+  // post-final-norm. Feeding the head the residual stream instead would be a
+  // plausible, confident, wrong answer.
+  std::vector<float> run_preln(const std::vector<float> &emb_in) {
+    std::vector<float> x = emb_in;
+    layer_norm(x, s_ln[0]);
+
+    qkvbuf.resize(rows * 3 * g_hidden);
+    hbuf.resize(x.size());
+    ctx.resize(rows * g_hidden);
+    proj.resize(rows * g_hidden);
+    up.resize(rows * (g_gated_ffn ? 2 : 1) * g_ffn);
+    if (g_gated_ffn) gated.resize(rows * g_ffn);
+    down.resize(rows * g_hidden);
+    scores.resize(batch * g_heads * g_seq * g_seq);
+
+    for (int64_t L = 0; L < g_layers; ++L) {
+      // h = LN1(x) -> hbuf. Layer 0's attn_norm IS nn.Identity() upstream --
+      // there is no tensor for it in the checkpoint -- so it is SKIPPED, and
+      // the packed zero is not an approximation of that. A norm with weight 1
+      // still subtracts the mean and divides by the standard deviation, so
+      // running it would change every activation in the layer.
+      //
+      // The COPY is unconditional and only the NORM is conditional, and the
+      // distinction is load-bearing: at layer 0 the norm is skipped, and a skip
+      // that took the copy with it would feed this layer's qkv GEMM
+      // hbuf.resize()'s zero-fill -- a constant, not the embedding. That is a
+      // wrong model that runs clean rather than a crash, so it is worth the
+      // extra pass to make the two steps impossible to confuse.
+      hbuf = x;
+      if (!(g_identity_ln1_layer0 && L == 0)) layer_norm(hbuf, s_ln[1 + 2 * L]);
+
+      gemm(qkv, is_qkv, hbuf, s_qkv[L], b_qkv[L], qkvbuf, 3 * g_hidden,
+           i8w(ws_qkv, L), i8w(as_qkv, L));
+      if (g_rope) apply_rope_qkv(qkvbuf);
+
+      // The band for THIS layer, set on EVERY layer including the global ones,
+      // where it is 0. See band_now's declaration for why that is a rule and
+      // not a nicety.
+      band_now = band_for_layer(L);
+
+      double ta = now_s();
+      qk(qkvbuf, scores);
+      t_attn += now_s() - ta;
+      t_qk += now_s() - ta;
+
+      if (host_sm) {
+        softmax_cpu(scores);          // applies add_mask itself
+      } else {
+        add_additive_mask(scores);
+        eltwise(softmax, scores.data(), scores.size());
+      }
+
+      ta = now_s();
+      av(scores, qkvbuf, ctx);
+      t_attn += now_s() - ta;
+      t_av += now_s() - ta;
+
+      gemm(attn_out, is_ao, ctx, s_ao[L], b_ao[L], proj, g_hidden,
+           i8w(ws_ao, L), i8w(as_ao, L));
+      // x += proj, and NO NORM. This one line is the difference between the two
+      // architectures: under post-LN the norm belongs here, and under pre-LN
+      // putting it here re-centres the residual.
+      add_plain(x, proj);
+
+      hbuf = x;
+      layer_norm(hbuf, s_ln[2 + 2 * L]);
+
+      gemm(ffn_up, is_fu, hbuf, s_fu[L], b_fu[L], up,
+           g_gated_ffn ? 2 * g_ffn : g_ffn, i8w(ws_fu, L), i8w(as_fu, L));
+      if (g_gated_ffn) {
+        swiglu_cpu(up, gated);
+        gemm(ffn_down, is_fd, gated, s_fd[L], b_fd[L], down, g_hidden,
+             i8w(ws_fd, L), i8w(as_fd, L));
+      } else {
+        if (host_gelu)
+          gelu_cpu(up);
+        else
+          eltwise(gelu, up.data(), up.size());
+        gemm(ffn_down, is_fd, up, s_fd[L], b_fd[L], down, g_hidden,
+             i8w(ws_fd, L), i8w(as_fd, L));
+      }
+      // x += down, and NO NORM. See above.
+      add_plain(x, down);
+    }
+
+    // final_norm, at site 1 + 2*g_layers. Its OUTPUT is the encoder's output.
+    layer_norm(x, s_ln[final_norm_site()]);
+    band_now = 0;                 // nothing after this reads it; leave no residue
+    return x;
+  }
+
+  // Which loop to run. One place, so the callers that drive an encode cannot
+  // disagree about it -- and a caller picking the wrong one gets the wrong
+  // MODEL, not a slow one.
+  std::vector<float> run_dispatch(const std::vector<float> &emb_in) {
+    return g_preln ? run_preln(emb_in) : run(emb_in);
+  }
+
+  // x += y, in place, with NO normalisation and NO residual copy.
+  //
+  // Deliberately not add_norm_quant / add_norm_bf16: both of those store the
+  // NORMALISED value into `residual` as their last act, which is the bug this
+  // function exists to avoid. And not add_into either -- that one reads
+  // `residual` rather than `x`, because run() keeps the pre-add stream there;
+  // under pre-LN the residual IS x, so the source and the destination are the
+  // same buffer and the copy is not needed at all.
+  void add_plain(std::vector<float> &x, const std::vector<float> &y) {
+    par(x.size(), [&](size_t lo, size_t hi) {
+      size_t i = lo;
+#if defined(__AVX2__)
+      for (; i + 8 <= hi; i += 8)
+        _mm256_storeu_ps(x.data() + i,
+                         _mm256_add_ps(_mm256_loadu_ps(x.data() + i),
+                                       _mm256_loadu_ps(y.data() + i)));
+#endif
+      for (; i < hi; ++i) x[i] += y[i];
     });
   }
 
@@ -4653,7 +5087,11 @@ struct EmbedService {
       }
     }
     e.add_mask = cmask;
-    auto h = e.run(buf);
+    // run_dispatch, not run: a pre-LN container has to take the other loop, and
+    // this is the ONE place an encode is driven, so picking the loop here is
+    // what keeps the choice from being made per-lane -- which for a mixed
+    // workload would run two different models.
+    auto h = e.run_dispatch(buf);
     pool_rows(h.data(), cam.data(), take, out.data() + base * g_hidden);
     if (tokens) *tokens += ntok;
   }
@@ -4668,7 +5106,8 @@ struct EmbedService {
       std::atomic<size_t> next{0};
       std::vector<std::thread> ts;
       // chunk() can throw -- npue::InputTooLong on a caller's bad input, or
-      // anything e.run() raises on a device error -- and an exception that
+      // anything e.run_dispatch() raises on a device error -- and an exception
+      // that
       // escapes a std::thread's entry point calls std::terminate. This
       // branch had no handler, which was survivable only for as long as
       // nothing on the path threw. Capture the first, stop handing out work,

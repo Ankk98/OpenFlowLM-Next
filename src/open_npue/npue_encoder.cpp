@@ -33,6 +33,32 @@ bool g_wide_lock = false;
 bool g_rope = false, g_gated_ffn = false;
 double g_rope_theta = 0.0;
 GatedAct g_gated_act = GatedAct::Silu;
+// UpFirst: the packed order for every container up to and including arch=3, and
+// therefore the value that must be in force for arch=0/1/2/3. apply_model_shape()
+// writes this for EVERY container and this initialiser is only what a caller
+// that never went through a container sees.
+//
+// A default that is wrong for the new architecture would be worse than no
+// default, because apply_model_shape() REFUSES a container that omits the key --
+// so an arch=4 container can never reach this line. What the initialiser has to
+// get right is the other five.
+GateOrder g_gate_order = GateOrder::UpFirst;
+
+// Empty for every arch that has no locality term, which is all six
+// shipping encoders. band_for_layer() reads 0 out of an empty
+// vector and that is the whole point: an unconditional band is not
+// "a band for the new model", it is a band on bge-base, and it
+// returns a correctly-sized, correctly-normed, plausible vector.
+std::vector<char> g_sliding_layer;
+
+// arch=4's three, all reset for every container that is not arch=4. Their
+// zero values are the CORRECT values for the other five arches: post-LN, a real
+// layer-0 norm, and no band. That is deliberate -- a default that happened to
+// be harmless-but-wrong for arch=4 would be the dangerous one, and this build
+// refuses any container that omits them.
+bool g_preln = false;
+bool g_identity_ln1_layer0 = false;
+int64_t g_band_half = 0;
 
 }  // namespace enc
 }  // namespace npue

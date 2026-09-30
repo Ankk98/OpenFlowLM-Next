@@ -2878,8 +2878,22 @@ std::string prepare_model_auto(const PrepareOptions &opt) {
   PrepareOptions rooted = opt;
   rooted.checkpoint_dir = ckpt_dir;
   rooted.checkpoint_subdir.clear();
-  const std::string pooling = resolve_pooling(rooted);
-  say(opt, "  pooling    " + pooling + " (from 1_Pooling/config.json)");
+  // ModernBERT carries no 1_Pooling/config.json, because it has no sentence
+  // embedding head to configure: this model pools by GATHER at the [MASK]
+  // markers and the decision engine never reaches pool_rows at all. The key
+  // still has to name one of the two modes apply_model_shape accepts, and
+  // "mean" is the one whose recorded note says it is a fiction.
+  //
+  // Gated on model_type rather than on the file being absent, because the
+  // absence is what the OTHER five arches refuse on: a BERT checkpoint whose
+  // 1_Pooling went missing must not quietly become a mean-pooler.
+  const std::string pooling =
+      model_type == "modernbert" ? std::string("mean") : resolve_pooling(rooted);
+  say(opt, "  pooling    " + pooling +
+               (model_type == "modernbert"
+                    ? " (FICTION -- ModernBERT pools by marker gather; see "
+                      "pooling_note in the container)"
+                    : " (from 1_Pooling/config.json)"));
   const std::string repo = resolve_source_repo(rooted);
   say(opt, "  source     " + repo);
 
