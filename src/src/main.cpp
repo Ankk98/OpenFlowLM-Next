@@ -645,12 +645,17 @@ int main(int argc, char* argv[]) {
             // NESTS its files -- so an empty entry is not a degraded path, it
             // is a refusal from the packer one layer down.
             nlohmann::ordered_json entry;
+            std::filesystem::path dpath;
             if (availble_models.is_model_supported(parsed_args.model_tag)) {
                 auto [resolved, info] =
                     availble_models.get_model_info(parsed_args.model_tag);
                 entry = info;
+                // get_model_path, NOT a hand-built <root>/<tag>. The CLI and
+                // `oflm serve` must resolve a tag to the SAME directory, and
+                // the server goes through this call.
+                dpath = availble_models.get_model_path(parsed_args.model_tag);
             }
-            return decision_cli::run(parsed_args, entry);
+            return decision_cli::run(parsed_args, dpath, entry);
         }
         else if (parsed_args.command == "run") {
             check_and_notify_new_version();

@@ -188,7 +188,13 @@ bool requires_npu_access(const std::string& method, const std::string& path) {
                path == "/api/chat" || 
                path == "/v1/chat/completions" ||
                path == "/v1/audio/transcriptions" ||
-               path == "/v1/embeddings";
+               path == "/v1/embeddings" ||
+               // A decision model shares the encoder's PROCESS-WIDE geometry
+               // globals and the NPU, so it is enrolled here for the same
+               // reason /v1/embeddings is: two concurrent NPU users corrupt or
+               // crash the shared hw_context, and a decision request served
+               // beside a chat one would interleave dispatches into it.
+               path == "/v1/systemone";
     }
     return false;
 }
@@ -1044,6 +1050,18 @@ std::unique_ptr<WebServer> create_lm_server(model_list& models, ModelDownloader&
             std::shared_ptr<CancellationToken> cancellation_token) {
                 json request_json;
                 rest_handler->handle_models_openai(request_json, send_response, send_streaming_response);
+        });
+
+    server->register_handler("POST", "/v1/systemone",
+        [rest_handler](const http::request<http::string_body>& req,
+            std::function<void(const json&)> send_response,
+            std::function<void(const json&, bool)> send_streaming_response,
+            std::shared_ptr<HttpSession> session,
+            std::shared_ptr<CancellationToken> cancellation_token) {
+                json request_json;
+                if (!req.body().empty())
+                    request_json = json::parse(req.body());
+                rest_handler->handle_systemone(request_json, send_response);
         });
 
     server->register_handler("POST", "/v1/embeddings",

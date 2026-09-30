@@ -1337,7 +1337,7 @@
         },
         "laya-decision": {
             "multilingual": {
-                "name": "convaiinnovations/laya",
+                "name": "laya",
                 "url": "https://huggingface.co/convaiinnovations/laya",
                 "file_url": "https://huggingface.co/api/models/convaiinnovations/laya/tree/main",
                 "ms_url": "",
@@ -1365,7 +1365,8 @@
                 "npue_design_family": "BERT-h768-gated-i1152-bf16",
                 "npue_checkpoint_subdir": "multilingual",
                 "npue_config_subdir": "encoder",
-                "npue_tokenizer_subdir": "tokenizer"
+                "npue_tokenizer_subdir": "tokenizer",
+                "name_note": "The model_list `name` is a DIRECTORY name, not a repository id: model_list::get_model_path() builds <models_root>/<name>. Every other entry is the repo's last segment (BAAI-bge-large-en-v1.5, Alibaba-NLP/... -> gte-multilingual-base), and putting the full 'convaiinnovations/laya' here produced <root>/models/convaiinnovations/laya and a refusal that named a path no one created. The url is the repository."
             }
         }
     }

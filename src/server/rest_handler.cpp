@@ -355,8 +355,55 @@ static json convert_tool_responses_gemma4(json messages) {
 
 ///@return the rest handler
 RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, program_args_t& args)
-    : supported_models(models), downloader(downloader), default_model_tag(args.model_tag), current_model_tag(""), modelscope(args.modelscope), asr(args.asr), asr_model_tag(args.asr_model.empty() ? std::string("whisper-v3:turbo") : args.asr_model), embed(args.embed), embedding_model_tag(args.embedding_model), img_pre_resize(args.img_pre_resize), preemption(args.preemption){
+    : supported_models(models), downloader(downloader), args(args), default_model_tag(args.model_tag), current_model_tag(""), modelscope(args.modelscope), asr(args.asr), asr_model_tag(args.asr_model.empty() ? std::string("whisper-v3:turbo") : args.asr_model), embed(args.embed), embedding_model_tag(args.embedding_model), img_pre_resize(args.img_pre_resize), preemption(args.preemption){
     this->npu_device_inst = oflm_rt::device(0);
+
+    // A decision model, loaded ONCE at construction and never lazily.
+    //
+    // The obvious place for this was `ensure_embed_model_loaded`, which is
+    // where it went first -- and that function is gated on --embed, so a server
+    // started with --decisionmodel alone never ran it. The route then answered
+    // "no decision model is loaded" with the model directory sitting right
+    // there, which is the worst shape of a wiring bug: a refusal that is true
+    // and wrong.
+    //
+    // Eager is also right on its own terms. The load is ~1.1 GB and the NPU
+    // context is exclusive, so a server that will serve this route should pay
+    // for it at startup, where a failure is visible, rather than on the first
+    // request.
+    // The decision model, loaded only when one was named. It is a SEPARATE
+    // member and a separate load because it is a separate model with separate
+    // weights, and a server may serve both: one decision model per server, the
+    // same one-per-server rule the embedding engine follows and for the same
+    // reason -- the encoder's geometry globals are process-wide, so a second one
+    // would reinterpret the first one's weights.
+    if (!this->args.decision_model.empty()) {
+        try {
+            auto [dt, dinfo] =
+                this->supported_models.get_model_info(this->args.decision_model);
+            const std::string dpath = this->supported_models.get_model_path(dt);
+            const float dtemp = this->args.decision_temperature;
+            this->decision_temperature =
+                dtemp >= 0.f ? static_cast<double>(dtemp) : 1.0;
+            this->decision_temperature_overridden = dtemp >= 0.f;
+            // get_model_info returns a plain `nlohmann::json`, which is a
+            // std::map and therefore SORTS its keys. The decision registry
+            // takes an `ordered_json` for exactly the reason the wire format
+            // needs one: option order travels in the request, and a sorted map
+            // would hand the adapter its keys in an order nobody chose.
+            const nlohmann::ordered_json dOrdered(dinfo);
+            this->auto_decision_engine =
+                get_auto_decision_model(this->args.decision_model, dpath, &dOrdered,
+                                        this->args.decision_threads);
+            this->decision_model_tag = this->auto_decision_engine->name();
+        } catch (const std::exception& e) {
+            header_print("ERROR", "decision model '"
+                                                      << this->args.decision_model
+                                                      << "' failed to load: " << e.what());
+            this->auto_decision_engine.reset();
+        }
+    }
+
 
     if (args.ctx_length != -1) {
         this->ctx_length = args.ctx_length >= 512 ? args.ctx_length : 512;
@@ -749,7 +796,12 @@ void RestHandler::handle_show(const json& request,
             {"model_info", {
                 {"general.architecture", "oflm" }
             }},
-            {"capabilities", {"chat", "vision", "completion"}}
+            // "systemone" and NOT "embeddings". The existing literal omitted
+            // embeddings, which is a separate omission and not this one's
+            // licence: a client reads `capabilities` to decide which route to
+            // call, and a decision model is called through a route whose name is
+            // the pinned schema's.
+            {"capabilities", {"chat", "vision", "completion", "systemone"}}
         };
 
 
@@ -1362,6 +1414,101 @@ void RestHandler::handle_embeddings(const json& request,
 ///@param request the request
 ///@param send_response the send response
 ///@param send_streaming_response the send streaming response
+void RestHandler::handle_systemone(const json& request,
+                                   std::function<void(const json&)> send_response) {
+    // The is_object check comes FIRST, for the reason handle_embeddings' does
+    // and in the same words: `std::string model = request["model"]` on a
+    // non-object killed the server process while holding the NPU lock, and a
+    // route that does not make the first statement the check has the same bug.
+    if (!request.is_object()) {
+        send_response(json{{"error", {
+            {"message", "the request body must be a JSON object."},
+            {"type", "invalid_request_error"},
+            {"param", ""},
+            {"code", "invalid_value"}}}});
+        return;
+    }
+    // A non-autoregressive readout has nothing to stream, and a client that
+    // asked for SSE and received one JSON object waits forever for events that
+    // will not come. Refused by name.
+    if (request.contains("stream") && request["stream"].is_boolean() &&
+        request["stream"].get<bool>()) {
+        send_response(json{{"error", {
+            {"message",
+             "a decision model answers in one forward pass and does not stream. "
+             "Send without \"stream\"."},
+            {"type", "invalid_request_error"},
+            {"param", "stream"},
+            {"code", "unsupported_value"}}}});
+        return;
+    }
+    if (!auto_decision_engine) {
+        send_response(json{{"error", {
+            {"message",
+             "no decision model is loaded. Start the server with "
+             "--decisionmodel <tag>."},
+            {"type", "invalid_request_error"},
+            {"param", ""},
+            {"code", "model_not_found"}}}});
+        return;
+    }
+    try {
+        // THE MODEL-IDENTITY GUARD, and it is the second reason the response
+        // carries the ANSWERING tag rather than the asked-for one. One decision
+        // model is loaded per server (the encoder's geometry globals are
+        // process-wide), so a request naming another would be served by the
+        // loaded model anyway and come back labelled with the tag that was
+        // asked for -- and a client comparing response.model to its request
+        // would see agreement. handle_embeddings' comment records that measured
+        // on this tree; the same substitution here would be worse, because a
+        // decision model answers with a CONFIDENT distribution rather than a
+        // vector nobody inspects.
+        std::string asked;
+        if (request.contains("model") && request["model"].is_string())
+            asked = request["model"].get<std::string>();
+        if (!asked.empty() && asked != decision_model_tag) {
+            send_response(json{{"error", {
+                {"message", "this server has '" + decision_model_tag +
+                                "' loaded, not '" + asked +
+                                "'. One decision model is loaded per server; "
+                                "start another with --decisionmodel " + asked +
+                                " to serve it."},
+                {"type", "invalid_request_error"},
+                {"param", "model"},
+                {"code", "model_not_found"}}}});
+            return;
+        }
+        // Ordered, not nlohmann::json. Option order travels in the REQUEST and a
+        // std::map would sort it, which for a four-level score is the difference
+        // between a legend in the caller's order and one in index order.
+        const nlohmann::ordered_json body = request;
+        // The temperature is the SERVER's, from --decisiontemperature, and NOT
+        // a body field: the pinned SystemOneRequest has no temperature field at
+        // all. Inventing one in the body would be a field the schema does not
+        // have, and a client sending it would believe it took effect.
+        auto req = decision::parse_request(body, decision_temperature);
+        req.temperature_overridden = decision_temperature_overridden;
+        for (const auto& d : req.dropped)
+            header_print("OFLM", "dropped question " << d << ": its `type` is not implemented");
+        auto answers = auto_decision_engine->decide(req);
+        send_response(decision::render_response(auto_decision_engine->name(),
+                                                req.questions, answers,
+                                                req.input_tokens));
+    } catch (const decision::DecisionRequestInvalid& e) {
+        send_response(json{{"error", {
+            {"message", e.what()},
+            {"type", "invalid_request_error"},
+            {"param", ""},
+            {"code", "invalid_value"}}}});
+    } catch (const std::exception& e) {
+        send_response(json{{"error", {
+            {"message", e.what()},
+            {"type", "server_error"},
+            {"param", ""},
+            {"code", "internal_error"}}}});
+    }
+}
+
 void RestHandler::handle_models(const json& request,
                                std::function<void(const json&)> send_response,
                                StreamResponseCallback send_streaming_response) {

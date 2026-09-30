@@ -31,45 +31,24 @@
 
 namespace decision_cli {
 
-/// The model directory for `tag`, and the refusal when there is none.
-///
-/// The models root is `utils::get_models_directory()` -- the same call
-/// `oflm pull` writes into -- so a tag resolves to the one directory the
-/// downloader filled. Resolution does NOT go through the supported-models
-/// registry: a decision model's entry names a design family and a set of
-/// subdirectories, and the CLI needs the DIRECTORY, not the entry. The
-/// registry is consulted inside the adapter, which is where those keys are read.
-inline std::filesystem::path model_dir(const std::string &tag) {
-  // The DECISION registry's own completion, not the embedding registry's. The
-  // two are separate on purpose: borrowing `complete_simple_embedding_tag`
-  // here would let an embedding alias name a decision model, which is the same
-  // class of substitution this file's header is about.
-  const std::string full = complete_simple_decision_tag(tag);
-  const std::filesystem::path root = utils::get_models_directory();
-  for (const std::string &name : {tag, full}) {
-    if (name.empty()) continue;
-    const std::filesystem::path p = root / name;
-    if (std::filesystem::is_directory(p)) return p;
-  }
-  throw std::runtime_error(
-      "no such decision model: '" + tag + "'. Looked for " +
-      (root / tag).string() + " and " + (root / full).string() +
-      ". A tag that names a chat or embedding model is a different kind of "
-      "model and is refused rather than loaded and asked to decide -- it would "
-      "answer with fluent text, which is the worst version of a wrong answer.");
-}
-
 /// Run the CLI. Returns a process exit code, and prints the response to stdout.
 ///
 /// `--input-file` is `-` for stdin. `--json` prints the response body and
 /// nothing else, which is what makes this scriptable; the human form is a
 /// per-question summary because a five-question request's JSON is unreadable
 /// and the JSON is still one flag away.
-/// `entry` is the model_list.json entry for `tag`, read by the caller through
-/// the SAME registry every other command uses. It is passed in rather than
-/// re-read here because it is the registry's parse of model_list.json, and a
-/// second parse is a second answer to "what does this tag mean".
+/// `dir` and `entry` are the model directory and the model_list.json entry for
+/// `tag`, BOTH resolved by the caller through the same registry every other
+/// command uses.
+///
+/// They are passed in rather than re-derived here because this file originally
+/// built `<models_root>/<tag>` itself, and that is a DIFFERENT directory from
+/// the one `oflm serve` loads -- `get_model_path` returns
+/// `<models_root>/<entry["name"]>`. So the CLI and the route could be pointed
+/// at two different models under one tag, which is precisely the substitution
+/// the model-identity guard exists to catch. One resolver, in one place.
 inline int run(const program_args_t &args,
+               const std::filesystem::path& dir,
                const nlohmann::ordered_json& entry) {
   try {
     // --decisionmodel is the ENGINE to load; the positional tag is the MODEL
@@ -160,7 +139,7 @@ inline int run(const program_args_t &args,
         ::dup2(STDERR_FILENO, STDOUT_FILENO);
       }
       RestoreStdout restore{saved};
-      model = get_auto_decision_model(tag, model_dir(tag), &entry,
+      model = get_auto_decision_model(tag, dir, &entry,
                                       args.decision_threads);
     }
     if (!model)

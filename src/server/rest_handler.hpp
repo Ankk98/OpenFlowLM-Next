@@ -11,6 +11,7 @@
 #include "AutoModel/all_models.hpp"
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
 #include "whisper/modeling_whisper.hpp"
+#include "AutoDecisionModel/all_decision_model.hpp"
 #include "AutoEmbeddingModel/all_embedding_model.hpp"
 #endif
 #include "model_list.hpp"
@@ -57,6 +58,15 @@ public:
                           std::function<void(const json&)> send_response,
                           StreamResponseCallback send_streaming_response);
     
+
+    /// `POST /v1/systemone`. One forward pass, one distribution per question,
+    /// no generation and no streaming -- so the third callback exists only to
+    /// match the shape of the other handlers, and a request that arrives with
+    /// `"stream": true` is refused by name rather than silently answered
+    /// unstreamed (a client that asked for SSE and received one JSON object
+    /// waits for more events that will never come).
+    void handle_systemone(const json& request,
+                          std::function<void(const json&)> send_response);
 
     void handle_models(const json& request,
                       std::function<void(const json&)> send_response,
@@ -125,7 +135,28 @@ private:
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
     std::unique_ptr<Whisper> whisper_engine;
     std::unique_ptr<AutoEmbeddingModel> auto_embedding_engine;
+    /// A decision model, and it is a SEPARATE member from the embedding engine
+    /// rather than a variant of it. They are different kinds of model: one
+    /// turns text into a vector, the other turns a state and typed questions
+    /// into a distribution per question. A server may load both, and a single
+    /// engine member holding "whichever was loaded last" is how
+    /// /v1/embeddings starts answering with a decision model's nonsense or
+    /// /v1/systemone answers with vectors.
+    std::unique_ptr<AutoDecisionModel> auto_decision_engine;
+    std::string decision_model_tag;
+    /// The server's decision temperature, and whether it was set. Two members
+    /// rather than one because 1.0 is both "asked for a neutral scale" and
+    /// "asked for nothing", and the difference is whether the container's
+    /// fitted per-type calibration survives.
+    double decision_temperature = 1.0;
+    bool decision_temperature_overridden = false;
 #endif
+    /// The parsed command line, kept by reference. The decision model's
+    /// temperature and thread count are read from it at LOAD time, which is
+    /// why a route cannot change them per request: they are server
+    /// configuration, and a per-request temperature would be a field the pinned
+    /// schema does not have.
+    program_args_t& args;
     oflm_rt::device npu_device_inst;
     model_list& supported_models;
     ModelDownloader& downloader;
