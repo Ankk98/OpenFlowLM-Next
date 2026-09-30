@@ -404,6 +404,14 @@ def head(t, ids, markers, qtype, keep=None):
                  + t[p + "linear2.bias"].astype(np.float64))
 
     m = h[np.asarray(markers, dtype=int)]
+    global _GATHERED
+    # The gathered rows, returned alongside the logits. Comparing the logits
+    # alone localises nothing: a difference could be the head, the gather or the
+    # scorer. Comparing the rows either side of the scorer splits that in one
+    # run, and the engine's logits are FLATTER than the oracle's rather than
+    # noisier, which is the signature of a scorer's input being dominated by a
+    # few large directions -- so the rows are the thing to look at.
+    _GATHERED = m
     m = _ln(m, *_gb(t, "scorer.0.weight", "scorer.0.bias"))
     m = gelu_exact(m @ t["scorer.1.weight"].astype(np.float64).T
                    + t["scorer.1.bias"].astype(np.float64))
@@ -421,6 +429,9 @@ def main():
                     help="round the GEMM operands to bfloat16: the replica the "
                          "plan's threshold is calibrated from")
     ap.add_argument("--out", default="")
+    ap.add_argument("--dump-rows", default="",
+                    help="write the GATHERED marker rows here, so the engine and "
+                         "the oracle can be compared either side of the scorer")
     ap.add_argument("--head", default="",
                     help="markers,qtype for the head, e.g. '12,20;2'")
     ap.add_argument("--checkpoint-subdir", default="multilingual",
@@ -472,6 +483,9 @@ def main():
         logits = head(tt, ids, [int(x) for x in mk.split(",")], int(qt),
                       keep=[True] * len(ids))
         print("# head logits " + " ".join("%.7g" % v for v in logits))
+        if a.dump_rows:
+            _GATHERED.astype(np.float32).tofile(a.dump_rows)
+            print("# gathered rows -> " + a.dump_rows)
     if a.out:
         out.astype(np.float32).tofile(a.out)
     return 0
