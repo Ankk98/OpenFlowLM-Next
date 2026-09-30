@@ -189,6 +189,23 @@ struct PrepareOptions {
   // (65,536 B against the 63 KB budget), so it must be 32.
   int64_t tile_k = 64;
   int64_t tile_n = 48;
+  // Where the checkpoint's FILES are, relative to checkpoint_dir, for a
+  // repository that NESTS them instead of laying them out flat.
+  //
+  // convaiinnovations/laya is the case this exists for: its tree is
+  //   multilingual/{encoder/config.json, model.safetensors, tokenizer/tokenizer.json,
+  //                 rl_agent_config.json}
+  // so with checkpoint_dir = <served>/multilingual the config is at
+  // encoder/config.json and the tokenizer at tokenizer/tokenizer.json. Nothing
+  // in the flat path could express that, and guessing a subdirectory is exactly
+  // the kind of guess this packer refuses everywhere else.
+  //
+  // Empty means flat, which is every shipped model's layout, so the default
+  // keeps every existing caller byte-identical. A non-empty value that does not
+  // resolve is an ERROR naming the composed path -- never a silent fallback to
+  // the root, which is what would make a typo look like a missing packer.
+  std::string config_subdir;      // default ""
+  std::string tokenizer_subdir;   // default "tokenizer"
   // arch=1 escape hatch (tasks/0074). The default is the production geometry,
   // so a cold clone self-produces a container the ARRAY can run -- before that
   // default existed it self-produced a host-only container and quietly ran at

@@ -3744,3 +3744,153 @@ term is the lx <-> ax hardware context change, 22 per step. Queueing ahead acros
 that change (level 2) hung the array three times in three runs
 (`ERT_CMD_STATE_TIMEOUT`), so no host schedule hides it; one xclbin carrying both
 layer types does.
+
+### OPEN-ENC-MODERNBERT: a ModernBERT checkpoint packs to an arch-4 container and the runtime runs it
+**Applies to:** openflowlm-next (`src/open_npue/npue_pack.cpp`, `src/open_npue/npue_encoder.hpp`, `src/open_npue/tokenizer_bbpe.cpp`, `src/open_npue/bbpe_tokenizer_gen.cpp`, `src/open_npue_adapter/npue_embedding.cpp`)
+**Test category:** unit (packer, tokenizer, shape) + manual (the NPU run)
+**Tests:** `specs/open-engine/tests/test_modernbert_pack.py`
+
+A checkpoint with `model_type: "modernbert"` shall pack to a
+`modernbert_rope_geglu` container, and that container shall load and run. The
+architecture is pre-LayerNorm with a final norm, bias-free throughout, no
+position table (position enters only through RoPE), GeGLU whose packed order is
+`gate|up`, and a sliding window of `local_attention // 2` on the layers whose
+`layer_types` entry is `sliding_attention`. Layer 0's attention norm is
+`nn.Identity()` and is **skipped**, not replaced by a weight-1 norm — a norm with
+weight 1 still centres and scales.
+
+The packer emits the container keys `apply_model_shape` reads, and the runtime
+reads the tokenizer's special ids from the encoder `config.json` rather than from
+the generated blob. It shall refuse, by name, on: a `model_type` it does not
+implement; a config it cannot find; a `swiglu_halves` / `pre_tokenizer` /
+`normalizer` value it does not implement; and a requested sequence length above
+the packed `max_seq_len`.
+
+**Acceptance criteria:**
+- A synthetic `modernbert` fixture packs, and the container loads through `ShapeLease`/`apply_model_shape` with `num_layers`, `hidden`, `num_heads`, `head_dim`, `intermediate` and `max_seq_len` read back as packed.
+- `embeddings.position` and `embeddings.token_type` and every `*.bias` are zero-filled and present; `embeddings.word` is the embedding table's packed name and dtype.
+- The GeGLU gate half is packed **first**, and the container says so in `swiglu_halves`.
+- With `identity_attn_norm_layer0` set, layer 0 applies no attention norm; without it, a weight-1 norm is still refused as a substitute.
+- The band mask is off for every `sliding_attention: false` layer, off for the decision head entirely, and on for `sliding_attention: true` layers at exactly `local_attention // 2` — not `+1`.
+- A checkpoint with a nested `config.json` is packable through the subdirectory keys; one with no `config.json` is refused naming the path.
+- `bge-*`, `nomic`, `gte` and `all-minilm` still pack to byte-identical containers after every change above.
+
+### OPEN-DECISION-SYSTEMONE: `/v1/systemone` is byte-compatible with the pinned TypeSafe schema
+**Applies to:** openflowlm-next (`src/common/AutoDecisionModel/decision_types.cpp`, `src/server/rest_handler.cpp`, `src/server/server.cpp`, `specs/open-engine/plans/typesafe-systemone-0ffd094c.py`)
+**Test category:** unit (serialisation, refusals) + integration (the route)
+**Tests:** `specs/open-engine/tests/test_systemone_wire.py`
+
+`POST /v1/systemone` shall accept a `SystemOneRequest` and return a
+`SystemOneResponse` as pinned by
+`typesafe-ai/typesafe-sdk-python @ 0ffd094c72ed9445223060b24ffd7a56aa781fb4`,
+`src/typesafe_sdk/_schemas/models.py`, vendored beside this plan. The response
+carries the full envelope — `model`, `answers`, `usage` — and `model` is the tag
+that answered, not the tag that was asked for. `usage.output_tokens` is always
+`0`, which is definitional for a non-autoregressive readout. `noul` answers carry
+no `confidence` key at all. Index-keyed maps serialise with string keys.
+
+Question order and option order are semantic and are preserved end to end: a
+`std::map`-backed JSON object is not used anywhere on this path.
+
+**Acceptance criteria:**
+- A golden request/response pair round-trips byte-for-byte against the vendored models, and a test re-reads the vendored file and fails if the fixture and it disagree.
+- The response body is `{model, answers, usage}`; `usage.output_tokens == 0`.
+- A `noul` answer has no `confidence` key; serialising one is an error.
+- A 3-level `score` emits `legend` and `probabilities` keyed `{"0","1","2"}`.
+- `choice` accepts 1–255 options and `score` 2–10 levels; outside those, the request is refused by name.
+- A request naming a model other than the loaded one is refused; the response never carries another model's answers under the asked-for name.
+- A question whose `type` is not implemented is dropped with a warning and the rest of the batch is served.
+- The route is enrolled in `requires_npu_access()` and is never served concurrently with a NPU route.
+
+### OPEN-DECISION-READOUT: one forward pass returns a typed answer per question, or refuses by name
+**Applies to:** openflowlm-next (`src/common/AutoDecisionModel/decision_types.cpp`, `src/include/AutoDecisionModel/auto_decision_model.hpp`, `src/common/AutoDecisionModel/all_decision_model.hpp`)
+**Test category:** unit
+**Tests:** `specs/open-engine/tests/test_decision_plan.py`
+
+A decision model shall take a state plus typed questions and return a
+probability distribution per question in one forward pass, with no generation and
+no parsing. The readout kind is derived from the container, and a model whose
+readout this build does not implement **refuses by name** — it does not fall
+back to a neighbouring recipe. `output_tokens` is always `0`.
+
+`noul` renders exactly two options in the semantic order `[false, true]`; `score`
+options are ordered and the order is the scale; `choice` preserves the caller's
+option order. A criterion value that is falsy but meaningful — `0`, `False`,
+`0.0`, `[]` — is rendered, not replaced by the type's default sentence.
+
+`confidence` is `max(p[:k])` **after temperature**, the quantity Laya's
+calibration is fitted to. This is a recorded divergence: the pinned schema types
+`confidence` as a bare 0–1 float and does not define a formula, and engines in
+this ecosystem differ on which they emit.
+
+**Acceptance criteria:**
+- A 2-option `noul`, an n-option `choice` and an m-level `score` each produce the right option strings, in the right order, from the same prompt builder.
+- A `noul` criterion of `0` or `False` renders its value; only `None` and `""` fall back to the default sentence.
+- `noul_labels` is accepted on `noul` only; supplying it on `choice` or `score` is an error, matching upstream's refusal.
+- `confidence` equals `max(p[:k])` after temperature, and is absent for `noul`.
+- `probabilities` and `logits` have length `k` (this row's marker count), never the batch's `kmax`.
+- A container whose readout is not `scored_slot` is refused by name, naming the readout.
+- `output_tokens` is `0` in every response.
+
+### OPEN-DECISION-HEAD: the decision head is arithmetically a BERT layer and runs where it can be made reproducible
+**Applies to:** openflowlm-next (`src/open_npue/decision_engine.cpp`, `src/open_npue/npue_encoder.hpp`)
+**Test category:** unit (head arithmetic against the reference) + manual (the NPU encoder run)
+**Tests:** `specs/open-engine/tests/test_decision_head.py`
+
+The head shall reproduce the checkpoint's 2-layer `nn.TransformerEncoderLayer`
+exactly: `in_proj`=qkv, `out_proj`=attn_out, `linear1`+`linear2` the FFN, **with
+biases**, `norm_first=True`, and torch-default **ReLU** — not GELU, which is the
+encoder's activation and not the head's. `h += type_emb[qtype]` is broadcast over
+the sequence before the head; the marker gather is after it. The head consumes the
+encoder's post-`final_norm` output.
+
+The head runs on the **host**. This is a placement decision, not a capability
+limit: the encoder's geometry globals are process-wide, the encoder hardcodes its
+tensor prefix, every `npu::Design` is its own `hw_context`, and one model resolves
+to one design set. The head is 8 of the model's 96 GEMMs.
+
+`act_head` is computed and discarded, and the container records why. It is not
+silently skipped: a missing tensor and a deliberately-unused one are different
+things.
+
+**Acceptance criteria:**
+- The head's per-layer output matches the reference on a fixed input, including both biases at every site and ReLU in the FFN.
+- The head's attention is **full-band**: no sliding window and no causal mask, with the padding mask only. A banded head is a wrong answer, not a slow one.
+- The head applies `1/sqrt(head_dim)` explicitly; the encoder's scale is folded into its weight at pack time and the host head's is not.
+- `qkv` is de-interleaved from `in_proj_weight` in `[Q|K|V]` order (the head is plain MHA, not the encoder's `(3, Nh, Dh)` interleave, and has no RoPE).
+- The head never calls `pool_rows`; pooling for this model is a gather at `marker_pos`, not a mean.
+- `type_emb` is indexed by `qtype` in `QTYPES` order and broadcast over the sequence.
+- `act_head` runs and its result is dropped, with the reason in the container's `not_implemented`.
+
+### OPEN-DECISION-ACCURACY: the gate is argmax agreement, stratified by how decided the reference was
+**Applies to:** openflowlm-next (`src/test/laya_decision_npu/test.cpp`, `npu_offload/gemm_rtp/families.json`, `utilities/oflm-test/oflm_test/tasks.py`)
+**Test category:** manual (the NPU run against the PyTorch reference) + integration (the `decisions` suite)
+**Tests:** `specs/open-engine/tests/test_decision_accuracy_fixture.py`
+
+A decision model's answers shall be gated against the upstream PyTorch reference
+by **argmax agreement**, stratified by the reference's own top-2 probability gap.
+On pairs where the reference had an opinion (gap ≥ 0.20) agreement shall be
+100 %; below that threshold the agreement rate is recorded, not passed or failed.
+The threshold is calibrated from the fixture's measured gap distribution, not set
+in advance, and if no natural separation exists the plan says so and sets it
+where this port's disagreements stop clustering.
+
+The reference is run **twice** — once under the bf16 autocast that
+`rl_agent_config.json` specifies, once in fp32 — and the gap between those two
+runs is the reference's own noise floor. Raw logits are diagnostics, not a gate:
+this architecture's pre-softmax scores reach ~55 and amplify summation order, so
+a logit tolerance is both unmeetable and meaningless.
+
+**The datapath is decided here, by measurement.** `--emulate-bfp16` is not
+inherited from the four families that use it. Both arms are built, the gate runs
+on both, and the winner is named in `model_list.json` — the same decision
+`bge-small` was rebuilt for, made the same way. The losing arm's number is
+written into the repo beside the winning one's.
+
+**Acceptance criteria:**
+- On the fixture's decided stratum, argmax agreement is 100 % against the bf16-autocast reference; `confidence` within 1e-3.
+- The undecided stratum's agreement rate is recorded in the repo with the fixture, and the gap distribution that set the 0.20 threshold is recorded with it.
+- The fp32-vs-autocast reference disagreement is measured and reported as the noise floor, and every disagreement this port has with fp32 that autocast does not is treated as this port's error.
+- Raw-logit deltas are reported, not gated.
+- Both datapaths are built and gated; `model_list.json`'s `npue_design_family` names the winner, and the loser's numbers are in the repo.
+- `oflm-test --decisions` runs D1–D9 (shape, probabilities sum to 1, determinism over 10 draws, batch/index integrity, argmax stability, model identity, unknown-type drop, `noul` has no `confidence`, reference agreement) and is mutually exclusive with `--embedding`, both taking the `ShapeLease`.

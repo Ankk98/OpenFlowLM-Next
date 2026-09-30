@@ -1930,6 +1930,24 @@ void say(const PrepareOptions &opt, const std::string &s) {
   if (opt.log) opt.log(s);
 }
 
+// Compose one path inside the checkpoint from an OPTIONAL subdirectory, so an
+// empty subdirectory is the flat layout and a non-empty one is a nested
+// checkpoint -- with no "//" in either case, because these strings are printed
+// in refusal messages and the reader is meant to be able to open what is named.
+std::string sub(const std::string &dir, const std::string &subdir,
+                const std::string &name) {
+  std::string p = dir;
+  if (!p.empty() && p.back() == '/') p.pop_back();
+  if (!subdir.empty()) {
+    p += '/';
+    p += subdir;
+    if (!subdir.empty() && subdir.back() == '/') p.pop_back();
+  }
+  p += '/';
+  p += name;
+  return p;
+}
+
 std::string resolve_source_repo(const PrepareOptions &opt) {
   if (!opt.source_repo.empty()) return opt.source_repo;
   const std::string repo =
@@ -1978,8 +1996,50 @@ std::string prepare_model_auto(const PrepareOptions &opt) {
     out = opt.checkpoint_dir + "/" +
           fs::path(opt.checkpoint_dir).filename().string() + ".npue";
 
-  const std::string model_type =
-      json_string_field(opt.checkpoint_dir + "/config.json", "model_type");
+  // A nested checkpoint puts its config somewhere this packer is not looking,
+  // so the config path is composed ONCE and both the model_type read below and
+  // every packer use it. Empty config_subdir reproduces the flat layout exactly.
+  const std::string cfg_path = sub(opt.checkpoint_dir, opt.config_subdir,
+                                   "config.json");
+  const std::string model_type = json_string_field(cfg_path, "model_type");
+
+  // FAIL CLOSED on an architecture this build does not pack, in TWO arms,
+  // because the two failures are different and neither is the BERT fallback's.
+  //
+  // json_string_field() returns the EMPTY string for a file it cannot open,
+  // cannot parse, has no `model_type` in, or has a non-string one -- and it does
+  // not throw. So `model_type == ""` is three distinct situations collapsed into
+  // one value, and the one Laya actually hits is the first: it ships no
+  // config.json at its root or under `multilingual/`, because the real tree is
+  // multilingual/{encoder/config.json, model.safetensors, tokenizer/...}.
+  // Left alone, that falls through to the BERT LAST branch, whose first act is
+  // slurp(config.json) and slurp(vocab.txt) -- so the user gets "cannot open
+  // <dir>/config.json", naming a file the checkpoint does not have in a
+  // directory it does not name.
+  if (model_type.empty())
+    throw std::runtime_error(
+        "no usable \"model_type\" in " + cfg_path +
+        ". That file is missing, unparseable, or has no string \"model_type\"; "
+        "this packer reads the config from the checkpoint root and refuses to "
+        "guess a subdirectory. If the checkpoint nests its config (e.g. "
+        "<dir>/encoder/config.json), point \"npue_checkpoint_subdir\" in the "
+        "model entry at the directory that holds config.json, model.safetensors "
+        "and any 1_Pooling/config.json -- or pass PrepareOptions::"
+        "config_subdir. See specs/open-engine/plans/laya-decision-encoder.md.");
+  // The OTHER arm, and the more dangerous one: a checkpoint that DOES put a
+  // config.json at its root, naming an architecture no packer here handles,
+  // would otherwise be packed as arch=0 -- GELU plus absolute position
+  // embeddings, for a GeGLU-plus-RoPE model. The runtime loads that container
+  // happily and returns wrong vectors, because arch=0's tensor names are the
+  // ones this one shares on purpose. Refusing costs a rebuild; writing it costs
+  // an answer nobody downstream can tell is wrong.
+  if (model_type == "modernbert")
+    throw std::runtime_error(
+        "modernbert_rope_geglu is not packed by this build. The BERT fallback "
+        "below would emit a valid-looking arch=0 container for a GeGLU/RoPE "
+        "model; refusing rather than writing the wrong answer. The architecture "
+        "is specified in npu_offload/gemm_rtp/npue.py (arch=4) and the port is "
+        "tracked in specs/open-engine/plans/laya-decision-encoder.md.");
 
   // arch=1 (EmbeddingGemma / Gemma3 family): a completely different tensor
   // shape and container, routed to its own packer rather than threaded through
