@@ -187,6 +187,7 @@ def encode(root, ids, band_on, seq=None, bf16_replica=False, want_layers=False):
     cfg = json.load(open(os.path.join(root, "encoder", "config.json")))
     C = Config(cfg)
     t = load_safetensors(os.path.join(root, "model.safetensors"))
+    t["_root"] = root
     S = len(ids) if seq is None else seq
     H, Nh, Dh, I, L = C.hidden, C.heads, C.head_dim, C.inter, C.layers
 
@@ -296,19 +297,142 @@ def encode(root, ids, band_on, seq=None, bf16_replica=False, want_layers=False):
     return (out, per_layer) if want_layers else out
 
 
+# --------------------------------------------------------------------------
+# the decision head
+#
+# Separated from the encoder above because the Phase 7 gate has to be able to
+# blame one or the other: fed the SAME ids the engine used, this answers "is the
+# engine's head arithmetic right", and the prompt builder is then the only
+# remaining suspect. Run together they answer neither.
+# --------------------------------------------------------------------------
+
+def _ln(x, w, b=None, eps=1e-5):
+    """LayerNorm with an OPTIONAL beta. This checkpoint's norms are bias-free --
+    `norm_bias: false`, and its safetensors header carries no encoder `*.bias`
+    at all -- so a required beta is a refusal against a complete model."""
+    mu = x.mean(-1, keepdims=True)
+    var = ((x - mu) ** 2).mean(-1, keepdims=True)
+    y = (x - mu) / np.sqrt(var + eps) * w
+    return y if b is None else y + b
+
+
+def _gb(t, wkey, bkey):
+    """A norm's gamma/beta pair, with the beta OPTIONAL. See `_ln`."""
+    if wkey not in t:
+        raise SystemExit(f"no {wkey}")
+    return (t[wkey].astype(np.float64),
+            t[bkey].astype(np.float64) if bkey in t else None)
+
+
+def head(t, ids, markers, qtype, keep=None):
+    """The 2 head layers + the scorer, in float64, on the checkpoint's weights.
+
+    `t` is the loaded safetensors dict, `ids` a single row, `markers` that row's
+    marker positions, `qtype` its index into type_emb.
+
+    Mirrors the engine exactly, including the three places the two could
+    disagree: ReLU (not GELU) in the head FFN, the explicit 1/sqrt(head_dim) on
+    Q, and LayerNorm eps 1e-5 (torch's default) rather than the encoder's 1e-12.
+    """
+    cfg = json.load(open(os.path.join(t["_root"], "encoder", "config.json")))
+    C = Config(cfg)
+    d = C.hidden
+    S = len(ids)
+    x = t["encoder.embeddings.tok_embeddings.weight"][list(ids)].astype(np.float64)
+    x = _ln(x, *_gb(t, "encoder.embeddings.norm.weight", "encoder.embeddings.norm.bias"), eps=C.eps)
+    cos, sin = rope_tables(S, C.head_dim, C.theta)
+    pos = np.arange(S)
+    keepm = np.ones(S, dtype=bool) if keep is None else np.asarray(keep, dtype=bool)
+    neg = np.where(keepm, 0.0, -1.0e30)
+    Nh, Dh, L, I = C.heads, C.head_dim, C.layers, C.inter
+    band = C.band
+
+    for l in range(L):
+        p = f"encoder.layers.{l}."
+        h = x if l == 0 else _ln(x, *_gb(t, p + "attn_norm.weight", p + "attn_norm.bias"), eps=C.eps)
+        qkv = (t[p + "attn.Wqkv.weight"].astype(np.float64) @ h.T).T.reshape(S, 3, Nh, Dh)
+        q = apply_rope(qkv[:, 0], cos, sin)
+        k = apply_rope(qkv[:, 1], cos, sin)
+        v = qkv[:, 2]
+        sc = np.einsum("ihd,jhd->hij", q, k) / np.sqrt(Dh)
+        if band and C.layer_types[l] == "sliding_attention":
+            sc = np.where((np.abs(pos[:, None] - pos[None, :]) > band)[None, :, :],
+                          -1.0e30, sc)
+        sc = sc + neg[None, None, :]
+        sc = sc - sc.max(-1, keepdims=True)
+        e = np.exp(sc)
+        ctx = np.einsum("hij,jhd->ihd", e / e.sum(-1, keepdims=True), v).reshape(S, d)
+        x = x + (t[p + "attn.Wo.weight"].astype(np.float64) @ ctx.T).T
+        h = _ln(x, *_gb(t, p + "mlp_norm.weight", p + "mlp_norm.bias"), eps=C.eps)
+        wi = t[p + "mlp.Wi.weight"].astype(np.float64) @ h.T
+        up, gate = wi[:I].T, wi[I:].T
+        x = x + (t[p + "mlp.Wo.weight"].astype(np.float64) @ (gelu_exact(gate) * up).T).T
+    h = _ln(x, *_gb(t, "encoder.final_norm.weight", "encoder.final_norm.bias"), eps=C.eps)
+
+    # --- the head. type_emb first, broadcast over the sequence.
+    h = h + t["type_emb.weight"].astype(np.float64)[qtype]
+    for l in range(cfg.get("head_layers", 2)):
+        p = f"head.layers.{l}."
+        n = _ln(h, *_gb(t, p + "norm1.weight", p + "norm1.bias"))
+        # PyTorch's names. The CONTAINER renames in_proj -> in_proj.weight and
+        # out_proj -> out_proj.weight (it collides with the encoder's
+        # attn_out otherwise), so a reader that used the container's names
+        # against the checkpoint gets a KeyError -- which is the cheap failure,
+        # unlike the reverse.
+        ip = t[p + "self_attn.in_proj_weight"].astype(np.float64)
+        ib = t[p + "self_attn.in_proj_bias"].astype(np.float64)
+        proj = (n @ ip.T + ib).reshape(S, 3, Nh, Dh)     # [Q|K|V], plain MHA
+        q, k, v = proj[:, 0], proj[:, 1], proj[:, 2]
+        q = q / np.sqrt(Dh)                              # EXPLICIT, on Q only
+        sc = np.einsum("ihd,jhd->hij", q, k)              # no band, no RoPE
+        sc = sc + neg[None, None, :]
+        sc = sc - sc.max(-1, keepdims=True)
+        e = np.exp(sc)
+        ctx = np.einsum("hij,jhd->ihd", e / e.sum(-1, keepdims=True), v).reshape(S, d)
+        h = h + (ctx @ t[p + "self_attn.out_proj.weight"].astype(np.float64).T
+                 + t[p + "self_attn.out_proj.bias"].astype(np.float64))
+        n = _ln(h, *_gb(t, p + "norm2.weight", p + "norm2.bias"))
+        f = np.maximum(0.0, n @ t[p + "linear1.weight"].astype(np.float64).T
+                       + t[p + "linear1.bias"].astype(np.float64))   # ReLU
+        h = h + (f @ t[p + "linear2.weight"].astype(np.float64).T
+                 + t[p + "linear2.bias"].astype(np.float64))
+
+    m = h[np.asarray(markers, dtype=int)]
+    m = _ln(m, *_gb(t, "scorer.0.weight", "scorer.0.bias"))
+    m = gelu_exact(m @ t["scorer.1.weight"].astype(np.float64).T
+                   + t["scorer.1.bias"].astype(np.float64))
+    return (m @ t["scorer.3.weight"].astype(np.float64).T
+            + t["scorer.3.bias"].astype(np.float64)).reshape(-1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--ids", required=True, help="comma-separated token ids")
+    ap.add_argument("--ids", default="", help="comma-separated token ids")
     ap.add_argument("--seq", type=int, default=0, help="0 = one row per id")
     ap.add_argument("--band", type=int, default=0, choices=[0, 1])
     ap.add_argument("--bf16", type=int, default=0, choices=[0, 1],
                     help="round the GEMM operands to bfloat16: the replica the "
                          "plan's threshold is calibrated from")
     ap.add_argument("--out", default="")
+    ap.add_argument("--head", default="",
+                    help="markers,qtype for the head, e.g. '12,20;2'")
+    ap.add_argument("--ids-file", default="",
+                    help="read the ids from the engine's own output, so the two "
+                         "sides are provably running the same prompt")
     ap.add_argument("--dump", default="", help="a .bin the engine wrote")
     a = ap.parse_args()
-    ids = [int(x) for x in a.ids.split(",") if x.strip()]
+    if a.ids_file:
+        ids = [int(x) for x in open(a.ids_file).read().split()]
+    else:
+        ids = [int(x) for x in a.ids.split(",") if x.strip()]
+    if not ids:
+        raise SystemExit(
+            "no ids: pass --ids or --ids-file. Reading the ENGINE's ids with "
+            "--ids-file is what makes the head comparison a test of the head "
+            "rather than of the prompt builder; with --ids the two sides could "
+            "disagree about the prompt and the comparison would blame the head "
+            "for a prompt bug.")
     out = encode(a.checkpoint, ids, a.band, a.seq or None, bool(a.bf16))
     print(f"# reference shape {out.shape} band={a.band} bf16_replica={a.bf16}",
           file=sys.stderr)
@@ -323,6 +447,17 @@ def main():
         print(f"max_abs_diff  {d.max():.6g}   mean_abs_diff {d.mean():.6g}")
         rel = d.max() / max(1e-12, np.abs(ref).max())
         print(f"max_rel_diff  {rel:.6g}")
+    if a.head:
+        mk, qt = a.head.split(";")
+        tt = load_safetensors(os.path.join(a.checkpoint, "model.safetensors"))
+        tt["_root"] = a.checkpoint
+        # The oracle runs the REAL PREFIX only, so every position it has is
+        # real. (An earlier version indexed this by token id, which is a
+        # different thing entirely -- ids reach 235337, so it built a quarter of
+        # a million mask entries and then failed to broadcast.)
+        logits = head(tt, ids, [int(x) for x in mk.split(",")], int(qt),
+                      keep=[True] * len(ids))
+        print("# head logits " + " ".join("%.7g" % v for v in logits))
     if a.out:
         out.astype(np.float32).tofile(a.out)
     return 0

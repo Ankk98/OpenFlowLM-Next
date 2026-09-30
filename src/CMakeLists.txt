@@ -326,6 +326,12 @@ endif()
 if(NOT OFLM_USE_HRX)
     set(OPEN_NPUE_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/npue_encoder.cpp"
+        # The decision engine, arch=4's host head. Listed explicitly, like every
+        # other source here, and NOT behind an arch guard: it compiles for every
+        # build and refuses at LOAD time for a container that is not arch=4, so
+        # the refusal is one line with a container in the message rather than a
+        # link error on a build that happens to be missing a feature.
+        "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/decision_engine.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/npue.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/npue_pack.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_npue/npu_device.cpp"
