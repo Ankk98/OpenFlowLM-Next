@@ -72,6 +72,7 @@
 #include "npu_device.hpp"
 #include "npue.hpp"
 #include "tokenizer.hpp"
+#include "tokenizer_bbpe.hpp"
 #include "tokenizer_xlmr.hpp"
 
 namespace npue {
@@ -310,7 +311,20 @@ inline bool encoder_implemented(const std::string &arch) {
          // encoder deltas -- RoPE from rope_inv_freq, exact-erf GELU on the
          // gate half, real biases, XLM-R Unigram tokenizer -- are all
          // data-driven off the container (tasks/0134-0136).
-         arch == "gte_new_rope_geglu";
+         arch == "gte_new_rope_geglu" ||
+         // ModernBERT / mmBERT (arch=4): also BERT tensor names on purpose.
+         // FOUR properties separate it from the three above and each of them
+         // turns a wrong answer rather than an error, which is why they are
+         // data on the container and read back here: pre-LayerNorm with a final
+         // norm (add_norm_* stores the NORMALISED value as the residual, which
+         // is wrong under pre-LN), layer 0's attention norm SKIPPED rather than
+         // zero-weighted, a gated GeGLU whose gate half is packed FIRST (the
+         // reverse of arch=2/3, because ModernBERT's gate is the second half of
+         // Wi), and a +/-64 sliding-window band on the layers whose layer_types
+         // entry is sliding_attention. None of the three above has a locality
+         // term at all, which is why band_half defaults to 0 and every existing
+         // container stays bit-identical.
+         arch == "modernbert_rope_geglu";
 }
 
 inline bool config_flag(const npue::File &f, const char *key, bool fallback) {
@@ -336,13 +350,35 @@ inline bool config_flag(const npue::File &f, const char *key, bool fallback) {
 struct AnyTokenizer {
   std::unique_ptr<npue::Tokenizer> wordpiece;
   std::unique_ptr<npue::XlmrTokenizer> xlmr;
+  // arch=4. Its encode() is NOT the facade's: this family's caller needs
+  // add_special_tokens=False (Laya inserts every special by hand, in a specific
+  // order, and applies none of the blob's post-processor), so the decision
+  // engine calls tokenize() directly rather than going through here.
+  std::unique_ptr<npue::BbpeTokenizer> bbpe;
 
   size_t vocab_size() const {
-    return wordpiece ? wordpiece->vocab_size() : xlmr->vocab_size();
+    if (wordpiece) return wordpiece->vocab_size();
+    if (bbpe) return bbpe->vocab_size();
+    return xlmr->vocab_size();
   }
 
   npue::Encoded encode(const std::string &text, int max_len) const {
     if (wordpiece) return wordpiece->encode(text, max_len);
+    if (bbpe) {
+      // Not reachable by accident. Every other backend here is an EMBEDDING
+      // encoder, where the facade's wrap-and-pad policy is the right one; arch=4
+      // is a decision model whose prompt is assembled token by token with its
+      // specials in hand. Refusing by name beats picking a policy: the two
+      // differ in where [CLS] goes, and only one of them is right for this
+      // architecture.
+      throw std::runtime_error(
+          "AnyTokenizer::encode() on a modernbert_rope_geglu container. This "
+          "architecture's prompt is assembled by the decision engine with every "
+          "special inserted by hand -- [CLS] <type> question: ... [SEP] [MASK] "
+          "opt0 ... [SEP] <state> [SEP] -- and NONE of the blob's "
+          "post-processor prefix/suffix, so the facade's wrap-and-pad policy is "
+          "not merely different here, it is wrong. Call tokenize() per segment.");
+    }
     // XLM-R Unigram. XlmrTokenizer::encode() returns the FULL <s>...</s>
     // sequence, unpadded and untruncated (its header: an input that does
     // not fit is the caller's error to raise, not the tokenizer's to
@@ -381,6 +417,60 @@ inline AnyTokenizer load_tokenizer(npue::File &model,
     arch = model.config_string("arch");
   } catch (const std::exception &) {
     // Pre-arch container: WordPiece, like everything else that old.
+  }
+  // arch=4: the BBPETOK1 blob, stored whole in the container and consumed in
+  // place -- the same shape as arch=3's XLM-R blob above.
+  //
+  // THE CONTAINER'S SPECIAL IDS WIN, ALWAYS, AND THE BLOB'S ARE OVERWRITTEN.
+  // The blob derives cls_id from the first of {[CLS], <s>, <|endoftext|>} and
+  // sep_id from {[SEP], </s>} -- a guess about NAMES, which is right for the
+  // BERT family the generator was written against and WRONG here, measured:
+  // convaiinnovations/laya's vocabulary has `<s>` at 204 and `</s>` at 213,
+  // while its encoder config says cls_token_id = 1 and sep_token_id = 1, both
+  // `<eos>`. The prompt builder inserts cls and sep by those ids for every
+  // single row, so taking the blob's number would hand the model a sequence it
+  // never sees and return confidently wrong answers.
+  //
+  // It is NOT a refusal, and the design plan's "throw if they disagree" was
+  // wrong: the disagreement is the EXPECTED state for this checkpoint, so
+  // refusing would make the model unloadable over a name-guess being a
+  // name-guess. What IS checked is the thing that would actually be broken --
+  // that the container's id names a token this vocabulary has -- and what is
+  // reported is the difference, because a silent overwrite hides the fact that
+  // the blob's derivation is unusable for this family.
+  if (arch == "modernbert_rope_geglu") {
+    auto v = model.raw("tokenizer.bbpe_table");
+    AnyTokenizer t;
+    t.bbpe = std::make_unique<npue::BbpeTokenizer>(
+        npue::BbpeTokenizer::from_table_bytes(
+            reinterpret_cast<const char *>(v.data), v.bytes));
+    const int32_t vocab = static_cast<int32_t>(t.bbpe->vocab_size());
+    struct { const char *key; int32_t *dst; } ids[] = {
+        {"cls_token_id", &t.bbpe->cls_id},
+        {"sep_token_id", &t.bbpe->sep_id},
+        {"pad_token_id", &t.bbpe->pad_id},
+        {"unk_token_id", &t.bbpe->unk_id},
+        {"marker_token_id", &t.bbpe->mask_id},
+    };
+    for (const auto &id : ids) {
+      const int32_t from_blob = *id.dst;
+      const int32_t want = model.config_int(id.key);
+      if (want < 0 || want >= vocab)
+        throw std::runtime_error(
+            std::string("container ") + id.key + "=" + std::to_string(want) +
+            " is outside this container's vocabulary (0.." +
+            std::to_string(vocab - 1) + "). Framing or padding a sequence with "
+            "an id no token has produces a correctly-shaped input to a model "
+            "that never sees it.");
+      if (want != from_blob)
+        std::printf(
+            "  tokenizer  %s: container %d ('%s') overrides the table's "
+            "name-derived %d -- the table guesses by NAME and this family does "
+            "not use these names\n",
+            id.key, want, t.bbpe->token_of(want).c_str(), from_blob);
+      *id.dst = want;
+    }
+    return t;
   }
   if (arch == "gte_new_rope_geglu") {
     auto v = model.raw("tokenizer.xlmr_table");

@@ -138,6 +138,56 @@ void prepare_model_gte(const std::string &model_dir,
                        int64_t tile_k, int64_t tile_n, int64_t max_seq,
                        void (*log)(const std::string &) = nullptr);
 
+// arch=4 (ModernBERT / mmBERT: pre-LN, RoPE, gated GeGLU, bidirectional with a
+// sliding window on most layers) -- `model_type: "modernbert"`. Emits the SAME
+// per-layer tensor names and emission order as arch=0/2/3 so `Encoder`'s
+// existing NPU dispatch path serves it unchanged, with departures that are all
+// read from the checkpoint rather than assumed:
+//
+//   * PRE-LayerNorm with a final norm after the last layer. `add_norm_*` stores
+//     the NORMALISED value as the residual, which is correct under post-LN and
+//     wrong under pre-LN -- a correctness bug, not a slow path.
+//   * layer 0's attention norm is `nn.Identity()`, so the checkpoint has NO
+//     `attn_norm` tensor for it. Zero-filled and SKIPPED via
+//     config["identity_attn_norm_layer0"], never replaced by a weight-1 norm:
+//     a norm with weight 1 still centres and scales.
+//   * NO biases anywhere in the encoder. `attention_bias`/`mlp_bias`/`norm_bias`
+//     are all false and the checkpoint ships no `*.bias` at all. The bias slots
+//     are zero-filled, which is exact and unavoidable -- the runtime
+//     dereferences `<op>.bias` for every GEMM unconditionally.
+//   * NO position table. `embeddings.position` / `embeddings.token_type` are
+//     zero-filled placeholders of the right shape, same reasoning as nomic.
+//   * GeGLU whose GATE half is the SECOND half of `mlp.Wi`, the reverse of
+//     LLaMA's convention and of arch=2/3. The packer moves it FIRST
+//     (add_gemm_b_reorder_rows) and records the swap in config["glu_halves"].
+//
+// `model_dir` is the CHECKPOINT ROOT (PrepareOptions::checkpoint_subdir has
+// already been applied by the caller) and must hold model.safetensors and
+// rl_agent_config.json; `config_subdir` and `tokenizer_subdir` name the other
+// two, which for convaiinnovations/laya are one level below it. The
+// tokenizer blob is read from the cached tokenizer/tokenizer.bin when present
+// and otherwise generated here in C++ (generate_bbpe_tokenizer_table(), which
+// is where the byte-level BPE for this family lives) and written back -- the
+// same self-sufficiency prepare_model_gemma() has for its own table.
+//
+// The decision head's tensors are packed here too, as plain F32 host weights:
+// no layout hash, no design, no pre-tiling. That is a PLACEMENT decision and
+// not a capability limit -- the head is 8 of this model's 96 GEMMs and the
+// obstacles to running it on the array are process-wide geometry globals, a
+// hardcoded "layer." tensor prefix, one hw_context per npu::Design, and one
+// design set per model. Packing them keeps the container self-contained.
+void prepare_model_modernbert(const std::string &model_dir,
+                              const std::string &pooling,
+                              const std::string &source_repo,
+                              const std::string &out,
+                              const std::string &layout_json,
+                              const std::string &layout_hash,
+                              int64_t tile_k, int64_t tile_n, int64_t max_seq,
+                              const std::string &config_subdir,
+                              const std::string &tokenizer_subdir,
+                              const std::string &rl_config_path,
+                              void (*log)(const std::string &) = nullptr);
+
 // ONE CALL THAT PACKS A CHECKPOINT (tasks/0156, T63).
 //
 // The four prepare_model_* entry points above each need the right arguments,
@@ -189,23 +239,40 @@ struct PrepareOptions {
   // (65,536 B against the 63 KB budget), so it must be 32.
   int64_t tile_k = 64;
   int64_t tile_n = 48;
-  // Where the checkpoint's FILES are, relative to checkpoint_dir, for a
-  // repository that NESTS them instead of laying them out flat.
+  // Where the checkpoint's FILES are, for a repository that NESTS them instead
+  // of laying them out flat. Three independent offsets, all relative, because
+  // one repository can put them in three different places:
   //
-  // convaiinnovations/laya is the case this exists for: its tree is
-  //   multilingual/{encoder/config.json, model.safetensors, tokenizer/tokenizer.json,
-  //                 rl_agent_config.json}
-  // so with checkpoint_dir = <served>/multilingual the config is at
-  // encoder/config.json and the tokenizer at tokenizer/tokenizer.json. Nothing
-  // in the flat path could express that, and guessing a subdirectory is exactly
-  // the kind of guess this packer refuses everywhere else.
+  //   checkpoint_subdir  where the CHECKPOINT is under checkpoint_dir
+  //   config_subdir      where config.json is under the checkpoint root
+  //   tokenizer_subdir   where tokenizer.json is under the checkpoint root
   //
-  // Empty means flat, which is every shipped model's layout, so the default
-  // keeps every existing caller byte-identical. A non-empty value that does not
-  // resolve is an ERROR naming the composed path -- never a silent fallback to
-  // the root, which is what would make a typo look like a missing packer.
-  std::string config_subdir;      // default ""
-  std::string tokenizer_subdir;   // default "tokenizer"
+  // convaiinnovations/laya is the case these exist for. Its tree is
+  //   multilingual/{encoder/config.json, model.safetensors,
+  //                 tokenizer/tokenizer.json, rl_agent_config.json}
+  // so with checkpoint_dir = <served>, checkpoint_subdir = "multilingual",
+  // config_subdir = "encoder" and tokenizer_subdir = "tokenizer", the weights
+  // and the RL config land at the checkpoint root -- which is convenient,
+  // because every other file this packer reads is there -- and only the config
+  // and the tokenizer are one level deeper.
+  //
+  // The defaults are the flat layout every shipped model uses, so every existing
+  // caller is unchanged. A value that does not resolve is an ERROR naming the
+  // composed path: never a silent fallback to the root, which is what would make
+  // a typo look like a missing packer.
+  std::string checkpoint_subdir;   // default ""
+  std::string config_subdir;       // default ""
+  std::string tokenizer_subdir;    // default "tokenizer"
+  // arch=4's design is compiled at one sequence length and `set_design_seq()`
+  // REFUSES anything above it, so the container has to record the same number.
+  // It is a knob rather than a constant because it is a property of the DESIGN
+  // and of nothing else: two ModernBERT-shaped checkpoints at different lengths
+  // need two containers and one geometry.
+  //
+  // 1024 is laya-multilingual's own `max_len`, and NOT its
+  // `max_position_embeddings` (8192) -- that one is a RoPE cache length only,
+  // because this architecture carries no position table at all.
+  int64_t modernbert_max_seq = 1024;
   // arch=1 escape hatch (tasks/0074). The default is the production geometry,
   // so a cold clone self-produces a container the ARRAY can run -- before that
   // default existed it self-produced a host-only container and quietly ran at

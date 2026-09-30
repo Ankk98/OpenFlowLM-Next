@@ -28,6 +28,7 @@
 
 #include "npue_pack.hpp"
 
+#include "bbpe_tokenizer_gen.hpp"
 #include "gemma_tokenizer_gen.hpp"
 #include "json_min.hpp"
 #include "xlmr_tokenizer_gen.hpp"
@@ -418,6 +419,26 @@ private:
   std::vector<uint8_t> blob_;
   uint64_t offset_ = 0;
 };
+
+// Compose one path inside the checkpoint from an OPTIONAL subdirectory, so an
+// empty subdirectory is the flat layout and a non-empty one is a nested
+// checkpoint -- with no "//" in either case, because these strings are printed
+// in refusal messages and the reader is meant to be able to open what is named.
+std::string sub(const std::string &dir, const std::string &subdir,
+                const std::string &name) {
+  std::string p = dir;
+  while (!p.empty() && p.back() == '/') p.pop_back();
+  if (!subdir.empty()) {
+    p += '/';
+    size_t b = 0, e = subdir.size();
+    while (b < e && subdir[b] == '/') ++b;
+    while (e > b && subdir[e - 1] == '/') --e;
+    p += subdir.substr(b, e - b);
+  }
+  p += '/';
+  p += name;
+  return p;
+}
 
 std::vector<uint8_t> slurp(const std::string &path) {
   std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -1930,24 +1951,6 @@ void say(const PrepareOptions &opt, const std::string &s) {
   if (opt.log) opt.log(s);
 }
 
-// Compose one path inside the checkpoint from an OPTIONAL subdirectory, so an
-// empty subdirectory is the flat layout and a non-empty one is a nested
-// checkpoint -- with no "//" in either case, because these strings are printed
-// in refusal messages and the reader is meant to be able to open what is named.
-std::string sub(const std::string &dir, const std::string &subdir,
-                const std::string &name) {
-  std::string p = dir;
-  if (!p.empty() && p.back() == '/') p.pop_back();
-  if (!subdir.empty()) {
-    p += '/';
-    p += subdir;
-    if (!subdir.empty() && subdir.back() == '/') p.pop_back();
-  }
-  p += '/';
-  p += name;
-  return p;
-}
-
 std::string resolve_source_repo(const PrepareOptions &opt) {
   if (!opt.source_repo.empty()) return opt.source_repo;
   const std::string repo =
@@ -1986,6 +1989,826 @@ std::string resolve_pooling(const PrepareOptions &opt) {
 
 }  // namespace
 
+// Emit `fused` (an [N, K] checkpoint tensor) with its row range
+// [r0, r0+rows) moved AHEAD of the rest: the layout along N is
+// [fused[r0..r0+rows) ; fused[everything else]], transposed to [K, N] the way
+// add_gemm_b() does, then pre-tiled.
+//
+// WHY A PERMUTATION AND NOT A CONCATENATION. add_gemm_b_concat2() above takes
+// TWO whole tensors and lays them out as [a; b], which is the right helper for
+// nomic (fc11 and fc12 are two separate [inter, hidden] tensors) and cannot
+// express "the same tensor, rows reordered". ModernBERT has no second
+// up-projection tensor to concatenate with: mlp.Wi is stored FUSED at
+// [2*inter, hidden] and is the model's only up-projection.
+//
+// WHY ModernBERT NEEDS IT AT ALL. Upstream computes
+//     x, gate = self.Wi(h).chunk(2, dim=-1)
+// so the GATE is the SECOND half -- chunk(2, -1) yields [first, second] and they
+// bind them as (input, gate). This runtime computes `lo * gelu(hi)` over the
+// packed order, i.e. the ACTIVE half comes SECOND, so the gate half has to be
+// packed FIRST. LLaMA's convention is the reverse of ModernBERT's here, and
+// getting it backwards still produces a model that emits fluent plausible
+// garbage -- which is why the container records what it did in
+// config["glu_halves"] rather than leaving a reader to infer it.
+//
+// Exact, not approximate: every element that moves is the same float32 value and
+// every element is still present exactly once.
+static void add_gemm_b_reorder_rows(Writer &w, const std::string &name,
+                                    const Tensor &fused, int64_t r0, int64_t rows,
+                                    int64_t tk, int64_t tn,
+                                    const std::string &layout_json,
+                                    const std::string &layout_hash) {
+  const int64_t N = fused.rows(), K = fused.cols();
+  if (r0 < 0 || rows <= 0 || r0 + rows > N)
+    throw std::runtime_error(
+        name + ": row range [" + std::to_string(r0) + ", " +
+        std::to_string(r0 + rows) + ") is outside the fused tensor's " +
+        std::to_string(N) + " rows");
+  const float *src = fused.f32();
+  std::vector<float> m(static_cast<size_t>(K) * N);
+  for (int64_t r = 0; r < K; ++r) {
+    // Source and destination are different index spaces, so this is a
+    // per-element copy with no aliasing to reason about.
+    for (int64_t c = 0; c < rows; ++c)
+      m[r * N + c] = src[(r0 + c) * K + r];
+    for (int64_t c = rows; c < N; ++c)
+      m[r * N + c] = src[(c - rows) * K + r];
+  }
+  const auto tiled = tile_b(m.data(), K, N, tk, tn);
+  w.add(name, tiled.data(), tiled.size() * 2, "BF16", "gemm_b", {K, N},
+        layout_json, layout_hash);
+}
+
+// The .npue header's `arch` number for this architecture.
+//
+// It is written into the 64-byte header (Writer::write's argument) and
+// npu_offload/gemm_rtp/npue.py reads it back as ARCH_MODERNBERT_ROPE_GEGLU = 4.
+// That constant was written when the architecture was specified and long before
+// anything here could pack one; the container format carried the slot from the
+// start. 4 in ONE place, because a second literal here would be a second place
+// for the header and the reader to disagree.
+constexpr uint32_t kArchModernBertRopeGeGLU = 4;
+
+// arch=4 (ModernBERT / mmBERT): pre-LN, RoPE, gated GeGLU, bidirectional with a
+// sliding window on most layers.
+//
+// NOT A BERT WITH A NEW ACTIVATION. Four properties make this architecture
+// different from arch=0 in ways that each produce a PLAUSIBLE WRONG ANSWER
+// rather than an error, so each is asserted from the checkpoint rather than
+// assumed:
+//
+//  * PRE-LAYERNORM, with a final norm after the last layer. arch=0/2/3 fuse
+//    `residual + y` and then normalise, storing the NORMALISED value as the
+//    residual -- correct under post-LN, wrong under pre-LN, where the next block
+//    would add to an already-centred stream and the residual stream would be
+//    re-centred twice per layer.
+//  * LAYER 0'S ATTENTION NORM IS nn.Identity(). The checkpoint has no
+//    `attn_norm` tensor for layer 0 at all (21 of them for 22 layers). It must
+//    be SKIPPED, not replaced by a weight-1 norm: a norm with weight 1 still
+//    subtracts the mean and divides by the standard deviation.
+//  * NO BIASES ANYWHERE IN THE ENCODER. attention_bias, mlp_bias and norm_bias
+//    are all false and the checkpoint ships no `*.bias` tensor for the encoder
+//    at all. The runtime dereferences `<op>.bias` for every GEMM
+//    unconditionally, so they are emitted zero-filled -- exact, because the
+//    embedding build is dst = word + position + token_type and a zero add
+//    changes nothing.
+//  * NO POSITION TABLE. position enters only through RoPE; `sans_pos` (mmBERT)
+//    says so and ModernBERT's own "absolute" is a dead key read by no code path.
+//    Zero-filled placeholders, same reasoning as nomic.
+//
+// And one that is a TRAP rather than a difference: the GeGLU gate is the SECOND
+// half of mlp.Wi, the opposite of LLaMA's convention and of arch=2/3 here.
+// add_gemm_b_reorder_rows() puts it first and the container says so.
+//
+// The decision head's tensors are packed here TOO, as plain F32 host weights --
+// no layout hash, no design, no pre-tiling -- because the decision engine runs
+// the head on the HOST. The reasons are structural rather than arithmetic: the
+// geometry globals are process-wide and written once by ShapeLease, the encoder
+// hardcodes its "layer." tensor prefix, every npu::Design is its own
+// hw_context, and one model resolves to one design set. The head is 8 of this
+// model's 96 GEMMs. Packing them keeps the container self-contained, so moving
+// the head onto the array later is not a re-pack.
+void prepare_model_modernbert(const std::string &model_dir,
+                              const std::string &pooling,
+                              const std::string &source_repo,
+                              const std::string &out,
+                              const std::string &layout_json,
+                              const std::string &layout_hash,
+                              int64_t tile_k, int64_t tile_n, int64_t max_seq,
+                              const std::string &config_subdir,
+                              const std::string &tokenizer_subdir,
+                              const std::string &rl_config_path,
+                              void (*log)(const std::string &)) {
+  const auto st_buf = slurp(model_dir + "/model.safetensors");
+  const auto src = read_safetensors(st_buf);   // widens this checkpoint's F16
+  Sha256 sh;                                   // to F32 at read time
+  sh.update(st_buf.data(), st_buf.size());
+  const std::string sha = sh.hex();
+
+  // The encoder's tensors carry an `encoder.` prefix on top of ModernBERT's own
+  // names -- `attn.Wqkv`, `mlp.Wi`, `attn_norm`, `final_norm`. Try the prefixed
+  // form first and fall back to the bare one, the same shape as gte's `get()`
+  // above: a checkpoint saved by transformers has the prefix, and one saved by a
+  // converter may not.
+  auto get = [&](const std::string &n) -> const Tensor & {
+    auto it = src.find("encoder." + n);
+    if (it == src.end()) it = src.find(n);
+    if (it == src.end())
+      throw std::runtime_error("checkpoint has no tensor 'encoder." + n +
+                               "' (nor '" + n + "')");
+    if (it->second.dtype != "F32")
+      throw std::runtime_error("checkpoint tensor '" + n + "' is " +
+                               it->second.dtype + "; this packer reads F32 "
+                               "(F16/BF16 are widened at read time)");
+    return it->second;
+  };
+
+  const auto cfg_buf = slurp(sub(model_dir, config_subdir, "config.json"));
+  const std::string cfg(reinterpret_cast<const char *>(cfg_buf.data()),
+                        cfg_buf.size());
+  auto find_key = [&](const char *key) -> size_t {
+    return cfg.find(std::string("\"") + key + "\"");
+  };
+  // The exact literal text of a value, or the fallback when the key is absent or
+  // explicitly null. Both are needed: `bos_token_id` is optional in some configs
+  // and `null` in others, and `std::stoll("null")` is a throw with a message
+  // about neither.
+  auto cfg_raw_or = [&](const char *key, const char *fallback) -> std::string {
+    const size_t i = find_key(key);
+    if (i == std::string::npos) return fallback;
+    size_t c = cfg.find(':', i) + 1;
+    while (c < cfg.size() && std::isspace(static_cast<unsigned char>(cfg[c]))) ++c;
+    size_t e = c;
+    while (e < cfg.size() && cfg[e] != ',' && cfg[e] != '}' && cfg[e] != '\n' &&
+           cfg[e] != '\r')
+      ++e;
+    while (e > c && std::isspace(static_cast<unsigned char>(cfg[e - 1]))) --e;
+    const std::string v = cfg.substr(c, e - c);
+    return v == "null" ? std::string(fallback) : v;
+  };
+  auto cfg_int = [&](const char *key) -> int64_t {
+    const std::string v = cfg_raw_or(key, nullptr);
+    if (v.empty())
+      throw std::runtime_error(std::string("config.json has no ") + key);
+    return std::stoll(v);
+  };
+  auto cfg_bool = [&](const char *key, bool fallback) -> bool {
+    const std::string v = cfg_raw_or(key, fallback ? "true" : "false");
+    if (v == "true") return true;
+    if (v == "false") return false;
+    return fallback;
+  };
+  auto cfg_str = [&](const char *key) -> std::string {
+    const size_t i = find_key(key);
+    if (i == std::string::npos)
+      throw std::runtime_error(std::string("config.json has no ") + key);
+    const size_t c = cfg.find(':', i) + 1;
+    const size_t q1 = cfg.find('"', c);
+    const size_t q2 = cfg.find('"', q1 + 1);
+    return cfg.substr(q1 + 1, q2 - q1 - 1);
+  };
+
+  // --- geometry, and the fail-closed assertions --------------------------
+  const std::string model_type = cfg_str("model_type");
+  if (model_type != "modernbert")
+    throw std::runtime_error("model_type='" + model_type +
+                             "', expected 'modernbert'");
+  const int64_t L = cfg_int("num_hidden_layers");
+  const int64_t H = cfg_int("num_attention_heads");
+  const int64_t hidden = cfg_int("hidden_size");
+  const int64_t inter = cfg_int("intermediate_size");
+  const int64_t vocab_size = cfg_int("vocab_size");
+  const int64_t head_dim = hidden / H;      // this config carries no head_dim
+  if (head_dim != 64)
+    throw std::runtime_error(
+        "hidden_size/num_attention_heads = " + std::to_string(head_dim) +
+        ", expected 64. The host attention kernels step head_dim/8 AVX2 "
+        "vectors and the design's MAC tile is chosen against it, so any other "
+        "width is a DIFFERENT geometry that needs its own design family -- not "
+        "this one, and not a variant of it.");
+
+  // Every bias off. Each is a plural flag in this config and each has a tensor
+  // behind it, so a config that sets one while the checkpoint ships none is
+  // exactly the fail-open the arch-4 guard exists to stop.
+  for (const char *k : {"attention_bias", "mlp_bias", "norm_bias"}) {
+    if (cfg_bool(k, false))
+      throw std::runtime_error(
+          std::string("config.json sets ") + k +
+          " -- this packer emits a bias-free encoder and zero-fills every "
+          "*.bias, because a ModernBERT checkpoint carries none. A config that "
+          "says otherwise is a mismatch; refusing rather than dropping weights.");
+  }
+  if (cfg_str("hidden_activation") != "gelu")
+    throw std::runtime_error(
+        "hidden_activation='" + cfg_str("hidden_activation") +
+        "', expected 'gelu' -- this is the EXACT erf form (ACT2FN['gelu']), not "
+        "the tanh approximation");
+  const std::string pet = cfg_str("position_embedding_type");
+  if (pet != "sans_pos" && pet != "rope" && pet != "absolute")
+    throw std::runtime_error(
+        "position_embedding_type='" + pet +
+        "' -- ModernBERT carries no position table (mmBERT says so with "
+        "'sans_pos', and ModernBERT's own 'absolute' is a dead key read by no "
+        "code path). A config naming a table this packer would have to read is "
+        "a checkpoint whose embeddings would be wrong.");
+
+  // layer_types is DERIVED in ModernBERT (`"full_attention" if i % n == 0`) and
+  // mmBERT ships it explicitly. Read it when present -- 22 explicit entries beat
+  // a re-derivation -- and derive it otherwise. Either way the resolved list goes
+  // into the container, because that is what the runtime's band mask keys on.
+  const int64_t every_n = cfg_int("global_attn_every_n_layers");
+  const int64_t local_attention = cfg_int("local_attention");
+  const int64_t half_window = local_attention / 2;
+  if (half_window <= 0)
+    throw std::runtime_error(
+        "local_attention=" + std::to_string(local_attention) +
+        " -- the half-window is local_attention / 2 and this leaves no band");
+  std::vector<std::string> layer_types;
+  {
+    const size_t i = find_key("layer_types");
+    if (i == std::string::npos) {
+      for (int64_t l = 0; l < L; ++l)
+        layer_types.push_back((l % every_n == 0) ? "full_attention"
+                                                : "sliding_attention");
+    } else {
+      const size_t ob = cfg.find('[', i), cb = cfg.find(']', ob);
+      if (ob == std::string::npos || cb == std::string::npos)
+        throw std::runtime_error("config.json: layer_types is not an array");
+      const std::string body = cfg.substr(ob + 1, cb - ob - 1);
+      size_t p = 0;
+      while (true) {
+        const size_t q1 = body.find('"', p);
+        if (q1 == std::string::npos) break;
+        const size_t q2 = body.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        layer_types.push_back(body.substr(q1 + 1, q2 - q1 - 1));
+        p = q2 + 1;
+      }
+      if (static_cast<int64_t>(layer_types.size()) != L)
+        throw std::runtime_error("layer_types has " +
+                                 std::to_string(layer_types.size()) +
+                                 " entries, num_hidden_layers is " +
+                                 std::to_string(L));
+      // The derived rule is a FACT about this architecture, not a preference,
+      // so the shipped list is cross-checked against it. A config whose
+      // layer_types was edited without the geometry following it would band the
+      // wrong layers, which is a wrong answer and not a warning.
+      for (int64_t l = 0; l < L; ++l) {
+        const bool want_global = (l % every_n == 0);
+        const std::string &got = layer_types[static_cast<size_t>(l)];
+        if (got != "full_attention" && got != "sliding_attention")
+          throw std::runtime_error("layer_types[" + std::to_string(l) +
+                                   "] is '" + got +
+                                   "', expected full_attention or "
+                                   "sliding_attention");
+        if (want_global != (got == "full_attention"))
+          throw std::runtime_error(
+              "layer_types[" + std::to_string(l) + "] is '" + got +
+              "' but i % " + std::to_string(every_n) +
+              " == 0 says it must be '" +
+              (want_global ? "full_attention" : "sliding_attention") +
+              "'. ModernBERT DERIVES this list, and a config where the two "
+              "disagree would band the wrong layers");
+      }
+    }
+  }
+
+  // RoPE theta is NESTED here -- rope_parameters.{full_attention,sliding_
+  // attention}.rope_theta -- and ModernBERT-large's two values DIFFER (160000
+  // global, 10000 local) while mmBERT's are both 160000. The runtime's pre-LN
+  // path builds ONE table and selects it per layer, which is exact for a
+  // checkpoint whose two agree and wrong by up to 1.9e-02 relfro at layer 0 for
+  // one whose they do not. So this REFUSES rather than picking a winner.
+  const double theta = [&] {
+    const size_t i = find_key("rope_parameters");
+    if (i == std::string::npos)
+      throw std::runtime_error("config.json has no rope_parameters");
+    const size_t ob = cfg.find('{', i);
+    if (ob == std::string::npos)
+      throw std::runtime_error("config.json: rope_parameters is not an object");
+    // One balanced-brace scan per sub-object. A bare substring search would
+    // always find the first `rope_theta`, which is the whole reason a
+    // differently-theta'd ModernBERT would be silently wrong here.
+    auto theta_in = [&](const char *key) -> double {
+      const std::string k = std::string("\"") + key + "\"";
+      const size_t at = cfg.find(k, ob);
+      if (at == std::string::npos)
+        throw std::runtime_error("rope_parameters has no " + std::string(key));
+      const size_t ob2 = cfg.find('{', at);
+      if (ob2 == std::string::npos)
+        throw std::runtime_error(std::string("rope_parameters.") + key + " is not an object");
+      size_t depth = 0, end = std::string::npos;
+      for (size_t p = ob2; p < cfg.size(); ++p) {
+        if (cfg[p] == '{') ++depth;
+        else if (cfg[p] == '}' && --depth == 0) { end = p; break; }
+      }
+      if (end == std::string::npos)
+        throw std::runtime_error(std::string("rope_parameters.") + key + " has no closing brace");
+      const std::string body = cfg.substr(ob2, end - ob2 + 1);
+      const size_t t = body.find("\"rope_theta\"");
+      if (t == std::string::npos)
+        throw std::runtime_error(std::string("rope_parameters.") + key + " has no rope_theta");
+      return std::stod(body.substr(body.find(':', t) + 1));
+    };
+    const double full = theta_in("full_attention");
+    const double local = theta_in("sliding_attention");
+    if (full != local)
+      throw std::runtime_error(
+          "rope_parameters.full_attention.rope_theta=" + py_double_repr(full) +
+          " and .sliding_attention.rope_theta=" + py_double_repr(local) +
+          " differ. This build's pre-LN path builds ONE RoPE table and selects it "
+          "per layer, which is exact for a checkpoint whose two agree (mmBERT: "
+          "both 160000) and wrong for one whose they do not (ModernBERT-large: "
+          "160000 global / 10000 local). Refusing rather than picking one.");
+    if (!(full > 0.0))
+      throw std::runtime_error("rope_theta must be positive");
+    return full;
+  }();
+
+  // The host LayerNorm uses a HARDCODED 1e-12 (layer_norm_cpu), so emitting
+  // 1e-5 and calling it layer_norm_eps would be a claim the runtime does not
+  // honour. Recorded for provenance, with the delta spelled out in
+  // not_implemented: ~5e-6 relative, far under the bf16 operand's 8-bit
+  // mantissa, and a Phase-5 comparison against a bf16 replica rather than
+  // against an absolute threshold.
+  const std::string eps_raw = cfg_raw_or("layer_norm_eps", "1e-5");
+
+  // --- the RL agent config: temperatures and head geometry ---------------
+  //
+  // PACKED, NOT READ AT RUN TIME. `temperature` is three floats and
+  // `temperature_by_options` is a small object, so they go in the config as
+  // data. Three reasons that is right:
+  //  * the container becomes self-contained, so a later upstream recalibration
+  //    does not silently apply to an already-served model;
+  //  * the checkpoint's own `temperature` BUFFER is deliberately NOT packed --
+  //    it is the same three numbers, upstream's forward() never reads it, and
+  //    packing it twice is how a container ends up with two sources of truth
+  //    for one value;
+  //  * the file is still needed ON DISK to read them, so it is in the model
+  //    entry's `files` list -- but not after the pack.
+  int64_t head_layers = 2, n_act = 2, max_len = 512, head_max_len = 192;
+  double temperature[3] = {1.0, 1.0, 1.0};   // QTYPES: choice, score, noul
+  std::string temperature_by_options = "{}";
+  {
+    const auto rl_buf = slurp(rl_config_path);
+    const std::string rl(reinterpret_cast<const char *>(rl_buf.data()),
+                         rl_buf.size());
+    auto rl_find = [&](const char *key) -> size_t {
+      return rl.find(std::string("\"") + key + "\"");
+    };
+    auto rl_int = [&](const char *key, int64_t fallback) -> int64_t {
+      const size_t i = rl_find(key);
+      if (i == std::string::npos) return fallback;
+      return std::stoll(rl.substr(rl.find(':', i) + 1));
+    };
+    head_layers = rl_int("head_layers", head_layers);
+    max_len = rl_int("max_len", max_len);
+    head_max_len = rl_int("head_max_len", head_max_len);
+    if (head_layers <= 0)
+      throw std::runtime_error(rl_config_path + ": head_layers=" +
+                               std::to_string(head_layers) +
+                               " -- a decision model with no head is not a "
+                               "decision model");
+    {
+      // n_act = len(act_costs) + 1, and it is the WIDTH of the act head's
+      // output. Read, not hardcoded: the next Laya release may add a cost, and a
+      // hardcoded 2 would silently drop it.
+      const size_t i = rl_find("act_costs");
+      if (i == std::string::npos)
+        throw std::runtime_error(rl_config_path +
+                                 " has no act_costs, so the act head's width "
+                                 "cannot be derived");
+      const size_t ob = rl.find('{', i), cb = rl.find('}', ob);
+      if (ob == std::string::npos || cb == std::string::npos)
+        throw std::runtime_error(rl_config_path + ": act_costs is not an object");
+      int64_t n = 0;
+      for (size_t p = ob + 1; p < cb;) {
+        const size_t q1 = rl.find('"', p);
+        if (q1 == std::string::npos || q1 >= cb) break;
+        const size_t q2 = rl.find('"', q1 + 1);
+        if (q2 == std::string::npos || q2 > cb) break;
+        ++n;
+        p = q2 + 1;
+      }
+      n_act = n + 1;
+    }
+    {
+      const size_t i = rl_find("temperature");
+      if (i == std::string::npos)
+        throw std::runtime_error(rl_config_path + " has no temperature vector");
+      const size_t ob = rl.find('[', i), cb = rl.find(']', ob);
+      if (ob == std::string::npos || cb == std::string::npos)
+        throw std::runtime_error(rl_config_path + ": temperature is not an array");
+      const std::string body = rl.substr(ob + 1, cb - ob - 1);
+      size_t p = 0;
+      for (int k = 0; k < 3; ++k) {
+        const size_t comma = body.find(',', p);
+        temperature[k] = std::stod(
+            body.substr(p, comma == std::string::npos ? std::string::npos : comma - p));
+        if (comma == std::string::npos) break;
+        p = comma + 1;
+      }
+      for (int k = 0; k < 3; ++k)
+        if (!(temperature[k] > 0.0))
+          throw std::runtime_error(rl_config_path + ": temperature[" +
+                                   std::to_string(k) + "]=" +
+                                   py_double_repr(temperature[k]) +
+                                   " -- zero or negative divides the softmax "
+                                   "by zero");
+      // temperature_by_options is copied VERBATIM, braces included, because its
+      // keys are Python-formatted strings ("choice:11+") and re-emitting them
+      // from parsed pieces is a way to spell one of them differently.
+      const size_t j = rl_find("temperature_by_options");
+      if (j == std::string::npos)
+        throw std::runtime_error(
+            rl_config_path + " has no temperature_by_options. The key is emitted "
+            "whether or not it is empty, because 'the key is missing' and 'the "
+            "map is empty' must not mean the same thing to a reader.");
+      const size_t b2 = rl.find('{', j);
+      if (b2 == std::string::npos)
+        throw std::runtime_error(rl_config_path +
+                                 ": temperature_by_options is not an object");
+      int depth = 0;
+      size_t e = b2;
+      for (; e < rl.size(); ++e) {
+        if (rl[e] == '{') ++depth;
+        else if (rl[e] == '}' && --depth == 0) break;
+      }
+      if (depth != 0)
+        throw std::runtime_error(rl_config_path +
+                                 ": temperature_by_options has unbalanced braces");
+      temperature_by_options = rl.substr(b2, e - b2 + 1);
+    }
+  }
+
+  // FLOAT, not double, exactly as the other packers' scale is -- and for
+  // head_dim 64 the value is 0.125, a power of two, so the fold below is EXACT
+  // (no rounding anywhere in x * 0.125f).
+  const float scale =
+      static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
+
+  // --- the tokenizer blob -----------------------------------------------
+  // Prefer a cached file, else generate here and write it back, exactly as
+  // prepare_model_gte() does for its XLM-R table. The generator is the C++ port
+  // of tools/gen_bbpe_tokenizer_table.py, so a cold clone packs without Python.
+  std::vector<uint8_t> tb;
+  bool tok_generated = false;
+  {
+    const std::string bin = sub(model_dir, tokenizer_subdir, "tokenizer.bin");
+    const std::string js = sub(model_dir, tokenizer_subdir, "tokenizer.json");
+    std::ifstream tf(bin, std::ios::binary);
+    if (tf.good()) {
+      tf.close();
+      tb = slurp(bin);
+    } else {
+      tb = generate_bbpe_tokenizer_table(js);
+      tok_generated = true;
+      std::ofstream of(bin, std::ios::binary);
+      if (!of) throw std::runtime_error("cannot write " + bin);
+      of.write(reinterpret_cast<const char *>(tb.data()),
+               static_cast<std::streamsize>(tb.size()));
+      if (!of) throw std::runtime_error("error writing " + bin);
+    }
+  }
+
+  if (log) {
+    int n_full = 0;
+    for (const auto &t : layer_types)
+      if (t == "full_attention") ++n_full;
+    std::ostringstream s;
+    s << "packing " << model_dir << " -> " << out
+      << "  (arch=modernbert_rope_geglu)\n"
+      << "  hidden=" << hidden << " heads=" << H << " head_dim=" << head_dim
+      << " layers=" << L << " inter=" << inter << " ffn_up=" << 2 * inter
+      << "\n  rope=" << py_double_repr(theta) << " window=" << half_window
+      << " (local_attention/2, NOT +1)  " << n_full << " full / "
+      << (L - n_full) << " sliding\n"
+      << "  head_layers=" << head_layers << " head_ffn=" << 4 * hidden
+      << " n_act=" << n_act << " max_len=" << max_len
+      << " head_max_len=" << head_max_len << "\n  temperature=["
+      << py_double_repr(temperature[0]) << ", " << py_double_repr(temperature[1])
+      << ", " << py_double_repr(temperature[2]) << "] (QTYPES order)";
+    log(s.str());
+  }
+
+  // --- the container config ----------------------------------------------
+  //
+  // KEY ORDER IS FIXED, and the NAMES ARE NOT FREE CHOICE. apply_model_shape()
+  // reads `num_layers`, `num_heads`, `hidden`, `head_dim`, `intermediate` and
+  // `max_seq_len` (npue_encoder.hpp), and a misspelled or missing one is not a
+  // warning: it is `the .npue reports a non-positive shape` two thousand lines
+  // from the cause, or a zero-shaped geometry that fails somewhere less obvious.
+  std::string cj;
+  cj += "{\"arch\":\"modernbert_rope_geglu\"";
+  cj += ",\"a_dtype\":\"bf16\"";
+  cj += ",\"model_type\":\"" + model_type + "\"";
+  cj += ",\"source_repo\":\"" + source_repo + "\"";
+  cj += ",\"source_sha256\":\"" + sha + "\"";
+  cj += ",\"num_layers\":" + std::to_string(L);
+  cj += ",\"num_heads\":" + std::to_string(H);
+  cj += ",\"hidden\":" + std::to_string(hidden);
+  cj += ",\"head_dim\":" + std::to_string(head_dim);
+  cj += ",\"intermediate\":" + std::to_string(inter);
+  cj += ",\"qkv_n\":" + std::to_string(3 * hidden);
+  cj += ",\"ffn_up_n\":" + std::to_string(2 * inter);
+  cj += ",\"vocab_size\":" + std::to_string(vocab_size);
+  cj += ",\"max_seq_len\":" + std::to_string(max_seq);
+  cj += ",\"checkpoint_max_position_embeddings\":" +
+        cfg_raw_or("max_position_embeddings", "8192");
+  cj += ",\"layer_norm_eps\":" + eps_raw;
+  cj += ",\"activation\":\"gelu\",\"gated_ffn\":true";
+  cj += ",\"glu_halves\":\"gate_first|up_second -- ModernBERT binds "
+        "x, gate = Wi(h).chunk(2, dim=-1), so the GATE is the SECOND half, and "
+        "the packer moved it FIRST because this runtime computes lo * gelu(hi) "
+        "over the packed order. LLaMA's convention is the reverse of ModernBERT's "
+        "here, and reading it the other way still produces fluent plausible "
+        "garbage.\"";
+  cj += ",\"position_embedding_type\":\"rope\"";
+  cj += ",\"rope_theta\":" + py_double_repr(theta);
+  cj += ",\"rope_theta_note\":\"ONE table, selected per layer. This packer "
+        "REFUSES a checkpoint whose full_attention and sliding_attention thetas "
+        "differ, because it only implements the single-table path; "
+        "ModernBERT-large (160000 / 10000) is therefore out of reach until a "
+        "per-layer selection lands, and mmBERT (both 160000) is exact.\"";
+  cj += ",\"pre_layernorm\":true,\"final_norm\":true";
+  cj += ",\"identity_attn_norm_layer0\":true";
+  cj += ",\"attention_bias\":false,\"mlp_bias\":false,\"norm_bias\":false";
+  cj += ",\"bias_note\":\"zero-filled, not omitted: the runtime dereferences "
+        "<op>.bias for every GEMM unconditionally, and a zero add to the "
+        "embedding build is exact.\"";
+  cj += ",\"sliding_window\":" + std::to_string(half_window);
+  cj += ",\"sliding_window_note\":\"local_attention/2, NOT +1. The +1 in "
+        "transformers' `self.sliding_window = config.sliding_window + 1` is a "
+        "FlashAttention inclusive-boundary convention and does NOT apply to the "
+        "dense/sdpa mask this checkpoint pins, which reaches "
+        "`abs(q_idx - kv_idx) <= config.sliding_window` through "
+        "sliding_window_bidirectional_overlay. The window is 64: a 129-token "
+        "band.\"";
+  cj += ",\"global_attn_every_n_layers\":" + std::to_string(every_n);
+  cj += ",\"layer_types\":[";
+  for (int64_t l = 0; l < L; ++l)
+    cj += std::string(l ? "," : "") + "\"" +
+          layer_types[static_cast<size_t>(l)] + "\"";
+  cj += "]";
+  // "pooling":"mean" is a FICTION and l2_normalize:false is the honest half.
+  // pool_rows() accepts only cls and mean (npue_encoder.hpp), so the key has to
+  // name one of the two -- but this model pools by GATHER at marker_pos, not by
+  // mean and not by CLS, and the decision engine never calls pool_rows at all.
+  // Recorded here because a future reader WILL reach for this key.
+  cj += ",\"pooling\":\"" + pooling + "\",\"l2_normalize\":false";
+  cj += ",\"pooling_note\":\"a fiction, and the only value apply_model_shape "
+        "will accept. This model pools by `gather` at the [MASK] marker "
+        "positions -- the decision head's readout -- not by mean and not by CLS, "
+        "and Laya never L2-normalises. The decision engine must NOT call "
+        "pool_rows; see not_implemented.\"";
+  cj += ",\"head_layers\":" + std::to_string(head_layers);
+  cj += ",\"head_intermediate\":" + std::to_string(4 * hidden);
+  cj += ",\"head_n_act\":" + std::to_string(n_act);
+  cj += ",\"head_activation\":\"relu\"";
+  cj += ",\"head_bias\":true";
+  cj += ",\"head_attention\":\"full-band: no sliding window, no causal mask, "
+        "padding mask only\"";
+  cj += ",\"n_qtype\":3";
+  cj += ",\"marker_token_id\":" + cfg_raw_or("mask_token_id", "4");
+  cj += ",\"cls_token_id\":" + cfg_raw_or("cls_token_id", "1");
+  cj += ",\"sep_token_id\":" + cfg_raw_or("sep_token_id", "1");
+  cj += ",\"pad_token_id\":" + cfg_raw_or("pad_token_id", "0");
+  cj += ",\"unk_token_id\":" + cfg_raw_or("unk_token_id", "3");
+  cj += ",\"bos_token_id\":" + cfg_raw_or("bos_token_id", "2");
+  cj += ",\"special_ids_note\":\"read from THIS config, never from the "
+        "tokenizer blob, and the runtime refuses if the two disagree. The blob "
+        "derives cls_id from the first of {[CLS], <s>, <|endoftext|>} and sep_id "
+        "from the first of {[SEP], </s>}; this vocabulary has <s> at 204 and "
+        "</s> at 213, so the blob would say 204/213 while this config says 1 and "
+        "1 (both <eos>).\"";
+  cj += ",\"max_len\":" + std::to_string(max_len);
+  cj += ",\"head_max_len\":" + std::to_string(head_max_len);
+  cj += ",\"temperature\":[" + py_double_repr(temperature[0]) + "," +
+        py_double_repr(temperature[1]) + "," + py_double_repr(temperature[2]) + "]";
+  cj += ",\"temperature_by_options\":" + temperature_by_options;
+  cj += ",\"temperature_note\":\"packed, not read at run time, in QTYPES order "
+        "{choice:0, score:1, noul:2}. The checkpoint's own `temperature` BUFFER "
+        "is deliberately NOT packed: it is the same three numbers, upstream's "
+        "forward() never reads it, and packing it twice is how a container ends "
+        "up with two sources of truth for one value.\"";
+  cj += ",\"tile_k\":" + std::to_string(tile_k) +
+        ",\"tile_n\":" + std::to_string(tile_n) +
+        ",\"mac_s\":" + std::to_string(kMacS) +
+        ",\"mac_t\":" + std::to_string(kMacT);
+  cj += ",\"fusions\":{\"qkv_fused\":true,\"transposed_to_kn\":true,"
+        "\"qk_scale_folded_into_q\":true,"
+        "\"gemm_operands_bf16\":true,"
+        "\"biases_and_layernorm_fp32\":true,"
+        "\"gated_ffn_fused_upstream\":true,"
+        "\"gated_ffn_gate_half_moved_first\":true,"
+        "\"position_embeddings_zeroed_rope_instead\":true,"
+        "\"token_type_embeddings_zeroed\":true}";
+  cj += ",\"not_implemented\":[";
+  cj += "\"context above " + std::to_string(max_seq) +
+        " tokens: the design is compiled at that seq and set_design_seq() "
+        "REFUSES more. The checkpoint's max_position_embeddings is " +
+        cfg_raw_or("max_position_embeddings", "8192") +
+        " and is a RoPE cache length only -- there is no table -- so this is a "
+        "throughput choice, not a correctness one.\"";
+  cj += ",\"predict_long's 50%-overlap windowing for long documents\"";
+  cj += ",\"structured (non-string) `state` and `criteria` values: Phase 1's "
+        "render_criterion reproduces Python's json.dumps exactly, but the "
+        "structured-STATE path is a separate serialiser and ships as a refusal "
+        "by name\"";
+  cj += ",\"Laya's Router language routing: one model per process, chosen by "
+        "the caller\"";
+  cj += ",\"build_sequence's truncate_left and option_order arguments\"";
+  cj += ",\"pooling says mean because the runtime accepts only cls/mean and "
+        "this model gathers at marker_pos; see pooling_note\"";
+  cj += ",\"cls_token_id/sep_token_id come from the config and not from the "
+        "tokenizer blob; see special_ids_note\"";
+  cj += ",\"act_head is computed and DISCARDED: Laya's own issue tracker "
+        "records action.act_probability at AUROC 0.30 against 0.77 for "
+        "confidence, so it is dead weight. It is computed -- it is in the "
+        "checkpoint, and skipping it would be a silent divergence -- and its "
+        "result is not returned.\"";
+  cj += ",\"the decision head runs on the HOST, not the array: 8 of this "
+        "model's 96 GEMMs, and the four obstacles are process-wide geometry "
+        "globals, a hardcoded 'layer.' tensor prefix, one hw_context per "
+        "npu::Design, and one design set per model -- none of which is about "
+        "arithmetic\"";
+  cj += ",\"layer_norm_eps is recorded at " + eps_raw +
+        " for provenance while layer_norm_cpu() uses a HARDCODED 1e-12. The "
+        "delta is ~5e-6 relative, far under the bf16 operand's 8-bit mantissa, "
+        "but a container is not allowed to claim a precision the runtime does "
+        "not implement.\"";
+  cj += "]}";
+
+  Writer w;
+  auto add_f32 = [&](const std::string &name, const Tensor &t,
+                     const char *role, const std::vector<int64_t> &shape) {
+    w.add(name, t.data, static_cast<size_t>(t.count()) * 4, "F32", role, shape);
+  };
+  auto add_zeros = [&](const std::string &name, const char *role,
+                       const std::vector<int64_t> &shape) {
+    size_t n = 1;
+    for (int64_t d : shape) n *= static_cast<size_t>(d);
+    const std::vector<float> z(n, 0.f);
+    w.add(name, z.data(), n * 4, "F32", role, shape);
+  };
+
+  // -- embeddings ---------------------------------------------------------
+  // `embeddings.word` is the NAME the runtime reads and casts to float; the
+  // checkpoint's own key is `embeddings.tok_embeddings.weight`, so the packer
+  // RENAMES ON PURPOSE and a packer that emits the checkpoint's key loads
+  // nothing. F32, not the checkpoint's F16: the runtime does
+  // model_.raw("embeddings.word").as<float>(), and .as<float>() on a BF16
+  // tensor reinterprets bytes rather than converting them.
+  add_f32("embeddings.word", get("embeddings.tok_embeddings.weight"),
+          "embedding", {vocab_size, hidden});
+  add_zeros("embeddings.position", "embedding", {max_seq, hidden});
+  add_zeros("embeddings.token_type", "embedding", {1, hidden});
+  add_f32("embeddings.ln.weight", get("embeddings.norm.weight"), "layernorm",
+          {hidden});
+  add_zeros("embeddings.ln.bias", "layernorm", {hidden});
+  w.add("tokenizer.bbpe_table", tb.data(), tb.size(), "U8", "tokenizer",
+        {static_cast<int64_t>(tb.size())});
+  if (log) {
+    std::ostringstream s;
+    s << (tok_generated
+              ? "  generated tokenizer.bbpe_table (no cached tokenizer.bin)  "
+              : "  tokenizer.bbpe_table  ")
+      << (tb.size() / 1e6) << " MB (BBPETOK1 v2)";
+    log(s.str());
+  }
+
+  // -- the decision head, then the encoder -------------------------------
+  //
+  // EMISSION ORDER IS LOAD-BEARING: embeddings.ln.weight, then the tokenizer
+  // blob, then embeddings.ln.bias -- the same interleaving arch=0/2/3 use. It is
+  // not cosmetic: Writer::add pads after every tensor, so moving one shifts
+  // every offset after it.
+  for (int64_t h = 0; h < head_layers; ++h) {
+    const std::string p = "head.layers." + std::to_string(h) + ".";
+    // norm1/norm2 are the pre-LN norms of the norm_first=True
+    // nn.TransformerEncoderLayer; in_proj/out_proj/linear1/linear2 are
+    // PyTorch's names for qkv / attn_out / ffn_up / ffn_down.
+    add_f32(p + "norm1.weight", get(p + "norm1.weight"), "layernorm", {hidden});
+    add_f32(p + "norm1.bias", get(p + "norm1.bias"), "layernorm", {hidden});
+    add_f32(p + "self_attn.in_proj.weight",
+            get(p + "self_attn.in_proj_weight"), "gemm_b_host",
+            {3 * hidden, hidden});
+    add_f32(p + "self_attn.in_proj.bias", get(p + "self_attn.in_proj_bias"),
+            "bias", {3 * hidden});
+    add_f32(p + "self_attn.out_proj.weight",
+            get(p + "self_attn.out_proj.weight"), "gemm_b_host",
+            {hidden, hidden});
+    add_f32(p + "self_attn.out_proj.bias", get(p + "self_attn.out_proj.bias"),
+            "bias", {hidden});
+    add_f32(p + "norm2.weight", get(p + "norm2.weight"), "layernorm", {hidden});
+    add_f32(p + "norm2.bias", get(p + "norm2.bias"), "layernorm", {hidden});
+    // The head's FFN is ReLU, not the encoder's GELU: torch's DEFAULT
+    // nn.TransformerEncoderLayer activation. The two are different functions,
+    // the head is only 2 layers deep, and getting it wrong produces a model
+    // that is still confidently wrong.
+    add_f32(p + "linear1.weight", get(p + "linear1.weight"), "gemm_b_host",
+            {4 * hidden, hidden});
+    add_f32(p + "linear1.bias", get(p + "linear1.bias"), "bias", {4 * hidden});
+    add_f32(p + "linear2.weight", get(p + "linear2.weight"), "gemm_b_host",
+            {hidden, 4 * hidden});
+    add_f32(p + "linear2.bias", get(p + "linear2.bias"), "bias", {hidden});
+  }
+  // type_emb is broadcast over the sequence BEFORE the head and the marker gather
+  // is after it, so its row order is the QTYPES order: {choice:0, score:1,
+  // noul:2}.
+  add_f32("type_emb.weight", get("type_emb.weight"), "embedding", {3, hidden});
+  // scorer: LayerNorm -> Linear(d,d) -> GELU -> Linear(d,1). N=1 for the last
+  // layer, which fails N % (tile_n*8) == 0 at EVERY legal tile, and K=772 for
+  // act_head.0, which fails K % 64 == 0. The whole tail is host arithmetic,
+  // and it runs on at most a couple of dozen MARKER positions rather than on
+  // rows, so there is nothing to tile in the first place.
+  add_f32("scorer.0.weight", get("scorer.0.weight"), "layernorm", {hidden});
+  add_f32("scorer.0.bias", get("scorer.0.bias"), "layernorm", {hidden});
+  add_f32("scorer.1.weight", get("scorer.1.weight"), "gemm_b_host",
+          {hidden, hidden});
+  add_f32("scorer.1.bias", get("scorer.1.bias"), "bias", {hidden});
+  add_f32("scorer.3.weight", get("scorer.3.weight"), "gemm_b_host", {1, hidden});
+  add_f32("scorer.3.bias", get("scorer.3.bias"), "bias", {1});
+  // act_head.0's K is d + 4 = 772: forward() concatenates four hand-built
+  // features onto h[:,0] first (top1, top1-top2, normalised entropy, k/255.0).
+  // The 255 is not a coincidence with the 255-option cap on a choice: the
+  // feature is calibrated against it.
+  add_f32("act_head.0.weight", get("act_head.0.weight"), "gemm_b_host",
+          {256, hidden + 4});
+  add_f32("act_head.0.bias", get("act_head.0.bias"), "bias", {256});
+  add_f32("act_head.2.weight", get("act_head.2.weight"), "gemm_b_host",
+          {n_act, 256});
+  add_f32("act_head.2.bias", get("act_head.2.bias"), "bias", {n_act});
+
+  // final_norm, after the last layer. Its OUTPUT is what the head consumes:
+  // upstream reads self.encoder(...).last_hidden_state, which is after
+  // final_norm, so the head's input is the encoder's output and not the residual
+  // stream from inside the loop.
+  add_f32("final_norm.weight", get("final_norm.weight"), "layernorm", {hidden});
+  add_zeros("final_norm.bias", "layernorm", {hidden});
+
+  for (int64_t l = 0; l < L; ++l) {
+    const std::string tag = "layer." + std::to_string(l) + ".";
+    // RELATIVE to the `encoder.` prefix `get()` adds -- ModernBERT's own naming,
+    // with no prefix of its own written here.
+    const std::string p = "layers." + std::to_string(l) + ".";
+
+    // qkv is FUSED upstream as [3H, H] in [Q|K|V] order -- ModernBERT's own
+    // layout, which is (3, Nh, Dh) and NOT the interleaved (Nh, 3, Dh) some
+    // transformers write. 1/sqrt(head_dim) folded into the Q block (the first
+    // `hidden` columns of the transposed [H, 3H] operand); exact, RoPE is linear
+    // in q, and bias-free so there is no bias third to scale.
+    add_gemm_b(w, tag + "qkv", get(p + "attn.Wqkv.weight"), tile_k, tile_n,
+               layout_json, layout_hash, scale, hidden);
+    add_zeros(tag + "qkv.bias", "bias", {3 * hidden});
+
+    add_gemm_b(w, tag + "attn_out", get(p + "attn.Wo.weight"), tile_k, tile_n,
+               layout_json, layout_hash);
+    add_zeros(tag + "attn_out.bias", "bias", {hidden});
+
+    // Layer 0's attn_norm IS nn.Identity() -- there is no tensor for it in the
+    // checkpoint at all. A zero-filled placeholder plus
+    // identity_attn_norm_layer0 lets the runtime SKIP the norm, which is not the
+    // same thing: a norm with weight 1 still subtracts the mean and divides by
+    // the standard deviation. The bias is emitted anyway, because stage_all
+    // dereferences <weight> AND <bias> for every layer unconditionally.
+    if (l == 0) {
+      add_zeros(tag + "ln1.weight", "layernorm", {hidden});
+      add_zeros(tag + "ln1.bias", "layernorm", {hidden});
+    } else {
+      add_f32(tag + "ln1.weight", get(p + "attn_norm.weight"), "layernorm",
+              {hidden});
+      add_zeros(tag + "ln1.bias", "layernorm", {hidden});
+    }
+    add_f32(tag + "ln2.weight", get(p + "mlp_norm.weight"), "layernorm",
+            {hidden});
+    add_zeros(tag + "ln2.bias", "layernorm", {hidden});
+
+    // THE GATE HALF MOVE. See add_gemm_b_reorder_rows' header: ModernBERT's gate
+    // is the SECOND half of Wi and this runtime's activation applies to the
+    // second half, so the packer puts the gate first. r0 = rows = intermediate,
+    // DERIVED from the config rather than written as 1152, because intermediate
+    // is the one number a differently-sized mmBERT would change and a hardcoded
+    // literal would pack the wrong halves in the right order.
+    add_gemm_b_reorder_rows(w, tag + "ffn_up", get(p + "mlp.Wi.weight"), inter, inter,
+                            tile_k, tile_n, layout_json, layout_hash);
+    add_zeros(tag + "ffn_up.bias", "bias", {2 * inter});
+
+    add_gemm_b(w, tag + "ffn_down", get(p + "mlp.Wo.weight"), tile_k, tile_n,
+               layout_json, layout_hash);
+    add_zeros(tag + "ffn_down.bias", "bias", {hidden});
+  }
+
+  w.write(out, cj, kArchModernBertRopeGeGLU);
+  if (log) {
+    std::ostringstream s;
+    s << "\n  tensors    : " << w.count()
+      << "\n  data       : " << (w.data_bytes() / 1e6) << " MB"
+      << "\n  source     : " << sha.substr(0, 16) << "...";
+    log(s.str());
+  }
+}
+
 std::string prepare_model_auto(const PrepareOptions &opt) {
   namespace fs = std::filesystem;
   if (opt.checkpoint_dir.empty())
@@ -1996,11 +2819,13 @@ std::string prepare_model_auto(const PrepareOptions &opt) {
     out = opt.checkpoint_dir + "/" +
           fs::path(opt.checkpoint_dir).filename().string() + ".npue";
 
-  // A nested checkpoint puts its config somewhere this packer is not looking,
-  // so the config path is composed ONCE and both the model_type read below and
-  // every packer use it. Empty config_subdir reproduces the flat layout exactly.
-  const std::string cfg_path = sub(opt.checkpoint_dir, opt.config_subdir,
-                                   "config.json");
+  // A nested checkpoint puts its files somewhere this packer is not looking, so
+  // every path is composed ONCE, here, and every branch below reads the same
+  // composed roots. `checkpoint_subdir` is where the CHECKPOINT is; the other
+  // two are relative to it. All three default to the flat layout, so every
+  // existing caller stays byte-identical.
+  const std::string ckpt_dir = sub(opt.checkpoint_dir, opt.checkpoint_subdir, "");
+  const std::string cfg_path = sub(ckpt_dir, opt.config_subdir, "config.json");
   const std::string model_type = json_string_field(cfg_path, "model_type");
 
   // FAIL CLOSED on an architecture this build does not pack, in TWO arms,
@@ -2026,21 +2851,6 @@ std::string prepare_model_auto(const PrepareOptions &opt) {
         "model entry at the directory that holds config.json, model.safetensors "
         "and any 1_Pooling/config.json -- or pass PrepareOptions::"
         "config_subdir. See specs/open-engine/plans/laya-decision-encoder.md.");
-  // The OTHER arm, and the more dangerous one: a checkpoint that DOES put a
-  // config.json at its root, naming an architecture no packer here handles,
-  // would otherwise be packed as arch=0 -- GELU plus absolute position
-  // embeddings, for a GeGLU-plus-RoPE model. The runtime loads that container
-  // happily and returns wrong vectors, because arch=0's tensor names are the
-  // ones this one shares on purpose. Refusing costs a rebuild; writing it costs
-  // an answer nobody downstream can tell is wrong.
-  if (model_type == "modernbert")
-    throw std::runtime_error(
-        "modernbert_rope_geglu is not packed by this build. The BERT fallback "
-        "below would emit a valid-looking arch=0 container for a GeGLU/RoPE "
-        "model; refusing rather than writing the wrong answer. The architecture "
-        "is specified in npu_offload/gemm_rtp/npue.py (arch=4) and the port is "
-        "tracked in specs/open-engine/plans/laya-decision-encoder.md.");
-
   // arch=1 (EmbeddingGemma / Gemma3 family): a completely different tensor
   // shape and container, routed to its own packer rather than threaded through
   // the BERT logic below. It resolves source_repo and the two tile knobs and
@@ -2063,9 +2873,14 @@ std::string prepare_model_auto(const PrepareOptions &opt) {
   say(opt, "  layout     tile (" + std::to_string(opt.tile_k) + ", " +
                std::to_string(opt.tile_n) + "), hash " +
                lay.hash.substr(0, 16) + "...");
-  const std::string pooling = resolve_pooling(opt);
+  // resolve_pooling reads <dir>/1_Pooling/config.json, which lives at the
+  // CHECKPOINT root, so it gets the rooted view rather than the served one.
+  PrepareOptions rooted = opt;
+  rooted.checkpoint_dir = ckpt_dir;
+  rooted.checkpoint_subdir.clear();
+  const std::string pooling = resolve_pooling(rooted);
   say(opt, "  pooling    " + pooling + " (from 1_Pooling/config.json)");
-  const std::string repo = resolve_source_repo(opt);
+  const std::string repo = resolve_source_repo(rooted);
   say(opt, "  source     " + repo);
 
   // arch=2 (nomic-embed-text-v1.5): RoPE + gated SwiGLU rather than BERT's
@@ -2073,8 +2888,8 @@ std::string prepare_model_auto(const PrepareOptions &opt) {
   if (model_type == "nomic_bert") {
     say(opt, "NpuEmbeddings -- preparing " + out +
                  " (arch=nomic_bert_rope_swiglu)");
-    prepare_model_nomic(opt.checkpoint_dir, pooling, repo, out, lay.json,
-                        lay.hash, opt.tile_k, opt.tile_n, 256, opt.log);
+    prepare_model_nomic(ckpt_dir, pooling, repo, out, lay.json, lay.hash,
+                        opt.tile_k, opt.tile_n, 256, opt.log);
     say(opt, "  wrote " + out);
     return out;
   }
@@ -2086,8 +2901,27 @@ std::string prepare_model_auto(const PrepareOptions &opt) {
   if (model_type == "new") {
     say(opt, "NpuEmbeddings -- preparing " + out +
                  " (arch=gte_new_rope_geglu)");
-    prepare_model_gte(opt.checkpoint_dir, pooling, repo, out, lay.json,
-                      lay.hash, opt.tile_k, opt.tile_n, 64, opt.log);
+    prepare_model_gte(ckpt_dir, pooling, repo, out, lay.json, lay.hash,
+                      opt.tile_k, opt.tile_n, 64, opt.log);
+    say(opt, "  wrote " + out);
+    return out;
+  }
+
+  // arch=4 (ModernBERT / mmBERT: pre-LN, RoPE, a gated GeGLU whose gate half is
+  // SECOND upstream, bidirectional with a sliding window on most layers).
+  //
+  // This branch and encoder_implemented()'s `modernbert_rope_geglu` arm land in
+  // the SAME change, both or neither. A container the packer can write but the
+  // runtime refuses is a wasted pack; a runtime that accepts an arch no packer
+  // produces is the arch-0 fail-open the guard above exists to close.
+  if (model_type == "modernbert") {
+    say(opt, "NpuEmbeddings -- preparing " + out +
+                  " (arch=modernbert_rope_geglu)");
+    prepare_model_modernbert(ckpt_dir, pooling, repo, out, lay.json, lay.hash,
+                             opt.tile_k, opt.tile_n, opt.modernbert_max_seq,
+                             opt.config_subdir, opt.tokenizer_subdir,
+                             sub(ckpt_dir, "", "rl_agent_config.json"),
+                             opt.log);
     say(opt, "  wrote " + out);
     return out;
   }
@@ -2100,10 +2934,11 @@ std::string prepare_model_auto(const PrepareOptions &opt) {
   // `arch` field is what the runtime later refuses on, which is the guard that
   // catches it.
   say(opt, "NpuEmbeddings -- preparing " + out);
-  prepare_model(opt.checkpoint_dir + "/model.safetensors",
-                opt.checkpoint_dir + "/vocab.txt",
-                opt.checkpoint_dir + "/config.json", pooling, repo, out, "",
-                lay.json, lay.hash, opt.tile_k, opt.tile_n, 256, opt.log);
+  prepare_model(sub(ckpt_dir, "", "model.safetensors"),
+                sub(ckpt_dir, "", "vocab.txt"),
+                sub(ckpt_dir, opt.config_subdir, "config.json"), pooling, repo,
+                out, "", lay.json, lay.hash, opt.tile_k, opt.tile_n, 256,
+                opt.log);
   say(opt, "  wrote " + out);
   return out;
 }
