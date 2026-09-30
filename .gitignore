@@ -86,3 +86,9 @@ src/xclbins/*/open_kernels*/
 # repro-open-timeout.sh output (server logs, per-attempt client logs)
 .repro-open-timeout/
 .agents/logs/
+
+# Local working notes, experiment logs and handoff documents. They are
+# deliberately NOT committed: they are this investigation's scratch space, and
+# several of them are megabytes of raw run output. The DURABLE record of a
+# finding is its commit message and the test that pins it.
+.local/

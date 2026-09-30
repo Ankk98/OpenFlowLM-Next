@@ -67,6 +67,11 @@ def load_safetensors(path):
 # mantissa bits are discarded. (Discarding 23 would keep one mantissa bit --
 # tf32, a lossier model than the one under test, which would set the gate's
 # threshold below the engine's real noise and pass a broken encoder.)
+# The two roots, set from the command line. laya's tree is NESTED and the two
+# subdirectories are not one prefix: the config and the weights are at different
+# depths under the served root.
+ROOT = {"ckpt": "multilingual", "config": "encoder"}
+
 BF16_DISCARD = 16
 BF16_KEEP = np.uint64(0xFFFF0000)
 BF16_HALF = np.uint64(0x8000)
@@ -184,10 +189,11 @@ class Config:
 
 
 def encode(root, ids, band_on, seq=None, bf16_replica=False, want_layers=False):
-    cfg = json.load(open(os.path.join(root, "encoder", "config.json")))
+    cfg = json.load(open(os.path.join(root, ROOT["config"], "config.json")))
     C = Config(cfg)
-    t = load_safetensors(os.path.join(root, "model.safetensors"))
+    t = load_safetensors(os.path.join(root, ROOT["ckpt"], "model.safetensors"))
     t["_root"] = root
+    t["_cfg"] = os.path.join(root, ROOT["config"])
     S = len(ids) if seq is None else seq
     H, Nh, Dh, I, L = C.hidden, C.heads, C.head_dim, C.inter, C.layers
 
@@ -334,7 +340,7 @@ def head(t, ids, markers, qtype, keep=None):
     disagree: ReLU (not GELU) in the head FFN, the explicit 1/sqrt(head_dim) on
     Q, and LayerNorm eps 1e-5 (torch's default) rather than the encoder's 1e-12.
     """
-    cfg = json.load(open(os.path.join(t["_root"], "encoder", "config.json")))
+    cfg = json.load(open(os.path.join(t["_root"], t["_cfg"], "config.json")))
     C = Config(cfg)
     d = C.hidden
     S = len(ids)
@@ -417,6 +423,10 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--head", default="",
                     help="markers,qtype for the head, e.g. '12,20;2'")
+    ap.add_argument("--checkpoint-subdir", default="multilingual",
+                    help="where the weights are, relative to --checkpoint")
+    ap.add_argument("--config-subdir", default="encoder",
+                    help="where config.json is, relative to the CHECKPOINT")
     ap.add_argument("--ids-file", default="",
                     help="read the ids from the engine's own output, so the two "
                          "sides are provably running the same prompt")
@@ -433,6 +443,8 @@ def main():
             "rather than of the prompt builder; with --ids the two sides could "
             "disagree about the prompt and the comparison would blame the head "
             "for a prompt bug.")
+    ROOT["ckpt"] = a.checkpoint_subdir
+    ROOT["config"] = os.path.join(a.checkpoint_subdir, a.config_subdir)
     out = encode(a.checkpoint, ids, a.band, a.seq or None, bool(a.bf16))
     print(f"# reference shape {out.shape} band={a.band} bf16_replica={a.bf16}",
           file=sys.stderr)
@@ -449,8 +461,10 @@ def main():
         print(f"max_rel_diff  {rel:.6g}")
     if a.head:
         mk, qt = a.head.split(";")
-        tt = load_safetensors(os.path.join(a.checkpoint, "model.safetensors"))
+        tt = load_safetensors(
+            os.path.join(a.checkpoint, a.checkpoint_subdir, "model.safetensors"))
         tt["_root"] = a.checkpoint
+        tt["_cfg"] = os.path.join(a.checkpoint_subdir, a.config_subdir)
         # The oracle runs the REAL PREFIX only, so every position it has is
         # real. (An earlier version indexed this by token id, which is a
         # different thing entirely -- ids reach 235337, so it built a quarter of
