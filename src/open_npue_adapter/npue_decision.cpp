@@ -103,13 +103,19 @@ std::string prepare_container(const fs::path &dir,
   // third. Pointed at the served root with no keys, the packer refuses with a
   // message about a missing config -- which is correct and unhelpful, because
   // the config IS there, two levels down.
+  // The packer's `config_subdir` is RELATIVE TO THE CHECKPOINT ROOT, while the
+  // entry's `config_subdir` -- the one LM_Config and the downloader use -- is
+  // relative to the SERVED directory. The checkpoint subdir is therefore
+  // prepended here, and getting that wrong is a refusal from the packer rather
+  // than a wrong model, which is the good kind of wrong.
   auto sub = [&](const char *key) -> std::string {
     if (info.contains(key) && info[key].is_string())
       return info[key].get<std::string>();
     return "";
   };
   const std::string ckpt = sub("npue_checkpoint_subdir");
-  const std::string cfg = sub("npue_config_subdir");
+  std::string cfg = sub("npue_config_subdir");
+  if (cfg.empty()) cfg = sub("config_subdir");
   const std::string tok = sub("npue_tokenizer_subdir");
   if (!fs::is_regular_file(dir / "model.safetensors") && ckpt.empty())
     throw std::runtime_error(

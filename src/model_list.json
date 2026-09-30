@@ -1365,6 +1365,9 @@
                 "npue_design_family": "BERT-h768-gated-i1152-bf16",
                 "npue_checkpoint_subdir": "multilingual",
                 "npue_config_subdir": "encoder",
+                "npue_config_subdir_note": "The packer's config subdir, RELATIVE TO npue_checkpoint_subdir -- so 'encoder', not 'multilingual/encoder'. Same file as config_subdir above, measured from a different root.",
+                "config_subdir": "multilingual/encoder",
+                "config_subdir_note": "Where config.json lives, RELATIVE to the model directory, for LM_Config and the downloader's completeness probe. Not the same prefix as npue_checkpoint_subdir: the config and the weights are at different depths, which is why there are two keys and not one.",
                 "npue_tokenizer_subdir": "tokenizer",
                 "name_note": "The model_list `name` is a DIRECTORY name, not a repository id: model_list::get_model_path() builds <models_root>/<name>. Every other entry is the repo's last segment (BAAI-bge-large-en-v1.5, Alibaba-NLP/... -> gte-multilingual-base), and putting the full 'convaiinnovations/laya' here produced <root>/models/convaiinnovations/laya and a refusal that named a path no one created. The url is the repository."
             }

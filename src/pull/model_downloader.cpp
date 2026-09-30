@@ -23,7 +23,18 @@ ModelDownloader::ModelDownloader(model_list& models)
 /// \return true if the model is downloaded, false otherwise
 ModelDownloader::ModelStatus ModelDownloader::is_model_downloaded(const std::string& model_tag, bool sub_process_mode, bool fast_check) {
     auto missing_files = get_missing_files(model_tag);
-    bool is_config_file_missing = std::find(missing_files.begin(), missing_files.end(), "config.json") != missing_files.end();
+    // THE CONFIG'S PATH IS THE ENTRY'S, not the literal "config.json". A nested
+    // repository lists `multilingual/encoder/config.json` in `files`, so the
+    // literal is never in `missing_files` -- which meant a model with NO config
+    // anywhere still reported its config present, and the failure surfaced
+    // later as an exit(1) from LM_Config with a message naming a directory.
+    std::string cfg_rel = "config.json";
+    {
+        auto [tag_unused, info] = supported_models.get_model_info(model_tag);
+        if (info.contains("config_subdir") && info["config_subdir"].is_string())
+            cfg_rel = info["config_subdir"].get<std::string>() + "/config.json";
+    }
+    bool is_config_file_missing = std::find(missing_files.begin(), missing_files.end(), cfg_rel) != missing_files.end();
     ModelStatus modelstatus = ModelStatus::Missing;
 
     if (!is_config_file_missing) {
@@ -50,7 +61,14 @@ ModelDownloader::ModelStatus ModelDownloader::is_model_downloaded(const std::str
 ModelDownloader::ModelStatus ModelDownloader::check_model_compatibility(const std::string& model_tag, bool sub_process_mode) {
     auto [new_model_tag, model_info] = supported_models.get_model_info(model_tag);
     LM_Config config;
-    config.from_pretrained(this->supported_models.get_model_path(new_model_tag));
+    // The config's SUBDIRECTORY, from the model entry. A repository that nests
+    // its files has no config.json at the served root, and from_pretrained used
+    // to open that one unconditionally and exit(1) -- so `oflm check` and
+    // `oflm list` died on a model whose files were all present and correct.
+    std::string cfg_subdir;
+    if (model_info.contains("config_subdir") && model_info["config_subdir"].is_string())
+        cfg_subdir = model_info["config_subdir"].get<std::string>();
+    config.from_pretrained(this->supported_models.get_model_path(new_model_tag), cfg_subdir);
     std::string oflm_version = config.oflm_version;
     // oflm_min_version, or the flm_min_version that a registry written before the
     // oflm rename carries (#41) -- the field was renamed in the DATA as well as the

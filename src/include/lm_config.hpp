@@ -68,7 +68,13 @@ class LM_Config{
 
         /// \brief from pretrained
         /// \param model_name the model name
-        void from_pretrained(std::string model_name){
+        /// `config_subdir` is the entry's `config_subdir`, relative and
+        /// possibly empty. It is a PARAMETER rather than read from the entry
+        /// here because LM_Config does not know about model_list, and a
+        /// constructor that reached for it would be a dependency in the wrong
+        /// direction.
+        void from_pretrained(std::string model_name, std::string config_subdir = ""){
+            this->config_subdir_ = std::move(config_subdir);
             this->_resolve_paths(model_name);
             this->_load_json();
             this->_normalize_multi_modal();
@@ -111,11 +117,36 @@ class LM_Config{
             #endif
         }
 
-        /// \brief read model_path/config.json into _json_config
+        /// \brief where config.json lives, RELATIVE to model_path.
+        ///
+        /// EMPTY for every model whose config is at the served root, which is
+        /// all of them except a repository that NESTS its files. laya's is at
+        /// `multilingual/encoder/config.json`, and the two subdirectory names
+        /// are not one prefix: the config and the weights sit at different
+        /// depths.
+        ///
+        /// This is a field and not a search because a search is a guess: a
+        /// recursive hunt for config.json finds the wrong one in a repository
+        /// that ships more than one, and a repository that ships exactly one at
+        /// an unexpected depth is precisely the case that needs saying so.
+        std::string config_subdir_ = "";
+
+        /// \brief read model_path/config_subdir/config.json into _json_config
         void _load_json(){
-            std::ifstream file(this->model_path + "/config.json");
+            // The message names the file it LOOKED FOR, not the directory it was
+            // given. The old message printed the directory, so a nested model
+            // reported "Failed to open file: <models>/laya" -- a path that
+            // exists and is a directory, which sends a reader looking for a
+            // permissions problem they do not have.
+            const std::string cfg = this->model_path + "/" + this->config_subdir_ +
+                                    "/config.json";
+            std::ifstream file(cfg);
             if (!file.is_open()){
-                std::cerr << "Failed to open file: " << this->model_path << std::endl;
+                std::cerr << "Failed to open file: " << cfg << std::endl;
+                // exit(1) is pre-existing and deliberately NOT changed here: it
+                // is the tree's established behaviour on an unreadable config and
+                // changing it would alter every model's failure path in a commit
+                // about nested configs. The model entry names the subdirectory.
                 exit(1);
             }
             // read the json file as a string
@@ -218,7 +249,8 @@ class Whisper_Config : public LM_Config{
 public:
     /// \brief from pretrained
     /// \param model_name the model name
-    void from_pretrained(std::string model_name){
+    void from_pretrained(std::string model_name, std::string config_subdir = ""){
+        this->config_subdir_ = std::move(config_subdir);
         this->_resolve_paths(model_name);
         this->_load_json();
 
