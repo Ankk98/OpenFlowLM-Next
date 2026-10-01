@@ -12,7 +12,14 @@
 #ifndef OPENFLOWLM_DECISION_CLI_H
 #define OPENFLOWLM_DECISION_CLI_H
 
+#ifdef _WIN32
+// MSVC has no <unistd.h>. main.cpp already guards <io.h> for exactly this
+// reason, but a header cannot rely on its includer having done so -- and this
+// one is included from main.cpp, which puts it on the Windows build path.
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <memory>
 
@@ -30,6 +37,29 @@
 #include "utils/utils.hpp"
 
 namespace decision_cli {
+
+// The three file-descriptor operations, and the two standard descriptors, in
+// whatever spelling the platform uses. They exist only for the stdout redirect
+// in run(): `dup`, `dup2`, `close`, and fd 1 / fd 2.
+//
+// MSVC declares the operations as _dup, _dup2 and _close in <io.h>, and does
+// not guarantee the STDOUT_FILENO / STDERR_FILENO macros, so the descriptors
+// come from _fileno() on the FILE* instead. All of it lives here so the call
+// sites below read identically on both platforms -- the alternative is four
+// #ifdefs around four statements, which is four chances to get one wrong.
+#ifdef _WIN32
+inline int oflm_stdout_fd() { return _fileno(stdout); }
+inline int oflm_stderr_fd() { return _fileno(stderr); }
+inline int oflm_dup(int fd) { return _dup(fd); }
+inline int oflm_dup2(int old_fd, int new_fd) { return _dup2(old_fd, new_fd); }
+inline int oflm_close(int fd) { return _close(fd); }
+#else
+inline int oflm_stdout_fd() { return STDOUT_FILENO; }
+inline int oflm_stderr_fd() { return STDERR_FILENO; }
+inline int oflm_dup(int fd) { return ::dup(fd); }
+inline int oflm_dup2(int old_fd, int new_fd) { return ::dup2(old_fd, new_fd); }
+inline int oflm_close(int fd) { return ::close(fd); }
+#endif
 
 /// Run the CLI. Returns a process exit code, and prints the response to stdout.
 ///
@@ -123,8 +153,8 @@ inline int run(const program_args_t &args,
       ~RestoreStdout() {
         if (fd < 0) return;
         std::cout.flush();
-        ::dup2(fd, STDOUT_FILENO);
-        ::close(fd);
+        oflm_dup2(fd, oflm_stdout_fd());
+        oflm_close(fd);
       }
     };
     std::unique_ptr<AutoDecisionModel> model;
@@ -133,10 +163,10 @@ inline int run(const program_args_t &args,
       // the end of the function would restore stdout AFTER the response was
       // written, and the response is the one thing that must reach the real
       // stdout -- which is the failure this was added to fix.
-      const int saved = args.json_output ? ::dup(STDOUT_FILENO) : -1;
+      const int saved = args.json_output ? oflm_dup(oflm_stdout_fd()) : -1;
       if (saved >= 0) {
         std::cout.flush();
-        ::dup2(STDERR_FILENO, STDOUT_FILENO);
+        oflm_dup2(oflm_stderr_fd(), oflm_stdout_fd());
       }
       RestoreStdout restore{saved};
       model = get_auto_decision_model(tag, dir, &entry,
