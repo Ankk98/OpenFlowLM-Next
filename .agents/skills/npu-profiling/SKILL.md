@@ -276,25 +276,71 @@ So per-kernel time and AIE cycle counts are not obtainable. What *is* usable:
   Use `--info`; **`--dump` alone is ambiguous** with `--dump-section` and errors.
 - `xrt-smi` is at `/opt/xilinx/xrt/bin/xrt-smi` — hyphenated, and not on PATH.
 
-**Use a dose-response instead of a counter.** Scale the AIE work and check that
-power scales with it. Measured: 8x the row-passes (batch 3 -> tier 4, batch 40
--> tier 32, same M=32768) gave **2.05x** power, 0.972 W -> 1.993 W, from 0 at
-rest. Sub-linear is expected, since total power is static plus dynamic and only
-the dynamic part scales. Full chain and its limits in
+**Do NOT use a power dose-response as proof.** It was tried here and it is
+confounded: scaling the batch scales the *host* attention too, so a rising reading
+may be entirely host work. It did rise (8x the row-passes -> 2.05x power, 0.972 W
+-> 1.993 W, from 0 at rest), and it would have passed just as well with the
+encoder doing nothing on the NPU. Flagging it here so it is not repeated.
+
+### 5.0.1 Prove a kernel executes by corrupting it
+
+The direct test, and the one to reach for first. Flip a few bytes in the middle
+of an `insts_*.bin` AIE instruction stream, leave the size unchanged, and run:
+
+```
+pristine   cd0ad90a2f20d7724e6b6c23e30eaffb  -> completes, logits printed
+corrupted  0adf1b4e3005ecd595780752eee28d56  -> REFUSED: gemm_rtp: kernel state 5
+```
+
+The device **executed the corrupted instructions and reported a bad kernel
+state.** No host fallback can produce a device kernel state, so this is direct
+proof of dispatch. It is strictly stronger than a power or timing signal, it
+costs one extra run, and it cannot be confounded by host work.
+
+**Confirm the subject of any `/proc` probe.** `pgrep -f layaacc` matched the *bash
+wrapper*, because the shell's own command line contains the rig's path. 35
+samples were taken of a shell whose only device fd was `/dev/null`, and the
+plausible conclusion was "the engine never opens the device". Match on
+`/proc/PID/exe`, not on a command line that merely mentions the name.
+
+**Prove the refusal as well as the success.** A run that works does not
+distinguish "dispatched" from "quietly computed on the host". Pointed at an
+empty design directory, the rig exits 1 in 0 s naming the `design.json` it could
+not find -- so there is no host fallback, and the only route to an answer is
+through the AIE.
+
+### 5.0.2 Ask the tool where the work is before measuring it
+
+`laya_decision_rig` prints its own dispatch accounting, and reading it is faster
+than any profile:
+
+```
+designs    ONE xclbin, 12 streams (3 batch tiers), one hw_context
+gelu       on the HOST (fp32) -- 22 fewer NPU dispatches
+softmax    on the HOST (fp32) -- 22 fewer NPU dispatches
+layernorm  on the HOST (fp32) -- 45 fewer NPU dispatches
+weights    220.59 MB staged on the device once, not per call
+```
+
+Here it says the AIE runs **only the four projections per layer (88 dispatches)**
+while GELU, softmax and LayerNorm are host fp32 -- 89 host-side ops per 22
+layers. That single line explains both symptoms that otherwise look like a
+broken NPU path: **high CPU, and ~1 W of device power.** "Idle NPU" and "a design
+that only offloads the GEMMs" are indistinguishable from power alone. It also
+matches the earlier profile that put `softmax_cpu` first at 39.4% of host CPU,
+LayerNorm third.
+
+Memory follows from the same fact. Host attention materialises
+`batch x heads x seq^2 x 4 B` -- measured 0.09 / 0.38 / **1.50 GB** at batch
+2 / 8 / 32, on a ~1.47 GB floor (1.08 GB container + 220 MB device-staged
+weights), for peak RSS of 1.47 / 1.48 / **6.04 GB**. A reading *below* the floor
+is a different process or an early sample. This is why tiers cap at 32 with no
+batch-64 tier, and it is **not** a tuning knob: no allocation flag shrinks
+`batch x heads x seq^2`. Moving attention onto the device is a kernel-design
+question, not a configuration one.
+
+Full chain, the confounded power test, and the limits are in
 `.local/laya-implement/results/npu-dispatch-proof.md`.
-
-**Two traps that cost real time on that run:**
-
-- **Confirm the subject of a `/proc` probe.** `pgrep -f layaacc` matched the
-  *bash wrapper*, because the shell's own command line contains the rig's path.
-  Thirty-five samples were taken of a shell whose only device fd was
-  `/dev/null`, and the plausible conclusion was "the engine never opens the
-  device". Match on `/proc/PID/exe`, not on a command line that merely mentions
-  the name.
-- **Prove the refusal as well as the success.** The strongest dispatch evidence
-  was the failing arm: point the rig at an empty design directory and it exits 1
-  in 0 s naming the `design.json` it could not find. No host fallback exists, so
-  the only route to an answer is through the AIE.
 
 ### 5.1 `xrt-capture` / `xrt-replay` capture nothing
 
