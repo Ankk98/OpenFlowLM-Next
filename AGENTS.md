@@ -47,6 +47,11 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <location>.agents/skills/teach-first/SKILL.md</location>
   </skill>
   <skill>
+    <name>project-scaffold</name>
+    <description>Start any multi-session task with a structured .local/&lt;slug&gt;/ folder so results, experiments, logs, scripts and status have an honest home, and keep a baseline row before the first candidate arm. Use when beginning work that will span sessions or produce numbers worth keeping, and when resuming one.</description>
+    <location>.agents/skills/project-scaffold/SKILL.md</location>
+  </skill>
+  <skill>
     <name>host-discipline</name>
     <description>Run heavy builds, model loads, test suites and benchmarks on a shared workstation without filling its disk or exhausting its RAM. Use when a job writes gigabytes, when choosing a scratch directory, setting -j, backgrounding long work, or setting up a benchmark. Also for "the disk is full", "the machine froze", "the screen went blank but it is still running".</description>
     <location>.agents/skills/host-discipline/SKILL.md</location>
