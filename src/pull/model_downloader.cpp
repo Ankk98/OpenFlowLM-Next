@@ -197,9 +197,21 @@ bool ModelDownloader::pull_model(const std::string& model_tag, bool use_modelsco
         }
         
         // Build download list
-        auto download_list = build_download_list(new_model_tag, use_modelscope);
+        bool download_list_ok = true;
+        auto download_list = build_download_list(new_model_tag, use_modelscope, &download_list_ok);
         auto downloads = download_list.first;
         float sum_fize_size = download_list.second;
+        if (!download_list_ok) {
+            // The list could not be built -- the tag is not in model_info.json,
+            // or the manifest does not describe files model_list.json requires.
+            // build_download_list() has already said which. Returning an empty
+            // list here would be indistinguishable from "already downloaded",
+            // which is how this used to report a successful pull of nothing.
+            header_print("ERROR", "Not downloading " + new_model_tag
+                                  + ": the download list could not be built. "
+                                    "See model_info.json above.");
+            return false;
+        }
         if (downloads.empty()) {
             header_print("OFLM", "No files to download for model: " + new_model_tag);
             return true; // Return true since all files are already present
@@ -389,8 +401,8 @@ std::string ModelDownloader::get_model_file_path(const std::string& model_path, 
 /// \brief Build the download list
 /// \param model_tag the model tag
 /// \return the download list
-std::pair<nlohmann::json, float> ModelDownloader::build_download_list(const std::string& model_tag, bool modelscope) {
-    
+std::pair<nlohmann::json, float> ModelDownloader::build_download_list(const std::string& model_tag, bool modelscope, bool* ok) {
+    if (ok) *ok = true;
     nlohmann::json downloads = nlohmann::json::array();
     float sum_file_size = 0;
     // Files model_list.json requires that model_info.json does not describe.
@@ -430,6 +442,11 @@ std::pair<nlohmann::json, float> ModelDownloader::build_download_list(const std:
                 }
             );
             if (it == hf_model_infos.end()) {
+                // Collected, not skipped. See the report below: a file the model
+                // needs that the manifest does not describe is a model that
+                // cannot be downloaded, and it used to look like a successful
+                // pull of nothing.
+                missing_from_manifest.push_back(filename);
                 continue;
             }
 
@@ -462,9 +479,17 @@ std::pair<nlohmann::json, float> ModelDownloader::build_download_list(const std:
             }
 
         }
-    } 
+    }
     catch (const std::exception& e) {
+        // The common cause is a tag absent from model_info.json, because
+        // `.at()` above throws rather than returning empty. That used to be
+        // printed here and then returned as an empty list, which the caller
+        // read as "all files are already present" -- so a model that was never
+        // described pulled nothing and reported success. The out-param is what
+        // stops that.
         header_print("ERROR", "Error building download list: " + std::string(e.what()));
+        if (ok) *ok = false;
+        return std::make_pair(nlohmann::json::array(), 0.0f);
     }
 
     // A FILE THE MODEL ENTRY REQUIRES AND THE MANIFEST DOES NOT LIST is a
@@ -476,8 +501,9 @@ std::pair<nlohmann::json, float> ModelDownloader::build_download_list(const std:
     //
     // Adding a model needs an entry in BOTH files: model_list.json says which
     // files the model consists of, model_info.json says where each one is and
-    // how big it is. (The HuggingFace API path that would have made the second
-    // one unnecessary is commented out just above.)
+    // how big it is. `utilities/sync_model_info.py` writes the second from the
+    // repository's own file list, so the oids cannot drift from what they
+    // describe.
     if (!missing_from_manifest.empty()) {
         std::string names;
         for (const auto& n : missing_from_manifest)
@@ -488,6 +514,7 @@ std::pair<nlohmann::json, float> ModelDownloader::build_download_list(const std:
         header_print("ERROR", "Adding a model needs an entry in BOTH files. "
                               "Refusing to report a partial download as "
                               "success.");
+        if (ok) *ok = false;
         return std::make_pair(nlohmann::json::array(), 0.0f);
     }
 

@@ -58,8 +58,15 @@ private:
     // Get the full path for a model file
     std::string get_model_file_path(const std::string& model_path, const std::string& filename);
     
-    // Build download URLs for model files
-    std::pair<nlohmann::json, float> build_download_list(const std::string& model_tag, bool modelscope=0);
+    // Build download URLs for model files.
+    //
+    // `ok` distinguishes "there is genuinely nothing to download" from "the
+    // download list could not be built". An empty array is returned in BOTH
+    // cases, and the caller used to read the empty array as success -- so a
+    // model whose manifest entry is missing, or which the manifest does not
+    // fully describe, downloaded nothing and reported a successful pull.
+    // Leave `ok` null if you do not care, but pull_model() must not.
+    std::pair<nlohmann::json, float> build_download_list(const std::string& model_tag, bool modelscope=0, bool* ok=nullptr);
 
     // bool check_model_compatibility(const std::string& model_tag);
     ModelStatus check_model_compatibility(const std::string& model_tag, bool sub_process_mode=0);

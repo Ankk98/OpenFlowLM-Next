@@ -3403,5 +3403,49 @@
             "size": 190,
             "path": "1_Pooling/config.json"
         }
+    ],
+    "laya-decision:multilingual": [
+        {
+            "type": "file",
+            "oid": "0de0e2d30638873790cf962def52e2acf4db3eef",
+            "size": 1938,
+            "path": "multilingual/encoder/config.json"
+        },
+        {
+            "type": "file",
+            "oid": "b99c8bea239c53f6f6bce734557dc6c403fa6b3e",
+            "size": 643835514,
+            "lfs": {
+                "oid": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204",
+                "size": 643835514,
+                "pointerSize": 134
+            },
+            "xetHash": "53499790a05bdabd4023a797e9e2776d39efd3bac72d6ddaed70495da40c6eb0",
+            "path": "multilingual/model.safetensors"
+        },
+        {
+            "type": "file",
+            "oid": "56d765858ed38eaabd35cd90759cbb1f89b0baa4",
+            "size": 34363188,
+            "lfs": {
+                "oid": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+                "size": 34363188,
+                "pointerSize": 133
+            },
+            "xetHash": "8fdbdb0307b65058d3b81a88cba0082cd1bbe8e85d34295d2271d6fa85a31c7a",
+            "path": "multilingual/tokenizer/tokenizer.json"
+        },
+        {
+            "type": "file",
+            "oid": "c255ac0c8cb34a37d066cd0dafe313fd769d27ae",
+            "size": 524,
+            "path": "multilingual/tokenizer/tokenizer_config.json"
+        },
+        {
+            "type": "file",
+            "oid": "00e35f88bb731bb9126a914666ab1cdac8a204c8",
+            "size": 472,
+            "path": "multilingual/rl_agent_config.json"
+        }
     ]
 }
