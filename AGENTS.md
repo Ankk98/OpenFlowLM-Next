@@ -37,6 +37,11 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <location>.agents/skills/upstream-prior-art/SKILL.md</location>
   </skill>
   <skill>
+    <name>locked-clock-bench</name>
+    <description>Enforce honest benchmarking when the accelerator cannot be clock-locked: verify instruments are alive and the machine is quiet before every arm, discard warmup, interleave and bracket A/B arms with cooldowns, label every number with its operating point, and refuse cross-arm comparisons that are not like-for-like. Use for any throughput or latency delta claim, and for any timing number that will be quoted.</description>
+    <location>.agents/skills/locked-clock-bench/SKILL.md</location>
+  </skill>
+  <skill>
     <name>prove-correctness</name>
     <description>Prove output identity and work conservation before believing any speedup, and prove your gate can see the bug you might have introduced. Greedy identical, counts conserved, precision bounds met, gate shown to have teeth: speed without identity is skipped work until proven otherwise. Use after engagement proof, before reading any delta, or when a change is engaged but its output may still be wrong.</description>
     <location>.agents/skills/prove-correctness/SKILL.md</location>
