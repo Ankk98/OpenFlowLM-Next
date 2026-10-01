@@ -67,6 +67,11 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <location>.agents/skills/open-granite-kernels/SKILL.md</location>
   </skill>
   <skill>
+    <name>open-laya-kernels</name>
+    <description>Build, verify and ship the open XDNA2 kernel sets (BERT-h768-gated-i1152) that run laya-decision:multilingual's encoder. Use when rebuilding those xclbins, adding another hidden-768 mmBERT checkpoint, choosing between the bf16 and bfp16 datapaths, or debugging "no open kernels found" for a Laya tag installed with oflm-add.</description>
+    <location>.agents/skills/open-laya-kernels/SKILL.md</location>
+  </skill>
+  <skill>
     <name>open-phi3-nanbeige-kernels</name>
     <description>Build, verify and serve the open XDNA2 kernel sets for Phi-4-mini (the phi3 recipe: a 96-of-128 rotation and longrope) and Nanbeige4.1-3B (the llama3 recipe at 20 heads over 4). Use when re-exporting either, adding another Phi-3 or Nanbeige size, or when `oflm serve` segfaults on the first request for a model whose adapter casts to its closed engine class.</description>
     <location>.agents/skills/open-phi3-nanbeige-kernels/SKILL.md</location>
