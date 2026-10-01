@@ -113,12 +113,18 @@ def main() -> int:
     root = Path(args.xclbins)
 
     bad = 0
+    # Families already judged bad, so the stream pass below cannot print a
+    # reassuring verdict for one. The tally and the exit status were always right;
+    # this is about the output, since a check whose happy path is printed directly
+    # above its own failure is a check people learn to skim.
+    failed = set()
     for fam in spec["families"]:
         name = fam["name"]
         dj = root / name / "gemm_rtp" / "design.json"
         if not dj.is_file():
             print(f"MISSING  {name}: not built ({dj})")
             bad += 1
+            failed.add(name)
             continue
         want = expected(list(fam["args"]) + list(common))
         got = actual(json.loads(dj.read_text(encoding="utf-8")))
@@ -126,12 +132,22 @@ def main() -> int:
                 if want[k] is not None and want[k] != got[k]}
         if diff:
             bad += 1
+            failed.add(name)
             print(f"MISMATCH {name}:")
             for k, (w, g) in sorted(diff.items()):
                 print(f"           {k}: families.json says {w!r}, "
                       f"design.json says {g!r}")
-        else:
-            print(f"ok       {name}")
+        # NO "ok" HERE. This pass and the stream pass below judge the SAME family,
+        # and printing ok from both meant a family whose metadata matched but
+        # whose streams[] were wrong came out as:
+        #
+        #     ok       BERT-h768-gated-i1152-bf16
+        #     MISMATCH BERT-h768-gated-i1152-bf16: streams[] has 20 entries, ...
+        #
+        # Two verdicts for one family, and the reassuring one is printed first. The
+        # exit status and the tally were always right -- this is about a reader
+        # scanning for their family and seeing "ok" on the line above the failure.
+        # The stream pass owns the per-family verdict; this pass owns the detail.
 
     # The stream COUNT, which no field above covers.
     #
@@ -145,7 +161,7 @@ def main() -> int:
         name = fam["name"]
         dj = root / name / "gemm_rtp" / "design.json"
         if not dj.is_file():
-            continue          # already reported above
+            continue          # already reported above as MISSING
         d = json.loads(dj.read_text(encoding="utf-8"))
         argv = list(fam["args"]) + list(common)
         want_tiers = expected(argv)["tiers"]
@@ -167,7 +183,7 @@ def main() -> int:
                 bad += 1
                 print(f"MISMATCH {name}: stream M != batch x seq ({seq}): "
                       f"{wrong[:4]}")
-            else:
+            elif name not in failed:
                 print(f"ok       {name} ({got} streams, seq {seq})")
 
     if bad:

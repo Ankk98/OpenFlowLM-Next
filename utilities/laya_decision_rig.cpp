@@ -18,7 +18,7 @@
 //       -L/opt/xilinx/xrt/lib64 -lxrt_coreutil
 //   PATH=/opt/xilinx/xrt/bin:$PATH ./drigr <container> <designs> req.json
 //
-// The request is {state, temperature?, questions:[{t, ins, options, criteria,
+// The request is {state, temperature?, questions:[{t, ins, state?, options, criteria,
 // noul_labels?}]} -- labels and criteria SEPARATE, because render_options is
 // what turns them into option text and moving that format into the rig would
 // hide the part that decides whether the model reads the slot correctly.
@@ -50,8 +50,13 @@ int main(int argc, char **argv) {
     o.lanes = 1;
     npue::dec::Decider D(o);
 
+    // Per-question `state` OVERRIDES the request-wide one, and it exists because
+    // a fixture is (state, question) PAIRS: a rig that takes one state per
+    // process makes a 60-pair fixture six processes, each mapping the same 1.08 GB
+    // container. Six loads is ~11 minutes of a 13-minute measurement. The
+    // measurement is the point, so the rig grew this.
     const auto *st = body.find("state");
-    const std::string state = st ? st->as_string() : std::string();
+    const std::string default_state = st ? st->as_string() : std::string();
     std::vector<float> temperature = {1.f, 1.f, 1.f};
     if (const auto *tp = body.find("temperature")) {
       if (!tp->is_array() || tp->as_array().size() != 3)
@@ -89,6 +94,8 @@ int main(int argc, char **argv) {
       auto opts = npue::dec::Decider::render_options(r.qtype, labels, criteria,
                                                     noul_labels);
       const auto *ip = q.find("ins");
+      const auto *qs = q.find("state");
+      const std::string state = qs ? qs->as_string() : default_state;
       auto p = D.build_prompt(type, ip ? ip->as_string() : std::string(), state,
                               opts, r.qtype);
       r.ids = p.ids;

@@ -2601,9 +2601,20 @@ void prepare_model_modernbert(const std::string &model_dir,
   cj += ",\"temperature\":[" + py_double_repr(temperature[0]) + "," +
         py_double_repr(temperature[1]) + "," + py_double_repr(temperature[2]) + "]";
   cj += ",\"temperature_by_options\":" + temperature_by_options;
-  cj += ",\"temperature_note\":\"packed, not read at run time, in QTYPES order "
-        "{choice:0, score:1, noul:2}. The checkpoint's own `temperature` BUFFER "
-        "is deliberately NOT packed: it is the same three numbers, upstream's "
+  // This note is PACKED, so it is user-visible, and it used to say "not read at
+  // run time" -- which stopped being true when the engine gained the per-bucket
+  // lookup. A note in a shipped artifact that contradicts the code is worse than
+  // no note: a reader debugging a probability has no way to know which of the two
+  // is lying.
+  cj += ",\"temperature_note\":\"READ AT RUN TIME by the engine, in QTYPES "
+        "order {choice:0, score:1, noul:2} for `temperature`, and per "
+        "temp_bucket(qtype, k) for `temperature_by_options`, which takes "
+        "precedence over the per-type value. Both are range-checked to [0.5, "
+        "5.0] at load: a fitted temperature below 1 sharpens the logits rather "
+        "than softening them, and upstream's own shipped choice:11+ value of "
+        "0.1006 multiplies them ~10x, so a 0.24 top probability would be "
+        "published as 0.99. The checkpoint's own `temperature` BUFFER is "
+        "deliberately NOT packed: it is the same three numbers, upstream's "
         "forward() never reads it, and packing it twice is how a container ends "
         "up with two sources of truth for one value.\"";
   cj += ",\"tile_k\":" + std::to_string(tile_k) +

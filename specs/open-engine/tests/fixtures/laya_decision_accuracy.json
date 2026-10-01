@@ -1,0 +1,711 @@
+{
+ "_comment": [
+  "The Phase 7 accuracy gate's fixture: >=50 (state, question) pairs spanning all",
+  "three question types and the option counts that map onto the temperature",
+  "buckets. 6 states x 10 questions = 60 pairs.",
+  "",
+  "PAIRS NOT PROMPTS: each pair is a full (state, question) so the reference's",
+  "top-2 gap can be measured PER PAIR and the pairs stratified by it.",
+  "",
+  "The first version of this fixture measured a reference top-2 gap of at most",
+  "0.043 across all 60 pairs -- no pair came close to the plan's 0.20 'decided'",
+  "threshold. The cause was THIS fixture, not the model: every choice option was",
+  "the instruction text with a different level word in front of it ('routine: what",
+  "is the clinical urgency of the presentation'), so the option markers differed by",
+  "one token and carried almost no signal. Choice options are now distinct option",
+  "CONTENT, which is what a choice question actually is.",
+  "",
+  "Option counts stay uneven on purpose: temp_bucket keys on the option COUNT, so",
+  "a fixture with one option count would not exercise the bucket map at all."
+ ],
+ "checkpoint": "convaiinnovations/laya",
+ "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
+ "states": [
+  "Right lower lobe consolidation on chest radiograph. Fever 39.2 C. Productive cough for three days. Intravenous antibiotics started. CRP 184 mg/L, WBC 17.2 x10^9/L. Oxygen saturations 92% on room air.",
+  "No consolidation on chest radiograph. Heart failure with reduced ejection fraction at 25%. Peripheral oedema to the knees. BNP 1840 pg/mL. Dyspnoea on minimal exertion.",
+  "Post-operative day 3 after laparoscopic cholecystectomy. Warm surgical site without erythema or discharge. Afebrile at 37.1 C. WBC 7.8 x10^9/L. Pain well controlled on paracetamol only.",
+  "Left-sided pyelonephritis. Flank pain and rigors. Urine culture positive for Escherichia coli. Intravenous gentamicin started. Creatinine rose from 88 to 141 umol/L.",
+  "Widespread atopic dermatitis affecting both flexures. Pruritus preventing sleep. No fever, no mucosal involvement, no skin infection. Sleep fragmented and behaviour withdrawn at school.",
+  "Acute pulmonary embolism confirmed on CT pulmonary angiogram. Tachycardic at 118 bpm. Right calf swelling. Wells score 8.5. Commenced on therapeutic low molecular weight heparin."
+ ],
+ "pairs": [
+  {
+   "state_id": 0,
+   "key": "s0_noul_bacterial",
+   "type": "noul",
+   "instructions": "Is this a bacterial infection?",
+   "criteria": {
+    "true": "There is a bacterial infection requiring antibiotics.",
+    "false": "There is no bacterial infection."
+   }
+  },
+  {
+   "state_id": 0,
+   "key": "s0_noul_sepsis",
+   "type": "noul",
+   "instructions": "Is the patient septic?",
+   "criteria": {
+    "true": "The patient meets the criteria for sepsis.",
+    "false": "The patient does not meet the criteria for sepsis."
+   }
+  },
+  {
+   "state_id": 0,
+   "key": "s0_noul_imaging_abnormal",
+   "type": "noul",
+   "instructions": "Is the imaging abnormal?",
+   "criteria": {
+    "true": "The imaging demonstrates an abnormality.",
+    "false": "The imaging is normal."
+   }
+  },
+  {
+   "state_id": 0,
+   "key": "s0_noul_prognosis_good",
+   "type": "noul",
+   "instructions": "Is the prognosis good?",
+   "criteria": {
+    "true": "The prognosis is favourable.",
+    "false": "The prognosis is poor."
+   }
+  },
+  {
+   "state_id": 0,
+   "key": "s0_choice_urgency",
+   "type": "choice",
+   "instructions": "What is the clinical urgency of the presentation?",
+   "criteria": {
+    "routine": "the case can be managed on the next available outpatient clinic",
+    "expedited": "the case needs review within hours, not days",
+    "emergent": "the case needs immediate life-saving intervention"
+   }
+  },
+  {
+   "state_id": 0,
+   "key": "s0_choice_likely_source",
+   "type": "choice",
+   "instructions": "What is the most likely source of the problem?",
+   "criteria": {
+    "lungs": "an infection or process centred in the pulmonary parenchyma",
+    "kidneys": "an infection or process centred in the renal tract",
+    "skin": "an infection or process centred in the skin and subcutaneous tissue",
+    "gastrointestinal": "an infection or process centred in the bowel",
+    "bone": "an infection or process centred in bone and joint"
+   }
+  },
+  {
+   "state_id": 0,
+   "key": "s0_choice_next_step",
+   "type": "choice",
+   "instructions": "What is the next step in management?",
+   "criteria": {
+    "continue": "continue the current management unchanged and review routinely",
+    "imaging": "obtain additional imaging before changing management",
+    "escalate": "escalate therapy now because of clinical deterioration",
+    "consult": "seek a second specialty opinion before deciding",
+    "discharge": "discharge with community follow-up arranged"
+   }
+  },
+  {
+   "state_id": 0,
+   "key": "s0_score_severity",
+   "type": "score",
+   "instructions": "How severe is the presentation overall?",
+   "criteria": [
+    "not severe at all",
+    "mildly severe",
+    "moderately severe",
+    "very severe"
+   ]
+  },
+  {
+   "state_id": 0,
+   "key": "s0_score_urgency",
+   "type": "score",
+   "instructions": "How urgent is the situation right now?",
+   "criteria": [
+    "not urgent",
+    "somewhat urgent",
+    "highly urgent"
+   ]
+  },
+  {
+   "state_id": 0,
+   "key": "s0_score_certainty",
+   "type": "score",
+   "instructions": "How certain is the diagnosis?",
+   "criteria": [
+    "certain it is not this",
+    "unlikely to be this",
+    "unsure",
+    "quite likely",
+    "certain it is this"
+   ]
+  },
+  {
+   "state_id": 1,
+   "key": "s1_noul_bacterial",
+   "type": "noul",
+   "instructions": "Is this a bacterial infection?",
+   "criteria": {
+    "true": "There is a bacterial infection requiring antibiotics.",
+    "false": "There is no bacterial infection."
+   }
+  },
+  {
+   "state_id": 1,
+   "key": "s1_noul_sepsis",
+   "type": "noul",
+   "instructions": "Is the patient septic?",
+   "criteria": {
+    "true": "The patient meets the criteria for sepsis.",
+    "false": "The patient does not meet the criteria for sepsis."
+   }
+  },
+  {
+   "state_id": 1,
+   "key": "s1_noul_imaging_abnormal",
+   "type": "noul",
+   "instructions": "Is the imaging abnormal?",
+   "criteria": {
+    "true": "The imaging demonstrates an abnormality.",
+    "false": "The imaging is normal."
+   }
+  },
+  {
+   "state_id": 1,
+   "key": "s1_noul_prognosis_good",
+   "type": "noul",
+   "instructions": "Is the prognosis good?",
+   "criteria": {
+    "true": "The prognosis is favourable.",
+    "false": "The prognosis is poor."
+   }
+  },
+  {
+   "state_id": 1,
+   "key": "s1_choice_urgency",
+   "type": "choice",
+   "instructions": "What is the clinical urgency of the presentation?",
+   "criteria": {
+    "routine": "the case can be managed on the next available outpatient clinic",
+    "expedited": "the case needs review within hours, not days",
+    "emergent": "the case needs immediate life-saving intervention"
+   }
+  },
+  {
+   "state_id": 1,
+   "key": "s1_choice_likely_source",
+   "type": "choice",
+   "instructions": "What is the most likely source of the problem?",
+   "criteria": {
+    "lungs": "an infection or process centred in the pulmonary parenchyma",
+    "kidneys": "an infection or process centred in the renal tract",
+    "skin": "an infection or process centred in the skin and subcutaneous tissue",
+    "gastrointestinal": "an infection or process centred in the bowel",
+    "bone": "an infection or process centred in bone and joint"
+   }
+  },
+  {
+   "state_id": 1,
+   "key": "s1_choice_next_step",
+   "type": "choice",
+   "instructions": "What is the next step in management?",
+   "criteria": {
+    "continue": "continue the current management unchanged and review routinely",
+    "imaging": "obtain additional imaging before changing management",
+    "escalate": "escalate therapy now because of clinical deterioration",
+    "consult": "seek a second specialty opinion before deciding",
+    "discharge": "discharge with community follow-up arranged"
+   }
+  },
+  {
+   "state_id": 1,
+   "key": "s1_score_severity",
+   "type": "score",
+   "instructions": "How severe is the presentation overall?",
+   "criteria": [
+    "not severe at all",
+    "mildly severe",
+    "moderately severe",
+    "very severe"
+   ]
+  },
+  {
+   "state_id": 1,
+   "key": "s1_score_urgency",
+   "type": "score",
+   "instructions": "How urgent is the situation right now?",
+   "criteria": [
+    "not urgent",
+    "somewhat urgent",
+    "highly urgent"
+   ]
+  },
+  {
+   "state_id": 1,
+   "key": "s1_score_certainty",
+   "type": "score",
+   "instructions": "How certain is the diagnosis?",
+   "criteria": [
+    "certain it is not this",
+    "unlikely to be this",
+    "unsure",
+    "quite likely",
+    "certain it is this"
+   ]
+  },
+  {
+   "state_id": 2,
+   "key": "s2_noul_bacterial",
+   "type": "noul",
+   "instructions": "Is this a bacterial infection?",
+   "criteria": {
+    "true": "There is a bacterial infection requiring antibiotics.",
+    "false": "There is no bacterial infection."
+   }
+  },
+  {
+   "state_id": 2,
+   "key": "s2_noul_sepsis",
+   "type": "noul",
+   "instructions": "Is the patient septic?",
+   "criteria": {
+    "true": "The patient meets the criteria for sepsis.",
+    "false": "The patient does not meet the criteria for sepsis."
+   }
+  },
+  {
+   "state_id": 2,
+   "key": "s2_noul_imaging_abnormal",
+   "type": "noul",
+   "instructions": "Is the imaging abnormal?",
+   "criteria": {
+    "true": "The imaging demonstrates an abnormality.",
+    "false": "The imaging is normal."
+   }
+  },
+  {
+   "state_id": 2,
+   "key": "s2_noul_prognosis_good",
+   "type": "noul",
+   "instructions": "Is the prognosis good?",
+   "criteria": {
+    "true": "The prognosis is favourable.",
+    "false": "The prognosis is poor."
+   }
+  },
+  {
+   "state_id": 2,
+   "key": "s2_choice_urgency",
+   "type": "choice",
+   "instructions": "What is the clinical urgency of the presentation?",
+   "criteria": {
+    "routine": "the case can be managed on the next available outpatient clinic",
+    "expedited": "the case needs review within hours, not days",
+    "emergent": "the case needs immediate life-saving intervention"
+   }
+  },
+  {
+   "state_id": 2,
+   "key": "s2_choice_likely_source",
+   "type": "choice",
+   "instructions": "What is the most likely source of the problem?",
+   "criteria": {
+    "lungs": "an infection or process centred in the pulmonary parenchyma",
+    "kidneys": "an infection or process centred in the renal tract",
+    "skin": "an infection or process centred in the skin and subcutaneous tissue",
+    "gastrointestinal": "an infection or process centred in the bowel",
+    "bone": "an infection or process centred in bone and joint"
+   }
+  },
+  {
+   "state_id": 2,
+   "key": "s2_choice_next_step",
+   "type": "choice",
+   "instructions": "What is the next step in management?",
+   "criteria": {
+    "continue": "continue the current management unchanged and review routinely",
+    "imaging": "obtain additional imaging before changing management",
+    "escalate": "escalate therapy now because of clinical deterioration",
+    "consult": "seek a second specialty opinion before deciding",
+    "discharge": "discharge with community follow-up arranged"
+   }
+  },
+  {
+   "state_id": 2,
+   "key": "s2_score_severity",
+   "type": "score",
+   "instructions": "How severe is the presentation overall?",
+   "criteria": [
+    "not severe at all",
+    "mildly severe",
+    "moderately severe",
+    "very severe"
+   ]
+  },
+  {
+   "state_id": 2,
+   "key": "s2_score_urgency",
+   "type": "score",
+   "instructions": "How urgent is the situation right now?",
+   "criteria": [
+    "not urgent",
+    "somewhat urgent",
+    "highly urgent"
+   ]
+  },
+  {
+   "state_id": 2,
+   "key": "s2_score_certainty",
+   "type": "score",
+   "instructions": "How certain is the diagnosis?",
+   "criteria": [
+    "certain it is not this",
+    "unlikely to be this",
+    "unsure",
+    "quite likely",
+    "certain it is this"
+   ]
+  },
+  {
+   "state_id": 3,
+   "key": "s3_noul_bacterial",
+   "type": "noul",
+   "instructions": "Is this a bacterial infection?",
+   "criteria": {
+    "true": "There is a bacterial infection requiring antibiotics.",
+    "false": "There is no bacterial infection."
+   }
+  },
+  {
+   "state_id": 3,
+   "key": "s3_noul_sepsis",
+   "type": "noul",
+   "instructions": "Is the patient septic?",
+   "criteria": {
+    "true": "The patient meets the criteria for sepsis.",
+    "false": "The patient does not meet the criteria for sepsis."
+   }
+  },
+  {
+   "state_id": 3,
+   "key": "s3_noul_imaging_abnormal",
+   "type": "noul",
+   "instructions": "Is the imaging abnormal?",
+   "criteria": {
+    "true": "The imaging demonstrates an abnormality.",
+    "false": "The imaging is normal."
+   }
+  },
+  {
+   "state_id": 3,
+   "key": "s3_noul_prognosis_good",
+   "type": "noul",
+   "instructions": "Is the prognosis good?",
+   "criteria": {
+    "true": "The prognosis is favourable.",
+    "false": "The prognosis is poor."
+   }
+  },
+  {
+   "state_id": 3,
+   "key": "s3_choice_urgency",
+   "type": "choice",
+   "instructions": "What is the clinical urgency of the presentation?",
+   "criteria": {
+    "routine": "the case can be managed on the next available outpatient clinic",
+    "expedited": "the case needs review within hours, not days",
+    "emergent": "the case needs immediate life-saving intervention"
+   }
+  },
+  {
+   "state_id": 3,
+   "key": "s3_choice_likely_source",
+   "type": "choice",
+   "instructions": "What is the most likely source of the problem?",
+   "criteria": {
+    "lungs": "an infection or process centred in the pulmonary parenchyma",
+    "kidneys": "an infection or process centred in the renal tract",
+    "skin": "an infection or process centred in the skin and subcutaneous tissue",
+    "gastrointestinal": "an infection or process centred in the bowel",
+    "bone": "an infection or process centred in bone and joint"
+   }
+  },
+  {
+   "state_id": 3,
+   "key": "s3_choice_next_step",
+   "type": "choice",
+   "instructions": "What is the next step in management?",
+   "criteria": {
+    "continue": "continue the current management unchanged and review routinely",
+    "imaging": "obtain additional imaging before changing management",
+    "escalate": "escalate therapy now because of clinical deterioration",
+    "consult": "seek a second specialty opinion before deciding",
+    "discharge": "discharge with community follow-up arranged"
+   }
+  },
+  {
+   "state_id": 3,
+   "key": "s3_score_severity",
+   "type": "score",
+   "instructions": "How severe is the presentation overall?",
+   "criteria": [
+    "not severe at all",
+    "mildly severe",
+    "moderately severe",
+    "very severe"
+   ]
+  },
+  {
+   "state_id": 3,
+   "key": "s3_score_urgency",
+   "type": "score",
+   "instructions": "How urgent is the situation right now?",
+   "criteria": [
+    "not urgent",
+    "somewhat urgent",
+    "highly urgent"
+   ]
+  },
+  {
+   "state_id": 3,
+   "key": "s3_score_certainty",
+   "type": "score",
+   "instructions": "How certain is the diagnosis?",
+   "criteria": [
+    "certain it is not this",
+    "unlikely to be this",
+    "unsure",
+    "quite likely",
+    "certain it is this"
+   ]
+  },
+  {
+   "state_id": 4,
+   "key": "s4_noul_bacterial",
+   "type": "noul",
+   "instructions": "Is this a bacterial infection?",
+   "criteria": {
+    "true": "There is a bacterial infection requiring antibiotics.",
+    "false": "There is no bacterial infection."
+   }
+  },
+  {
+   "state_id": 4,
+   "key": "s4_noul_sepsis",
+   "type": "noul",
+   "instructions": "Is the patient septic?",
+   "criteria": {
+    "true": "The patient meets the criteria for sepsis.",
+    "false": "The patient does not meet the criteria for sepsis."
+   }
+  },
+  {
+   "state_id": 4,
+   "key": "s4_noul_imaging_abnormal",
+   "type": "noul",
+   "instructions": "Is the imaging abnormal?",
+   "criteria": {
+    "true": "The imaging demonstrates an abnormality.",
+    "false": "The imaging is normal."
+   }
+  },
+  {
+   "state_id": 4,
+   "key": "s4_noul_prognosis_good",
+   "type": "noul",
+   "instructions": "Is the prognosis good?",
+   "criteria": {
+    "true": "The prognosis is favourable.",
+    "false": "The prognosis is poor."
+   }
+  },
+  {
+   "state_id": 4,
+   "key": "s4_choice_urgency",
+   "type": "choice",
+   "instructions": "What is the clinical urgency of the presentation?",
+   "criteria": {
+    "routine": "the case can be managed on the next available outpatient clinic",
+    "expedited": "the case needs review within hours, not days",
+    "emergent": "the case needs immediate life-saving intervention"
+   }
+  },
+  {
+   "state_id": 4,
+   "key": "s4_choice_likely_source",
+   "type": "choice",
+   "instructions": "What is the most likely source of the problem?",
+   "criteria": {
+    "lungs": "an infection or process centred in the pulmonary parenchyma",
+    "kidneys": "an infection or process centred in the renal tract",
+    "skin": "an infection or process centred in the skin and subcutaneous tissue",
+    "gastrointestinal": "an infection or process centred in the bowel",
+    "bone": "an infection or process centred in bone and joint"
+   }
+  },
+  {
+   "state_id": 4,
+   "key": "s4_choice_next_step",
+   "type": "choice",
+   "instructions": "What is the next step in management?",
+   "criteria": {
+    "continue": "continue the current management unchanged and review routinely",
+    "imaging": "obtain additional imaging before changing management",
+    "escalate": "escalate therapy now because of clinical deterioration",
+    "consult": "seek a second specialty opinion before deciding",
+    "discharge": "discharge with community follow-up arranged"
+   }
+  },
+  {
+   "state_id": 4,
+   "key": "s4_score_severity",
+   "type": "score",
+   "instructions": "How severe is the presentation overall?",
+   "criteria": [
+    "not severe at all",
+    "mildly severe",
+    "moderately severe",
+    "very severe"
+   ]
+  },
+  {
+   "state_id": 4,
+   "key": "s4_score_urgency",
+   "type": "score",
+   "instructions": "How urgent is the situation right now?",
+   "criteria": [
+    "not urgent",
+    "somewhat urgent",
+    "highly urgent"
+   ]
+  },
+  {
+   "state_id": 4,
+   "key": "s4_score_certainty",
+   "type": "score",
+   "instructions": "How certain is the diagnosis?",
+   "criteria": [
+    "certain it is not this",
+    "unlikely to be this",
+    "unsure",
+    "quite likely",
+    "certain it is this"
+   ]
+  },
+  {
+   "state_id": 5,
+   "key": "s5_noul_bacterial",
+   "type": "noul",
+   "instructions": "Is this a bacterial infection?",
+   "criteria": {
+    "true": "There is a bacterial infection requiring antibiotics.",
+    "false": "There is no bacterial infection."
+   }
+  },
+  {
+   "state_id": 5,
+   "key": "s5_noul_sepsis",
+   "type": "noul",
+   "instructions": "Is the patient septic?",
+   "criteria": {
+    "true": "The patient meets the criteria for sepsis.",
+    "false": "The patient does not meet the criteria for sepsis."
+   }
+  },
+  {
+   "state_id": 5,
+   "key": "s5_noul_imaging_abnormal",
+   "type": "noul",
+   "instructions": "Is the imaging abnormal?",
+   "criteria": {
+    "true": "The imaging demonstrates an abnormality.",
+    "false": "The imaging is normal."
+   }
+  },
+  {
+   "state_id": 5,
+   "key": "s5_noul_prognosis_good",
+   "type": "noul",
+   "instructions": "Is the prognosis good?",
+   "criteria": {
+    "true": "The prognosis is favourable.",
+    "false": "The prognosis is poor."
+   }
+  },
+  {
+   "state_id": 5,
+   "key": "s5_choice_urgency",
+   "type": "choice",
+   "instructions": "What is the clinical urgency of the presentation?",
+   "criteria": {
+    "routine": "the case can be managed on the next available outpatient clinic",
+    "expedited": "the case needs review within hours, not days",
+    "emergent": "the case needs immediate life-saving intervention"
+   }
+  },
+  {
+   "state_id": 5,
+   "key": "s5_choice_likely_source",
+   "type": "choice",
+   "instructions": "What is the most likely source of the problem?",
+   "criteria": {
+    "lungs": "an infection or process centred in the pulmonary parenchyma",
+    "kidneys": "an infection or process centred in the renal tract",
+    "skin": "an infection or process centred in the skin and subcutaneous tissue",
+    "gastrointestinal": "an infection or process centred in the bowel",
+    "bone": "an infection or process centred in bone and joint"
+   }
+  },
+  {
+   "state_id": 5,
+   "key": "s5_choice_next_step",
+   "type": "choice",
+   "instructions": "What is the next step in management?",
+   "criteria": {
+    "continue": "continue the current management unchanged and review routinely",
+    "imaging": "obtain additional imaging before changing management",
+    "escalate": "escalate therapy now because of clinical deterioration",
+    "consult": "seek a second specialty opinion before deciding",
+    "discharge": "discharge with community follow-up arranged"
+   }
+  },
+  {
+   "state_id": 5,
+   "key": "s5_score_severity",
+   "type": "score",
+   "instructions": "How severe is the presentation overall?",
+   "criteria": [
+    "not severe at all",
+    "mildly severe",
+    "moderately severe",
+    "very severe"
+   ]
+  },
+  {
+   "state_id": 5,
+   "key": "s5_score_urgency",
+   "type": "score",
+   "instructions": "How urgent is the situation right now?",
+   "criteria": [
+    "not urgent",
+    "somewhat urgent",
+    "highly urgent"
+   ]
+  },
+  {
+   "state_id": 5,
+   "key": "s5_score_certainty",
+   "type": "score",
+   "instructions": "How certain is the diagnosis?",
+   "criteria": [
+    "certain it is not this",
+    "unlikely to be this",
+    "unsure",
+    "quite likely",
+    "certain it is this"
+   ]
+  }
+ ]
+}

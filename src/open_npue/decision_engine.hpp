@@ -216,8 +216,6 @@ class Decider {
   /// the bucket for exactly the option counts the checkpoint fitted -- which is
   /// the bug this parameter exists to make impossible: an override that is
   /// silently ignored for most of what it was sent for.
-  std::map<std::string, float> temperature_by_options_;
-
   std::vector<RowAnswer> decide(const std::vector<PromptRow> &rows,
                                 const std::vector<float> &temperature,
                                 bool temperature_is_override = false);
@@ -302,6 +300,12 @@ class Decider {
   npue::enc::Stack stack_;
   std::unique_ptr<npue::enc::EmbedService> svc_;
   std::unique_ptr<Head> head_;
+  /// Private, with a public const getter above. It is MODEL STATE read from the
+  /// container at load, not part of the caller's contract: a public data member
+  /// invites `dec.temperature_by_options_["choice:11+"] = 0.1` from outside, and
+  /// 0.1 is precisely the value upstream refuses because it sharpens logits
+  /// ~10x. The range check in the constructor is then bypassable from outside.
+  std::map<std::string, float> temperature_by_options_;
   int64_t head_max_len_ = 0, max_seq_len_ = 0;
   std::mutex call_mu_;
 };
