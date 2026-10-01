@@ -47,6 +47,11 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <location>.agents/skills/prove-engaged/SKILL.md</location>
   </skill>
   <skill>
+    <name>prove-precise</name>
+    <description>Precision is contract, never a tuning knob. The single-threaded host path is the spec; every fast or reduced-precision path must reproduce it bit-for-bit or within a bound stated before the run. Diverging inputs are already suspect. Use wherever precisions mix, wherever a batch or tier selects a path, and before widening any accuracy gate.</description>
+    <location>.agents/skills/prove-precise/SKILL.md</location>
+  </skill>
+  <skill>
     <name>ground-truth-verify</name>
     <description>Verify every load-bearing plan claim against primary sources before implementing or benching: spec text, in-tree code at working HEAD, vendor docs, driver and kernel sources. Clone or fetch dependencies pinned by SHA as needed. Use before any kernel, scheduler, driver-facing, or contract-touching change, and whenever a plan cites a spec, a register or arch number, or an external limit.</description>
     <location>.agents/skills/ground-truth-verify/SKILL.md</location>
