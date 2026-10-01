@@ -259,17 +259,33 @@ void Head::forward(std::vector<float> &h, const std::vector<float> &pad,
     //
     // It survived because COSINE CANNOT SEE IT. The post-head residual has RMS
     // 199 with outliers past 240, so a corrupted attention CONTRIBUTION is a
-    // small perturbation of a large stream: the gathered marker rows still
-    // measured 0.999 against the float64 oracle. The argmax gate did see it --
-    // 0.60 agreement over 60 pairs -- and that was written off as "datapath
-    // error versus model margin". This bug is not that, and the margin claim
-    // has to be re-measured now it is gone.
-    //
-    // The oracle's equivalent is `q = q / np.sqrt(Dh)` on the `[S, Nh, Dh]` Q
-    // slice: per token, Q only. This is the same operation, and the stride is
-    // the whole point.
-    {
-      const float sc = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+      // small perturbation of a large stream: the gathered marker rows still
+      // measured 0.999 against the float64 oracle.
+      //
+      // MEASURED, both arms, 60-pair fixture, one instance each on the NPU:
+      //
+      //     before this fix   argmax agreement 36/60   residual max 0.8434
+      //     after  this fix   argmax agreement 36/60   residual max 0.6258
+      //
+      // The fix is real -- the logit residual fell 26% -- and it moved the
+      // argmax agreement by NOTHING. An earlier revision of this comment
+      // claimed the opposite, that the 0.60 agreement "did see" this bug and
+      // that the margin explanation was wrong. It did not see it. The number
+      // is identical with and without the fix, so this bug was never the
+      // cause of the disagreements, and the "datapath error versus model
+      // margin" reading of them is still open.
+      //
+      // What the disagreements are: all 24 sit where the reference's own top-2
+      // gap is under 0.043, and the engine's residual there is ~0.44 median.
+      // A near-tie plus a residual an order of magnitude larger than the margin
+      // is a coin flip, and the fixture has no decided pair to test. That is
+      // the honest state of the accuracy gate, not a solved question.
+      //
+      // The oracle's equivalent is `q = q / np.sqrt(Dh)` on the `[S, Nh, Dh]` Q
+      // slice: per token, Q only. This is the same operation, and the stride is
+      // the whole point.
+      {
+        const float sc = 1.0f / std::sqrt(static_cast<float>(head_dim_));
       for (int64_t i = 0; i < R * S; ++i) {
         float *row = qkv_.data() + i * 3 * d;
         for (int64_t j = 0; j < d; ++j) row[j] *= sc;

@@ -115,17 +115,41 @@ The second bug is the mirror image, in the accumulator: `acc` points at head
 ran last won the zeroing, so which 11 survived depended on thread interleaving
 — which is why two identical runs disagreed.
 
-**The lesson that generalises past this model:** the cosine gate could not see
-the Q bug. Gathered marker rows still measured **0.999** against the float64
-oracle, because scaling all of Q, K and V for a third of the tokens perturbs the
-stream only slightly. The **argmax** gate did see it — 0.60 agreement over 60
-pairs — and that number was written off as "datapath error versus model margin."
-It was neither. The gate was right and the explanation was wrong.
+**The lesson that generalises past this model, corrected by measurement:** the
+cosine gate could not see the Q bug. Gathered marker rows still measured **0.999**
+against the float64 oracle, because scaling all of Q, K and V for a third of the
+tokens perturbs the stream only slightly.
 
-So: **a gate that fires is information even when you can explain it away, and an
-explanation of why a gate fired is a hypothesis until you re-measure it.** Do not
-accept a passing or failing number with a story attached until the story has been
-tested.
+An earlier version of this section went further and said the *argmax* gate did see
+it — 0.60 agreement over 60 pairs — and that the "datapath error versus model
+margin" explanation was therefore wrong. **That was also wrong, and it was written
+before the measurement was taken.** Measured, both arms, one instance each on the
+NPU:
+
+| | argmax agreement | residual logit error (max) |
+|---|---:|---:|
+| before the Q fix | 36/60 = 0.600 | 0.8434 |
+| after the Q fix | 36/60 = 0.600 | **0.6258** |
+
+The fix is real — the residual fell 26% — and it moved agreement by **nothing**. So
+the Q bug was never the cause of the disagreements, and the margin reading of them
+is still open.
+
+Two rules, and the second is the one that was broken here:
+
+- A gate that fires is information even when you can explain it away — but a gate's
+  firing is not evidence about a *particular* defect until you have measured with
+  and without that defect. Both directions of that mistake are errors, and the
+  second is easier to commit because it feels like rigour.
+- **Never write the conclusion of a measurement you have not taken.** Both wrong
+  claims in this section were written in the past tense about a re-measurement that
+  had not happened. An A/B needs both arms; one arm is an anecdote.
+
+What the disagreements actually are: all 24 sit where the reference's own top-2 gap
+is under **0.043**, while the engine's residual there is ~0.44 median. A near-tie
+plus a residual an order of magnitude larger than the margin is a coin flip, and
+**the fixture contains no decided pair to test.** That is the current state of the
+accuracy gate: an open question, not a solved one.
 
 ## Verify
 
@@ -148,11 +172,15 @@ Toolchain as shipped in
 `src/xclbins/BERT-h768-gated-i1152-bf16/gemm_rtp/toolchain.json`: mlir-aie
 **1.4.2**, Peano **21.0.0.2026080301+c9c5ecb7**.
 
-**No datapath has been chosen and no accuracy number is published.** The 0.60
-argmax agreement over 60 pairs was measured *with the Q bug present* and is
-therefore not a datapath result. Nothing in this skill quotes a throughput,
-latency or accuracy figure for these families; when one exists it belongs here
-with its run date and the arm it came from.
+**No datapath has been chosen, and the accuracy gate cannot currently choose one.**
+The one hardware measurement that exists — 60-pair fixture, one instance, NPU —
+is in the table above: 36/60 argmax agreement with a 0.6258 max residual, and
+**no decided pair in the fixture at all** (the reference's widest top-2 gap over
+all 60 is 0.043). The plan's gate is "100% argmax agreement where the reference
+gap is >= 0.20", and that stratum is empty, so the gate's own primary requirement
+is untestable rather than met. Nothing in this skill quotes a throughput or
+latency figure for these families; when one exists it belongs here with its run
+date and the arm it came from.
 
 ## Rules
 
