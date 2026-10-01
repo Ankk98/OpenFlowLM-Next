@@ -13,7 +13,7 @@ measured. And most "these numbers moved" incidents are two jobs sharing DRAM
 bandwidth.
 
 **Nothing here is a number to memorise.** Limits are per-machine and per-workload.
-§1 is how to find yours; the rules after it are conditional on what you find.
+1 is how to find yours; the rules after it are conditional on what you find.
 
 ---
 
@@ -46,11 +46,11 @@ grep . /sys/devices/system/cpu/cpu*/topology/core_cpus_list 2>/dev/null | head
 
 | finding | consequence |
 |---|---|
-| scratch candidate is `tmpfs` | it is **RAM**. Never build, load or benchmark there -- see §2. |
+| scratch candidate is `tmpfs` | it is **RAM**. Never build, load or benchmark there -- see 2. |
 | swap is `zram`/`zswap` | swap is compressed RAM: no OOM kill, but CPU contention instead. `-j` now competes with compression. |
 | no swap at all | memory pressure reaches the user session immediately. |
-| a desktop session is active | cores and RAM are shared. `-j $(nproc)` is wrong (§4). |
-| SMT and/or mixed P/E cores | a thread's speed depends on which core it lands on. Pin deliberately (§7). |
+| a desktop session is active | cores and RAM are shared. `-j $(nproc)` is wrong (4). |
+| SMT and/or mixed P/E cores | a thread's speed depends on which core it lands on. Pin deliberately (7). |
 
 ---
 
@@ -72,7 +72,7 @@ size, the class:
 df -T "$(dirname "$SCRATCH")" | awk 'NR==2{print $2}'     # must NOT be tmpfs
 ```
 
-The guard in §8 exists because of this. Note it resolves the nearest **existing**
+The guard in 8 exists because of this. Note it resolves the nearest **existing**
 ancestor: `df -T` on a not-yet-created path fails silently, and a naive guard
 reads the empty result as "not tmpfs" and accepts. That fail-open is the exact
 shape of mistake the check exists to catch.
@@ -95,7 +95,7 @@ So `--basetemp` is not optional here:
 
 and after a session, check `du -sh /tmp/pytest-of-$USER` -- it is the single most
 likely place a runaway test suite goes, and `df /tmp` is the fastest way to notice.
-The runner in §8 sets it; use the runner rather than the flag.
+The runner in 8 sets it; use the runner rather than the flag.
 
 ---
 
@@ -211,7 +211,7 @@ for f in /sys/devices/system/cpu/cpufreq/policy0/scaling_governor \
   printf '%-56s %s\n' "$f" "$(cat "$f" 2>/dev/null)"
 done
 
-# One run at a time (§3).
+# One run at a time (3).
 pgrep -af -x oflm || echo "clear"
 ```
 
@@ -251,13 +251,13 @@ Measured on this host during a 12-question dispatch, raw sysfs and the `sensors`
 rendering side by side:
 
 ```
-/sys/class/hwmon/hwmon12/power1_input   0 -> 421000 -> 885000 -> 25000   (µW)
+/sys/class/hwmon/hwmon12/power1_input   0 -> 421000 -> 885000 -> 25000   (uW)
 sensors -> NPU_power                    0.00 mW -> 885.00 mW -> 25.00 mW
 ```
 
 So the NPU power channel **works**, peaks around 885 mW for that workload, and
 tracks the run: ramp, plateau, decay. The driver is right -- `amdxdna_sensors.c`
-does `npu_power * MICROWATT_PER_MILLIWATT` into hwmon's µW convention, and the
+does `npu_power * MICROWATT_PER_MILLIWATT` into hwmon's uW convention, and the
 field it reads is a `u16` of milliwatts.
 
 **Two traps, both of which I hit:**
@@ -273,7 +273,7 @@ field it reads is a `u16` of milliwatts.
 2. **`NPU_temperature` is `N/A` on this platform.** Not a failure: the driver
    gates on `AMDXDNA_INVALID_TEMPERATURE` and PMF does not report it here. So the
    channel exists and is empty -- which is the "documented field that always reads
-   zero" case from §6, in the other direction.
+   zero" case from 6, in the other direction.
 
 Cross-check power against `amd-smi`'s `SOCKET_POWER` when a figure looks
 implausible, but expect them to disagree in *scope*: this is the NPU rail only,
@@ -309,7 +309,7 @@ drm-shared-memory:                       0
 of machine gives per-process NPU attribution (`amd-smi` only reports device-total
 VRAM). Two uses:
 
-* as a **precondition check for the one-run rule** (§3) -- a stale process still
+* as a **precondition check for the one-run rule** (3) -- a stale process still
   holding ~500 MB of NPU memory means you have more than one client, whatever
   `pgrep` says;
 * to attribute memory when a run fails for want of it.
@@ -398,7 +398,7 @@ case "$(scratch_fs "$SCRATCH")" in
 esac
 
 if pgrep -x oflm >/dev/null 2>&1; then
-  echo "REFUSING: an oflm process is already running (one run at a time, §3)." >&2
+  echo "REFUSING: an oflm process is already running (one run at a time, 3)." >&2
   exit 2
 fi
 
@@ -425,27 +425,27 @@ while the first runs. All must behave.
 
 ## 9. Rules
 
-- **Measure before planning** (§1), on any new machine or workload.
-- **Never `tmpfs`** for scratch, build output, or model files -- it is RAM (§2).
-- **One model load, one run, at a time** (§3); verify with `pgrep` and
+- **Measure before planning** (1), on any new machine or workload.
+- **Never `tmpfs`** for scratch, build output, or model files -- it is RAM (2).
+- **One model load, one run, at a time** (3); verify with `pgrep` and
   `xrt-smi examine -r aie-partitions`.
-- **One scratch name, reused, deleted after every run** (§8). Never accumulate.
+- **One scratch name, reused, deleted after every run** (8). Never accumulate.
 - **Learn your workload's real cost** with `du -sh`; inherit nobody's number.
-- **`-j 8`, not `-j $(nproc)`**, on anything sharing the box with a desktop (§4).
-- **Foreground long jobs**; detach only with a completion marker and a poll (§5).
+- **`-j 8`, not `-j $(nproc)`**, on anything sharing the box with a desktop (4).
+- **Foreground long jobs**; detach only with a completion marker and a poll (5).
 - **Pin power mode, governor, EPP, boost and cores before a benchmark**, and
-  record them with the result (§7).
+  record them with the result (7).
 - **Sample DRAM bandwidth and package power during the run**, not just wall time.
 - **Interleave arms and repeat**; report the spread, and say "no measurable
-  difference" when they overlap (§7.5).
-- **Infer throttling from clocks** when no throttle counters exist (§7.3).
+  difference" when they overlap (7.5).
+- **Infer throttling from clocks** when no throttle counters exist (7.3).
 - **A blank screen with the machine alive is a compositor stall** until one grep
-  rules the kernel out (§6).
+  rules the kernel out (6).
 - **Cap the build cache** (`ccache -M 2G`); it is free until it is not.
 
 ---
 
-## Example: one host, probed 2026-10-01 -- what §1 and §7 came out as
+## Example: one host, probed 2026-10-01 -- what 1 and 7 came out as
 
 Illustrative only. **Re-run the probes; do not reuse these numbers.** A different
 firmware, a different `amd_pmf`, or a different SMI build changes what is
@@ -453,23 +453,23 @@ available -- that is why every recipe above probes first.
 
 | probe | value here | consequence |
 |---|---|---|
-| `/tmp` | `tmpfs` | RAM; §2 applies |
+| `/tmp` | `tmpfs` | RAM; 2 applies |
 | RAM / swap | 26 GB, no disk swap, 24 GB `zram` | no cushion; swap contends for CPU |
-| cores | 24 logical, SMT siblings present | pin for host-bound work (§7.4) |
+| cores | 24 logical, SMT siblings present | pin for host-bound work (7.4) |
 | observed core clocks | 5050 / 4190 / 3175 / 3156 MHz at idle | heterogeneous in practice |
 | power mode | `performance`, `Degraded: no` | already bench-correct; still verify |
 | governor / EPP / boost | `performance` / `performance` / `1` | same |
 | `intel-rapl` | present, `enabled=0`, reads nothing | **do not use**; use `amd-smi`/`sensors` |
 | `perf`, `sysstat`, `turbostat` | absent | no `mpstat`/`pidstat`; no uncore IMC counters |
-| NPU power | `sensors` `NPU_power` / `power1_input` | **works**, in **mW**, peaks ~885 mW on a 12-question run; see §7.2.1 |
-| NPU memory, per process | `/proc/<pid>/fdinfo` on `/dev/accel/accel0` | real (`drm-total-memory`, `drm-client-id`); see §7.2.2 |
-| NPU busy time | `drm-engine-amdxdna_accel_driver` **frozen while busy** | **do not use for utilisation**; see §7.2.2 |
+| NPU power | `sensors` `NPU_power` / `power1_input` | **works**, in **mW**, peaks ~885 mW on a 12-question run; see 7.2.1 |
+| NPU memory, per process | `/proc/<pid>/fdinfo` on `/dev/accel/accel0` | real (`drm-total-memory`, `drm-client-id`); see 7.2.2 |
+| NPU busy time | `drm-engine-amdxdna_accel_driver` **frozen while busy** | **do not use for utilisation**; see 7.2.2 |
 | NPU activity % | **not exposed at all** | use `xrt-smi examine -r aie-partitions` for presence |
 | DRAM bandwidth | `amd-smi metric` -> `APU_AVERAGE_DRAM_READS/WRITES` | MB/s, the bandwidth signal |
 | package power | `amd-smi metric` -> `SOCKET_POWER`; `sensors` -> `PPT` | two paths, cross-check them |
-| throttle counters | no `thermal_throttle` sysfs | infer from clocks and power (§7.3) |
+| throttle counters | no `thermal_throttle` sysfs | infer from clocks and power (7.3) |
 | one suite run | 5.6 GB scratch, 15 translation units per driver | x12 names = 126 GB |
-| container | ~1 GB resident when loaded | two concurrent loads is 2 GB (§3) |
+| container | ~1 GB resident when loaded | two concurrent loads is 2 GB (3) |
 
 Sequence that produced the two incidents: twelve runs, twelve scratch names,
 nothing cleaned up -> 126 GB. Then the "fix" was to move scratch to `/tmp` because

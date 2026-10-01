@@ -37,6 +37,11 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <location>.agents/skills/upstream-prior-art/SKILL.md</location>
   </skill>
   <skill>
+    <name>prove-engaged</name>
+    <description>Prove the change actually ran before any A/B comparison or performance claim. Name the observable that must differ, in the predicted direction, and refuse the delta if the arms are indistinguishable. Use before reading any speedup, before benchmarking a build or a flag, and when a change may be silently inactive.</description>
+    <location>.agents/skills/prove-engaged/SKILL.md</location>
+  </skill>
+  <skill>
     <name>host-discipline</name>
     <description>Run heavy builds, model loads, test suites and benchmarks on a shared workstation without filling its disk or exhausting its RAM. Use when a job writes gigabytes, when choosing a scratch directory, setting -j, backgrounding long work, or setting up a benchmark. Also for "the disk is full", "the machine froze", "the screen went blank but it is still running".</description>
     <location>.agents/skills/host-discipline/SKILL.md</location>

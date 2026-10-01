@@ -12,15 +12,15 @@ timer, and no working trace**.
 
 That is narrower than a first pass suggests, and getting it narrower is the point.
 A source-level survey of `~/repos/xdna-driver` (which matches the installed module
-exactly -- see §5.4) found that the driver *holds* a per-column busy counter,
+exactly -- see 5.4) found that the driver *holds* a per-column busy counter,
 `u16 npu_busy[AMDXDNA_NPU_MAX_PMF_COLUMNS]`, and exposes it as
 `AMDXDNA_SENSOR_TYPE_COLUMN_UTILIZATION`. So the data exists. What is missing is
 anything that reads it: hwmon wires up only power and temperature, `amd-smi` does
-not report the AIE at all, and the ioctl path is not wired to a tool here. §4.3
+not report the AIE at all, and the ioctl path is not wired to a tool here. 4.3
 has the ABI so the next person can finish it.
 
 That is a property of the build, not of the tooling in general -- and it was
-established by measurement, not by absence of evidence. The evidence is in §5.
+established by measurement, not by absence of evidence. The evidence is in 5.
 
 Read `host-discipline` for the whole-system level (power, DRAM bandwidth, clocks,
 one-run-at-a-time). This skill covers everything below that.
@@ -40,9 +40,9 @@ one-run-at-a-time). This skill covers everything below that.
 | host->NPU boundary | `/proc/<pid>/fdinfo` | works | per-client NPU **memory** only |
 | **AIE kernel** | **`aiebu-dump -p/-d -m aie2ps`** | **works** | opcode histogram, full disassembly, group binding |
 | **AIE graph** | **`xclbinutil --dump-section :JSON:`** | **works** | `ip_layout`, `connectivity`, `group_topology` |
-| AIE graph | `mlir_aie` Python API | **broken here** | see §5.2 |
+| AIE graph | `mlir_aie` Python API | **broken here** | see 5.2 |
 | **NPU device counters** | hwmon power only | **one signal** | power in mW; temperature N/A; activity % unreachable |
-| NPU trace | `xrt-capture` / `xrt-replay` | **inert** | copies the xclbin, records nothing (§5.1) |
+| NPU trace | `xrt-capture` / `xrt-replay` | **inert** | copies the xclbin, records nothing (5.1) |
 
 ---
 
@@ -83,8 +83,8 @@ can be right: the timers are **wall-clock per section**, gprof is **CPU-time
 sampled process-wide**, and the encoder is threaded. **Never compare the two
 directly**, and say which one a number came from.
 
-`gemm`'s 88 calls x 2.40 ms ≈ **211 ms of NPU-path cost** -- which is also the
-answer to "why does `t_npu` say zero" (§3).
+`gemm`'s 88 calls x 2.40 ms ~ **211 ms of NPU-path cost** -- which is also the
+answer to "why does `t_npu` say zero" (3).
 
 Notes: gprof needs the `-pg` build, so it is a *separate binary*; `-O2` is fine and
 the ranking is what matters, not the absolute numbers. Because the hot code is
@@ -108,7 +108,7 @@ timers  npu 0.0000  attn 0.1180 (qk 0.0480  av 0.0700)  hostln 0.0090
 ```
 
 Fields: `t_npu` (memcpy+sync+dispatch), `t_attn` split `t_qk`/`t_av`, host
-`t_hostln`/`t_hostsm`/`t_hostgelu`, and further splits `t_conv` (fp32↔bf16),
+`t_hostln`/`t_hostsm`/`t_hostgelu`, and further splits `t_conv` (fp32<->bf16),
 `t_in` (`sync_to_device`), `t_disp` (`kernel()`+wait), `t_out`
 (`sync_from_device`), `t_bias`, plus `n_dispatch` (88 = 22 layers x 4 ops).
 
@@ -116,7 +116,7 @@ Fields: `t_npu` (memcpy+sync+dispatch), `t_attn` split `t_qk`/`t_av`, host
 
 Two independent runs: `npu 0.0000` both times, while everything else moved
 within noise (`attn` 0.1180/0.1200, `hostgelu` 0.3602/0.3527). So in the
-fused-epilogue configuration **the host↔device time is not being measured at
+fused-epilogue configuration **the host<->device time is not being measured at
 all**, and the single most important number for an NPU-offload profile is the one
 that is absent.
 
@@ -142,7 +142,7 @@ of the compiled code, not of a run.
 ### 4.1 AIE kernel: `aiebu-dump`
 
 The per-tier, per-op instruction binaries under a family's `gemm_rtp/` are the
-kernel-level artifacts (`insts_qkv_b4.bin`, `insts_attn_out_b16.bin`, …).
+kernel-level artifacts (`insts_qkv_b4.bin`, `insts_attn_out_b16.bin`, ...).
 
 ```bash
 A=/opt/xilinx/xrt/bin            # NOT on PATH
@@ -267,7 +267,7 @@ XRT's profiling support is not compiled into this build -- consistent with
 `pyxrt` containing **zero** profile-related strings. So there is no AIE execution
 trace, no PC sampling, and no way to get one without an XRT rebuild.
 
-**This is the cleanest example in the repo of the rule in §6: exit 0 plus
+**This is the cleanest example in the repo of the rule in 6: exit 0 plus
 plausible artifacts is not measurement.** Always `md5sum` the capture and check it
 is not the input.
 
@@ -303,11 +303,11 @@ Recorded because the corrections are more useful than the claims were.
 works:
 
 ```
-/sys/class/hwmon/hwmon12/power1_input   0 -> 885000 -> 25000   (µW)
+/sys/class/hwmon/hwmon12/power1_input   0 -> 885000 -> 25000   (uW)
 sensors -> NPU_power                    0.00 mW -> 885.00 mW -> 25.00 mW
 ```
 
-`amdxdna_sensors.c` does `npu_power * MICROWATT_PER_MILLIWATT` into hwmon's µW
+`amdxdna_sensors.c` does `npu_power * MICROWATT_PER_MILLIWATT` into hwmon's uW
 convention, and the field is a `u16` of milliwatts, so 885 mW is 0.885 W of NPU
 rail. The "755 W" that started this was a shell line of mine that read the number
 and then appended a hardcoded `W`:
@@ -362,7 +362,7 @@ conclusions from this tree apply to the running driver *and* the running XRT.
 | `AGENTS.md`'s `source utilities/mlir-aie/utils/env_setup.sh` | **that path does not exist.** Peano is `ironvenv/lib/python3.14/site-packages/llvm-aie/bin` (21 tools, `clang` 21.0.0 Xilinx llvm-aie), and AGENTS.md also says Python 3.12 where it is 3.14. |
 | `/sys/kernel/debug/amdxdna/` | debugfs is mounted but **empty** -- no driver counters |
 | `intel-rapl` | present, `enabled=0`, reads nothing on AMD |
-| `sensors` -> `NPU_power` | ~1000x too large; see `host-discipline` §7.2.1 |
+| `sensors` -> `NPU_power` | ~1000x too large; see `host-discipline` 7.2.1 |
 | `drm-engine-amdxdna_accel_driver` in fdinfo | per-**file** submit time; you must read the fd owning the hwctx |
 | `perf`, `valgrind`, `py-spy`, `ltrace`, `turbostat`, `sysstat`, `numactl`, `cpupower`, `ryzen_smu` | **all absent** -- no uncore/IMC hardware counters, no `mpstat`/`pidstat` |
 
@@ -392,20 +392,20 @@ as absent, not as a fast path.
 
 For "where does the encode go", on this stack:
 
-1. **One run at a time** (`host-discipline` §3), scratch on a real filesystem.
-2. **gprof** for the host function ranking (§2). This is the primary tool.
-3. **The rig's timers** for the phase view, **knowing `t_npu` is 0** (§3), and take
+1. **One run at a time** (`host-discipline` 3), scratch on a real filesystem.
+2. **gprof** for the host function ranking (2). This is the primary tool.
+3. **The rig's timers** for the phase view, **knowing `t_npu` is 0** (3), and take
    `gemm`'s per-call total from gprof as the NPU-path number.
 4. **`strace -c -e trace=ioctl,mmap,openat`** for the dispatch shape. Measured:
    265 `mmap`, **504 `ioctl`** for 88 dispatches (~5.7 per dispatch), 69 `openat`.
    A sudden change in the ioctl-per-dispatch ratio means the command queue changed
    shape, which matters more than the absolute count.
 5. **`aiebu-dump -p -m aie2ps`** per kernel to confirm the shipped code is the code
-   you think (§4.1).
-6. **`xclbinutil` metadata** to confirm the shipped graph/tile layout (§4.2).
+   you think (4.1).
+6. **`xclbinutil` metadata** to confirm the shipped graph/tile layout (4.2).
 7. **`amd-smi metric`** for DRAM MB/s and package W during the run, so "the host is
    the bottleneck" and "the device is starved of bandwidth" can be told apart
-   (`host-discipline` §7.2).
+   (`host-discipline` 7.2).
 8. **Repeat interleaved, >=3 reps, and report the spread.** If arms overlap within
    noise, the answer is "no measurable difference".
 
@@ -420,6 +420,6 @@ For "where does the encode go", on this stack:
   the run.
 - **There is no runtime NPU counter.** Do not promise one, and do not synthesise a
   substitute from a counter that does not move.
-- **Check the artifact, not the exit code** (§6).
-- **Keep a "dead ends" list** -- §5 exists so the next person does not spend a day
+- **Check the artifact, not the exit code** (6).
+- **Keep a "dead ends" list** -- 5 exists so the next person does not spend a day
   re-proving that `xrt-capture` is inert.
