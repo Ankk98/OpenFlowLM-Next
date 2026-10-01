@@ -1,0 +1,182 @@
+=== SESSION 2026-09-30 laya-npu2 ===
+goal: Implement docs/plans/laya_npu2_research.md + specs/open-engine/plans/laya-decision-encoder.md so laya runs on NPU2
+repo: /home/ankk98/repos/OpenFlowLM-Next
+branch: add-laya-support-implement
+log: /home/ankk98/repos/OpenFlowLM-Next/.agents/logs/2026-09-30-laya-npu2-9c41.log
+---
+
+## 2026-09-30T00:00:00+05:30 note E1
+Environment survey:
+- CPU: AMD RYZEN AI MAX 390 w/ Radeon 8050S, 24 threads, avx512f/dq/cd/bw/vl + avx512_bf16
+- NPU: /dev/accel0, aie2p, 6x8, XRT 2.25.0, firmware 1.1.2.65
+- build/src/oflm exists (ninja build tree present)
+- 52 xclbin families in src/xclbins/
+- no oflm on PATH (not installed); ~/.npu/cache exists
+- oflm-test present at utilities/oflm-test
+
+## 2026-09-30T09:55:00+05:30 result R1 — ground truth fetched
+Files (convaiinnovations/laya @ 55cf4c4e):
+- multilingual/encoder/config.json: modernbert, h768, 22L, 12H, head_dim 64, inter 1152,
+  vocab 256000, local_attention 128, global_attn_every_n_layers 3, layer_types explicit
+  (8 full / 14 sliding), layer_norm_eps 1e-5, attention_bias/mlp_bias/norm_bias ALL false,
+  position_embedding_type "sans_pos", rope_parameters.{full,sliding}.rope_theta = 160000 BOTH,
+  cls=1 sep=1 (both <eos>) pad=0 unk=3 mask=4 bos=2, max_position_embeddings 8192.
+- multilingual/rl_agent_config.json: head_layers 2, max_len 1024, head_max_len 256,
+  act_costs {escalate:0.5} -> n_act 2, amp_dtype bf16, temperature [1,1,1],
+  temperature_by_options {}.
+- safetensors header (17504 B): 170 tensors, ALL encoder+head weights are **F16**
+  (temperature is F32). Keys are `encoder.`-prefixed:
+    encoder.embeddings.tok_embeddings.weight [256000,768]
+    encoder.embeddings.norm.weight [768]      (NO bias)
+    encoder.final_norm.weight [768]           (NO bias)
+    encoder.layers.{0..21}.attn.Wqkv.weight [2304,768]
+    encoder.layers.{0..21}.attn.Wo.weight  [768,768]
+    encoder.layers.{0..21}.mlp.Wi.weight    [2304,768]
+    encoder.layers.{0..21}.mlp.Wo.weight    [768,1152]
+    encoder.layers.{1..21}.attn_norm.weight [768]   <- 21, so layer 0 is Identity
+    encoder.layers.{0..21}.mlp_norm.weight [768]
+  head.layers.{0,1}.{norm1,norm2,self_attn.in_proj_{weight,bias},self_attn.out_proj.{weight,bias},
+                     linear1.{weight,bias},linear2.{weight,bias}}
+  type_emb.weight [3,768]; scorer.{0,1,3}.{weight,bias}; act_head.{0,2}.{weight,bias}
+  temperature [3] F32.
+  => NO biases anywhere in the encoder; every *.bias must be synthesized as zeros.
+  => tensors are `encoder.*`-prefixed, so the packer needs a name-mapping `get()`.
+
+## 2026-09-30T09:56:00+05:30 corrects C1 — the plan's tokenizer ORDER is wrong
+Plan Phase 2 step 2 says "normalise, then match added tokens against the *normalised*
+text". Measured against HF tokenizers 0.22.2, that is WRONG for this checkpoint:
+  tk.encode('  x')            -> ['▁','▁x']       (two single ▁, NOT the ▁▁ added token id 139)
+  tk.encode('▁▁x')            -> ['▁▁','▁x']     (raw ▁ DOES match)
+  tk.encode('    four spaces')-> ['▁','▁','▁','▁four','▁spaces']
+The reason: all 249 added tokens in this tokenizer.json carry `normalized: false`, which in
+HF means "match against the ORIGINAL input". And the vocab has NO raw-space added tokens --
+the space-run tokens are written as U+2581 runs (ids 139..168) -- so a space run can never
+match once the Replace normaliser has rewritten it. The existing C++ pipeline already does
+added-token matching FIRST on the raw text (tokenizer_bbpe.cpp:563-612), so the correct
+change is SMALLER than the plan assumed: add norm==2 (Replace) and a Metaspace pre-tokenizer,
+keep the added-token stage where it is.
+MetaSpace behaviour measured (probe with added_tokens removed):
+  split keeps the ▁ with the FOLLOWING piece and drops empty pieces:
+    '▁▁x' -> ['▁','▁x'] ; '▁▁▁x' -> ['▁','▁','▁x'] ; 'x▁y' -> ['▁x','▁y']
+  prepend ▁ to the whole segment iff it does not already start with ▁.
+  88 added tokens are strict prefixes of other added tokens -> leftmost-longest is load-bearing.
+  Only `<mask>` has lstrip:true. No single_word, no rstrip, none have raw spaces in content.
+
+## 2026-09-30T09:57:00+05:30 note E2 — toolchain on this host
+- ironvenv/ has mlir-aie 1.4.2 + llvm-aie 21.0.0.2026080301 (Peano). ~/.npu/cache has 68 entries.
+- NO pwsh/powershell -> npu_offload/gemm_rtp/build.ps1 cannot run. Need a Linux build driver.
+- transformers 5.10.2 / tokenizers 0.22.2 / torch 2.12.0 in the SYSTEM python3 (not ironvenv).
+  That is the oracle for the tokenizer fixture and the accuracy gate.
+
+## 2026-09-30T11:10:00+05:30 result R2 — Phase 0 + Phase 1 committed
+- 781d4b3 npue_pack: two model_type guards + subdir keys + 5 spec requirements
+  + vendored typesafe-systemone-0ffd094c.py + tests/test_modernbert_pack.py (11 pass)
+- e617ff0 decision: decision_types.{hpp,cpp} + tests/test_systemone_wire.py (59 pass)
+Learned while writing Phase 1's tests (cost 4 fix cycles, all real defects):
+  - nlohmann `find()` on an object returns an ITERATOR, not a pointer. `!= nullptr`
+    does not compile and `contains()` is the right call anyway.
+  - `<charconv>` needed for std::from_chars in the py_repr_double ladder.
+  - pydantic needs the exec'd module in sys.modules under cls.__module__ or it
+    raises "not fully defined" -- a statement about exec_module, not the pin.
+  - An unknown question type originally THREW. It has to be DROPPED with a
+    warning: the SDK pre-passes and deletes before validation. Found by the test.
+Decision: the 2-10 score band is imposed by this build, not claimed of the schema
+(the pinned ScoreQuestion.criteria is min_length=1 with no upper bound). Stated
+in the refusal message so nobody reads it as a schema fact.
+
+## 2026-09-30T11:12:00+05:30 decision D1 — tokenizer pipeline order (corrects plan Phase 2)
+Plan said: "normalise, then match added tokens against the NORMALISED text".
+MEASURED AGAINST HF: added tokens here all carry `normalized: false`, which in
+HF means "match the ORIGINAL input". The vocab has no raw-space added tokens at
+all -- the space runs are U+2581 runs (ids 139..168) -- so a space run can never
+match after the Replace normaliser rewrote it. Evidence:
+    tk('  x')             -> ['▁','▁x']        (not the ▁▁ added token, id 139)
+    tk('▁▁x')             -> ['▁▁','▁x']      (raw ▁ DOES match)
+So the EXISTING C++ order (added-token split on raw text, first) is already right.
+The change is smaller than the plan assumed: add norm==2 (Replace) and a Metaspace
+pre-tokenizer. No reordering of the added-token stage.
+
+## 2026-09-30T12:20:00+05:30 result R3 — Phase 2 committed (d34022a)
+The tokenizer gate is 418 strings vs tokenizers 0.22, all ids equal.
+
+## 2026-09-30T12:22:00+05:30 corrects C2 — the plan's "all 256 byte chars present" is
+### NOT the invariant for this checkpoint, and the port was wrong before the gate ran
+This checkpoint is a byte-FALLBACK BPE over RAW CHARACTERS, not a GPT-2 byte-level
+BPE. Evidence, all from its own tokenizer.json:
+  - decoder = Sequence[ Replace(U+2581->" "), ByteFallback, Fuse ] -- NO ByteLevel.
+    The decoder is what inverts the alphabet, so it is the discriminator.
+  - ' ' (U+0020) is NOT a vocab entry. In a bytes_to_unicode alphabet the space
+    would be U+0120; here it is absent, so a space MUST be rewritten before it can
+    tokenize -- which is exactly what the Replace normalizer does.
+  - vocab has U+2581=235248, 'hello'=17534, U+2581+h=531, U+2581hello=25612. A
+    GPT-2 byte-level vocab contains NONE of these (it would write U+2581 as the
+    three stand-ins for E2 96 81).
+  - merges are over RAW chars.
+  - 255 of the 256 <0xNN> pieces present; <0x09> missing because tab is id 226.
+THE TRAP: this 256k vocab HAPPENS to contain all 256 GPT-2 byte chars, so the old
+"byte characters all present" check PASSES for it and a runtime that maps bytes
+anyway looks right. First version of the port did exactly that: 'hello world' came
+back as 8 ids where HF gives 2. Fixed by making byte_mode a TABLE FIELD read from
+the decoder, and branching the alphabet-closedness check with it.
+Fixes to the plan's Phase 2 list: byte_fallback is NOT inert (it is the live
+mechanism); unk_token is real (<unk>=3, fuse_unk true); and the pre-tokenizer order
+is the existing one (see C1). Blob v2 APPENDS so v1 stays readable.
+
+## 2026-09-30T14:05:00+05:30 result R4 — Phase 3 done (not yet committed)
+prepare_model_modernbert packs arch=4. 34 tests in test_modernbert_pack.py,
+including the ShapeLease load gate (load_tokenizer + encoder_implemented +
+apply_model_shape on the real container).
+
+## 2026-09-30T14:06:00+05:30 corrects C3 — the plan's "throw if [blob/config] disagree" on
+### the special ids is WRONG, and following it would make the model unloadable
+Plan: "Read all five from the encoder config, never from the blob, and throw if
+they disagree." Measured: they DO disagree, by design of the derivation.
+  blob derives cls_id = first of {[CLS], <s>, <|endoftext|>}; laya's vocab has
+  <s> at 204 -> cls_id 204. Config says cls_token_id = 1. Same for sep (</s> at
+  213 vs 1). So a throw makes laya unloadable over a NAME GUESS being a name
+  guess.
+Resolution: the container wins, the blob's values are overwritten, the
+disagreement is PRINTED, and the refusal that IS correct is "the container's id
+is not in the vocabulary at all".
+Also: `AnyTokenizer::encode()` now REFUSES on an arch=4 container by name. Every
+other backend here is an embedding encoder where the facade's wrap-and-pad policy
+is right; arch=4's prompt is assembled token by token with its specials in hand,
+so the facade is not merely different, it is wrong.
+
+## 2026-09-30T14:07:00+05:30 note E3 — gotcha for the next session
+- /tmp is a 14 GB tmpfs and pytest's basetemp filled it (11 GB). Use
+  --basetemp=/home/ankk98/.cache/pytest-tmp/... for anything that packs fixtures.
+- .npue tensor offsets are relative to the DATA SECTION (header offset 32), not
+  to the file. Reading at file[offset] decodes plausible garbage; this cost a
+  confusing "the packer is wrong" round.
+- specs/open-engine/tests/test_quant_q4k.py has 2 PRE-EXISTING failures on the
+  clean tree. Not ours.
+
+## 2026-09-30T13:10:00+05:30 result R5 — Phase 3 committed (19f8db7)
+34 tests in test_modernbert_pack.py pass, incl. the ShapeLease load gate.
+
+## 2026-09-30T14:40:00+05:30 result R6 — Phase 4 committed (d9d7ef8)
+Both design families BUILT on this host (168 s each):
+  src/xclbins/BERT-h768-gated-i1152-bfp16  (hidden 768, inter 1152, seq 1024,
+     tiers 4,16,32, 12 streams, M up to 32768, emulate_bfp16 true)
+  src/xclbins/BERT-h768-gated-i1152-bf16   (same, emulate_bfp16 false)
+check_design_sets.py: 7/7 ok.
+LAYOUT HASH: both new families == BERT-h768-bfp16 == BERT-h768-gated-bfp16 ==
+94266693ea31aa674279b0cb124eb9a731276064eae1442ac55841dc266dddaf. Confirmed:
+gemm_b_layout only ever sees (tile_k, tile_n, "BF16"). So the hash is NOT
+evidence the right design was built; intermediate/gated_ffn/emulate_bfp16 are.
+NO TIER 1 POSSIBLE: export_gemm_rtp.py requires every tier to be a multiple of
+4 (`if b % 4`). Tiers are 4,16,32.
+
+## 2026-09-30T14:45:00+05:30 note E4 — the Linux NPU toolchain, three discoveries
+1. aiecc shells out to `xclbinutil`; it lives in /opt/xilinx/xrt/bin and is NOT
+   on PATH. Fails 35 steps into the first shape otherwise.
+2. PyXRT must be importable. mlir-aie picks its tensor class at IMPORT: XRT's
+   if `pyxrt` imports, CPU-only otherwise. CPU-only REJECTS device="npu", and
+   device="cpu" is NOT a fix -- it makes pretiled_array() try to RUN the design
+   ("Cannot run kernel; DefaultNPURuntime not set"). A pyxrt built for
+   cpython-314 exists at
+   ~/repos/xdna-driver/xrt/build/Release/opt/xilinx/xrt/python/
+   utilities/build-design-sets.py finds it by CPython tag and sets PYTHONPATH.
+3. `nohup ... &` from the bash tool gets killed when the call times out. Use
+   `setsid nohup ... & disown` for the multi-minute build.

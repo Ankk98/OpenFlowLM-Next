@@ -32,8 +32,16 @@ tmp
 # shipped pre-built in the distributed package only.
 src/xclbins/BERT-h*/
 
-# Claude Code: personal, not shared guidance (AGENTS.md is the shared doc)
-.claude/
+# Claude Code: personal guidance is not shared (AGENTS.md is the shared doc).
+#
+# The skills SYMLINKS are deliberately NOT ignored. They point at
+# .agents/skills/, which is the single source every other client reads, so they
+# contain nothing personal -- and R1 requires them checked in, or a Claude user
+# gets a different skill set from everyone else. Excluding the DIRECTORY (rather
+# than its contents) would make that un-negotiable, because git cannot re-include
+# a path whose parent directory is excluded -- hence `.claude/*` plus a negation.
+.claude/*
+!.claude/skills/
 CLAUDE.md
 
 # open_kernels build outputs and generated fixtures. A build directory is what it

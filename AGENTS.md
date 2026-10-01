@@ -42,6 +42,11 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <location>.agents/skills/prove-engaged/SKILL.md</location>
   </skill>
   <skill>
+    <name>teach-first</name>
+    <description>Explain technical work so the reader can check it - reasoning and assumptions stated before acting, every term defined at first use, every number carrying units and direction, one idea per message, and a worked example from real numbers. Use for any explanation, result summary, investigation write-up or handoff addressed to the human. Fires by default, not by request.</description>
+    <location>.agents/skills/teach-first/SKILL.md</location>
+  </skill>
+  <skill>
     <name>host-discipline</name>
     <description>Run heavy builds, model loads, test suites and benchmarks on a shared workstation without filling its disk or exhausting its RAM. Use when a job writes gigabytes, when choosing a scratch directory, setting -j, backgrounding long work, or setting up a benchmark. Also for "the disk is full", "the machine froze", "the screen went blank but it is still running".</description>
     <location>.agents/skills/host-discipline/SKILL.md</location>
