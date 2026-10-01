@@ -47,6 +47,11 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <location>.agents/skills/prove-engaged/SKILL.md</location>
   </skill>
   <skill>
+    <name>ground-truth-verify</name>
+    <description>Verify every load-bearing plan claim against primary sources before implementing or benching: spec text, in-tree code at working HEAD, vendor docs, driver and kernel sources. Clone or fetch dependencies pinned by SHA as needed. Use before any kernel, scheduler, driver-facing, or contract-touching change, and whenever a plan cites a spec, a register or arch number, or an external limit.</description>
+    <location>.agents/skills/ground-truth-verify/SKILL.md</location>
+  </skill>
+  <skill>
     <name>teach-first</name>
     <description>Explain technical work so the reader can check it - reasoning and assumptions stated before acting, every term defined at first use, every number carrying units and direction, one idea per message, and a worked example from real numbers. Use for any explanation, result summary, investigation write-up or handoff addressed to the human. Fires by default, not by request.</description>
     <location>.agents/skills/teach-first/SKILL.md</location>
