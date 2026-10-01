@@ -37,6 +37,11 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <location>.agents/skills/upstream-prior-art/SKILL.md</location>
   </skill>
   <skill>
+    <name>prove-correctness</name>
+    <description>Prove output identity and work conservation before believing any speedup, and prove your gate can see the bug you might have introduced. Greedy identical, counts conserved, precision bounds met, gate shown to have teeth: speed without identity is skipped work until proven otherwise. Use after engagement proof, before reading any delta, or when a change is engaged but its output may still be wrong.</description>
+    <location>.agents/skills/prove-correctness/SKILL.md</location>
+  </skill>
+  <skill>
     <name>prove-engaged</name>
     <description>Prove the change actually ran before any A/B comparison or performance claim. Name the observable that must differ, in the predicted direction, and refuse the delta if the arms are indistinguishable. Use before reading any speedup, before benchmarking a build or a flag, and when a change may be silently inactive.</description>
     <location>.agents/skills/prove-engaged/SKILL.md</location>
