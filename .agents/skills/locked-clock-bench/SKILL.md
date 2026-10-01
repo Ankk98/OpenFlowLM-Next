@@ -16,9 +16,21 @@ the comparison if it did.**
   attributes at all**. NPU clocks cannot be read, pinned, or locked by anyone,
   including with root. The host CPU governor *is* exposed and is currently
   `performance`.
-- `amdxdna` reads **0 mW at idle**. So a zero reading is the correct idle value
-  and a *non*-zero reading is what proves work happened. A zero reading
-  *during* a timed run is a dead instrument, not a fast kernel.
+- **`power1_input` is in MICROWATTS, not milliwatts.** The driver's own source
+  settles it -- `drivers/accel/amdxdna/amdxdna_sensors.c` computes
+  `*val = npu_metrics.npu_power * MICROWATT_PER_MILLIWATT`, where `npu_power`
+  is a `u16` in milliwatts. A reading of `1041000` is **1.04 W**, not 1041 W.
+  Check the unit in the driver before quoting a power number anywhere; a factor
+  of 1000 in the wrong direction reads as a hardware fault.
+- **The underlying field saturates.** `npu_power` is a `u16` in mW, so it tops
+  out at 65535 mW = **65.5 W**. A reading of exactly `1048575` is a saturated
+  field, not a measurement, and must not be reported as a power.
+- `amdxdna` reads **0 at idle**. So a zero reading is the correct idle
+  value and a *non*-zero reading is what proves work happened. A zero reading
+  *during* a timed run is a dead instrument, not a fast kernel. Note that a
+  plausible-looking 1 W under load is itself worth a second look: it may mean
+  the accelerator was barely used and the work was on the host. Confirm the
+  work is where you think it is before quoting the number.
 - The NPU (`amdxdna`), the iGPU (`amdgpu`) and the battery each have their own
   hwmon node with a `power1_input`. Indices move when hardware changes;
   **identify a node by its `name` field, never by its number.**
@@ -160,10 +172,12 @@ All of these hold, or the claim is refused:
 - **Every arm is labelled** with machine state and operating point, not with a
   single session-level preamble.
 - **Instruments were proven alive during the work.** A power reading that rose
-  from 0 mW, or a duration that is non-zero, is the evidence that the run
+  from zero, or a duration that is non-zero, is the evidence that the run
   happened and that the measurement observed it. This is the same requirement
   as `prove-engaged`, applied to the bench rather than to the code: an
-  instrument reading a plausible value under load.
+  instrument reading a plausible value under load. **State the unit when you
+  state the reading**, because the plausible-but-wrong-by-1000 number is
+  indistinguishable from a fault until you divide it.
 - **Binary freshness.** Hash each arm's binary and any library, and confirm the
   artifact is newer than the last source edit. A stale binary is the most
   expensive trap in benchmarking because it produces *identical magnitudes
