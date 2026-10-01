@@ -247,6 +247,55 @@ Presence is still available via `xrt-smi examine -r aie-partitions`.
 
 ## 5. What is present but inert -- do not re-explore these
 
+### 5.0 There is no absolute AIE execution counter on this box
+
+Measured 2026-10-01 by running a real dispatch, not by reading a man page. Every
+device-side busy-time instrument reads zero or is unwired:
+
+- `drm-engine-amdxdna_accel_driver` in `/proc/<pid>/fdinfo` on `/dev/accel/accel0`
+  reads **0 ns** during a dispatch that is demonstrably happening.
+- `t_npu` reads 0.0000, reproducibly, over multi-second runs.
+- The 8 column-utilization sensors **are registered** (`amdxdna_sensors.c:96`,
+  `AMDXDNA_NPU_MAX_PMF_COLUMNS` = **0x8**, so 8 columns -- not the large array the
+  header first suggests) but `amdxdna_hwmon_read` handles only `hwmon_temp` and
+  `hwmon_power`, so they never return a value. Registered and inert, which is why
+  an ioctl probe against them reads nothing.
+
+So per-kernel time and AIE cycle counts are not obtainable. What *is* usable:
+
+- `/sys/class/hwmon/hwmon12/power1_input` — `amdxdna`, in **MICROWATTS**
+  (`amdxdna_sensors.c:144` multiplies a `u16` mW field by
+  `MICROWATT_PER_MILLIWATT`). 0 at rest. The `u16` saturates at 65,535 mW =
+  65.5 W, so a reading of exactly 1048575 uW is a saturated field, not a
+  measurement.
+- `/proc/<pid>/fdinfo` on `/dev/accel/accel0` — `drm-driver`, `drm-client-id`,
+  `drm-pdev`, and heap/alloc sizes. Proves a context exists and how much device
+  memory is resident.
+- `xclbinutil --input <f> --info` and `--dump-section AIE_PARTITION:json:<out>` —
+  `column_width`, `start_columns`, `operations_per_cycle`, PDI/DPU CDO inventory.
+  Use `--info`; **`--dump` alone is ambiguous** with `--dump-section` and errors.
+- `xrt-smi` is at `/opt/xilinx/xrt/bin/xrt-smi` — hyphenated, and not on PATH.
+
+**Use a dose-response instead of a counter.** Scale the AIE work and check that
+power scales with it. Measured: 8x the row-passes (batch 3 -> tier 4, batch 40
+-> tier 32, same M=32768) gave **2.05x** power, 0.972 W -> 1.993 W, from 0 at
+rest. Sub-linear is expected, since total power is static plus dynamic and only
+the dynamic part scales. Full chain and its limits in
+`.local/laya-implement/results/npu-dispatch-proof.md`.
+
+**Two traps that cost real time on that run:**
+
+- **Confirm the subject of a `/proc` probe.** `pgrep -f layaacc` matched the
+  *bash wrapper*, because the shell's own command line contains the rig's path.
+  Thirty-five samples were taken of a shell whose only device fd was
+  `/dev/null`, and the plausible conclusion was "the engine never opens the
+  device". Match on `/proc/PID/exe`, not on a command line that merely mentions
+  the name.
+- **Prove the refusal as well as the success.** The strongest dispatch evidence
+  was the failing arm: point the rig at an empty design directory and it exits 1
+  in 0 s naming the `design.json` it could not find. No host fallback exists, so
+  the only route to an answer is through the AIE.
+
 ### 5.1 `xrt-capture` / `xrt-replay` capture nothing
 
 ```bash
