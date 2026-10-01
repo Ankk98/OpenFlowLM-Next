@@ -17,7 +17,29 @@
 #include <unordered_map>
 #include <vector>
 
+#include "AutoDecisionModel/auto_decision_model.hpp"
+
+// The CONCRETE backend is XRT-only. `open_npue_adapter/npue_decision.cpp` is
+// listed inside `if(NOT OFLM_USE_HRX)` in CMakeLists.txt, because the decision
+// surface is built on the open_npue engine and npu_device.cpp, and neither
+// exists in an HRX build. Including the backend header unconditionally therefore
+// compiled the class DECLARATION and then failed to link
+// `std::make_unique<NpueDecision>` -- a link error on a build that is merely
+// missing a feature, which is the opposite of what this tree does everywhere
+// else. CMakeLists.txt says so itself about the sibling file: "it compiles for
+// every build and refuses at LOAD time ... rather than a link error on a build
+// that happens to be missing a feature."
+//
+// So the concrete backend's header is included only when its implementation will
+// be, and the resolver refuses BY NAME otherwise. The abstract base above and
+// the registry table below both stay unconditional: they have no link
+// dependency, and dropping the table would turn a specific refusal into
+// "Known: []".
+#ifdef OFLM_USE_HRX
+#define OFLM_DECISION_BACKEND_UNAVAILABLE 1
+#else
 #include "AutoDecisionModel/npue_decision.hpp"
+#endif
 
 /// Which backend serves which tag.
 enum class DecisionBackend { Npue };
@@ -48,6 +70,17 @@ inline std::unique_ptr<AutoDecisionModel> get_auto_decision_model(
     const std::string& model_tag, const std::filesystem::path& dir,
     const nlohmann::ordered_json* model_info = nullptr,
     int threads = 0) {
+#ifdef OFLM_DECISION_BACKEND_UNAVAILABLE
+    (void)dir;
+    (void)model_info;
+    (void)threads;
+    throw std::runtime_error(
+        "no decision engine for '" + model_tag +
+        "': this binary was built with the HRX runtime (OFLM_USE_HRX=ON), and "
+        "the decision backend is XRT-only. Reconfigure with -DOFLM_USE_HRX=OFF "
+        "to build the decision surface. The tag is known -- the backend behind "
+        "it was not compiled into this build.");
+#else
     const std::string tag = complete_simple_decision_tag(model_tag);
     const auto& reg = decision_backend_registry();
     const auto it = reg.find(tag);
@@ -75,4 +108,5 @@ inline std::unique_ptr<AutoDecisionModel> get_auto_decision_model(
     nlohmann::ordered_json empty = nlohmann::ordered_json::object();
     m->load_model(dir.string(), model_info ? *model_info : empty, threads);
     return m;
+#endif
 }
