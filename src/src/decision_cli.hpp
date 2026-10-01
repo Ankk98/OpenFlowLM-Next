@@ -127,6 +127,37 @@ inline int run(const program_args_t &args,
       throw std::runtime_error(
           args.input_file_name + " is not JSON");
 
+    // THE MODEL-IDENTITY GUARD, the same one the route applies, and for the same
+    // reason. A body that names a `model` other than the one this invocation
+    // loaded is a request for a model that is not being served. It used to be
+    // ignored here: the positional tag and --decisionmodel chose the engine, the
+    // body's `model` was never compared against them, and the response was
+    // rendered from the tag that ANSWERED -- so a caller that asked for one model
+    // and named another in the body got well-formed, confident answers from the
+    // first. That is the substitution the registry header warns about, reached
+    // through a second door.
+    //
+    // Checked BEFORE the load, so a mismatched request does not pay for a
+    // container, and compared EXACTLY as the route compares -- no cut_tag, no
+    // rectify. Two surfaces that normalise differently would disagree about what
+    // counts as the same model, which is the same class of bug as a response
+    // keyed by the wrong tag.
+    //
+    // Only when present and a string, and an empty value counts as absent: both
+    // are the route's rules, not this file's preferences.
+    if (parsed.contains("model") && parsed["model"].is_string()) {
+      const std::string asked = parsed["model"].get<std::string>();
+      if (!asked.empty() && asked != tag) {
+        throw std::runtime_error(
+            "this invocation has '" + tag + "' loaded, not '" + asked +
+            "'. One decision model is loaded per invocation; run `oflm decide " +
+            asked + "` for that one. Refusing rather than answering '" + asked +
+            "' from '" + tag + "' -- the response names the tag that answered, "
+            "so a caller comparing the two would see a disagreement it could not "
+            "explain.");
+      }
+    }
+
     // The entry is REQUIRED, not optional, and the reason is concrete: a model
     // that NESTS its files names the three subdirectories in its entry, and a
     // decision model with an empty entry cannot pack itself -- the packer is
