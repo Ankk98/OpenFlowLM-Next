@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -72,6 +73,24 @@ int main(int argc, char **argv) {
     const int64_t workers =
         argc > 4 ? std::stoll(argv[4])
                  : std::max(1u, std::thread::hardware_concurrency() / 2u);
+
+    // "fwd" runs the FULL head -- the two attention layers -- over the rows and
+    // prints the post-head state. It exists because `score` alone CANNOT validate
+    // the head: score is the readout (LayerNorm -> Linear -> GELU -> Linear) and
+    // skips the attention entirely, so a Q-scaling bug in the attention passed
+    // every score-based comparison at 7 significant figures while making the
+    // answers wrong. The rows are [k, d]; they are treated as [1, k, d] with all
+    // k positions real, which is the head's own contract for a gathered row.
+    if (std::getenv("LAYA_HEAD_FWD")) {
+      std::vector<float> h = rows;                 // [1, k, d]
+      std::vector<float> pad(static_cast<size_t>(k), 1.0f);
+      H.forward(h, pad, 1, k, workers);
+      std::printf("head state");
+      for (float v : h) std::printf(" %.9g", v);
+      std::printf("\n");
+      return 0;
+    }
+
     std::vector<float> logits;
     H.score(rows, 1, k, d, workers, logits);
 

@@ -1585,7 +1585,7 @@ identical request.
    references a `../../detail/` tree which no longer exists; the live path is the
    Makefile's `test:` target, which copies `model_list.json` beside the binary
    first. Do not treat `test.sh` as load-bearing in the new harness either.
-6. **Skill file** `.opencode/skill/open-laya-decision-kernels/SKILL.md`, per
+6. **Skill file** `.agents/skills/open-laya-decision-kernels/SKILL.md`, per
    `AGENTS.md`. `open-phi3-nanbeige-kernels` and `open-qwen36-kernels` are the
    templates. It must record: the prompt format, the twelve traps, the
    `tile_n` reasoning, the fact that T43/T44 of `vegah/Npu-Embeddings`
@@ -1620,7 +1620,7 @@ identical request.
 | `src/test/laya_decision_npu/` | harness | 9 |
 | `specs/open-engine/spec.md` | the five `OPEN-DECISION-*` / `OPEN-NPUE-MODERNBERT` requirements | 0 |
 | `specs/open-engine/plans/typesafe-systemone-0ffd094c.py` | the pinned wire schema (vendored, `_schemas/models.py` only) | 0, 6 |
-| `.opencode/skill/open-laya-decision-kernels/SKILL.md` | the skill | 9 |
+| `.agents/skills/open-laya-decision-kernels/SKILL.md` | the skill | 9 |
 
 
 ---

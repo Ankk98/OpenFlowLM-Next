@@ -382,7 +382,7 @@ Reusable, from the arch-4 (ModernBERT) port.
 
 When a second port needs this material:
 
-1. Move this file to `.opencode/skill/<name>/SKILL.md`, keep the frontmatter
+1. Move this file to `.agents/skills/<name>/SKILL.md`, keep the frontmatter
    `name`/`description`, and write a description that triggers on the *task*
    ("validating a numerical port", "gate passes but output looks wrong", "build
    filled the disk"), not on the topic.

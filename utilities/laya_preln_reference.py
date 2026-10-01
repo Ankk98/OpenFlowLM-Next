@@ -71,6 +71,7 @@ def load_safetensors(path):
 # subdirectories are not one prefix: the config and the weights are at different
 # depths under the served root.
 ROOT = {"ckpt": "multilingual", "config": "encoder"}
+_HEAD_STATE = None
 
 BF16_DISCARD = 16
 BF16_KEEP = np.uint64(0xFFFF0000)
@@ -330,7 +331,7 @@ def _gb(t, wkey, bkey):
             t[bkey].astype(np.float64) if bkey in t else None)
 
 
-def head(t, ids, markers, qtype, keep=None):
+def head(t, ids, markers, qtype, keep=None, x0=None):
     """The 2 head layers + the scorer, in float64, on the checkpoint's weights.
 
     `t` is the loaded safetensors dict, `ids` a single row, `markers` that row's
@@ -344,8 +345,17 @@ def head(t, ids, markers, qtype, keep=None):
     C = Config(cfg)
     d = C.hidden
     S = len(ids)
-    x = t["encoder.embeddings.tok_embeddings.weight"][list(ids)].astype(np.float64)
-    x = _ln(x, *_gb(t, "encoder.embeddings.norm.weight", "encoder.embeddings.norm.bias"), eps=C.eps)
+    if x0 is None:
+        x = t["encoder.embeddings.tok_embeddings.weight"][list(ids)].astype(np.float64)
+        x = _ln(x, *_gb(t, "encoder.embeddings.norm.weight",
+                        "encoder.embeddings.norm.bias"), eps=C.eps)
+    else:
+        # `x0` is the state the head should START from, so a caller can drive the
+        # engine's Head::forward and this on identical input. Without it the only
+        # comparable thing is the logits, i.e. only the readout -- and the
+        # readout matched at 7 significant figures while the attention was wrong
+        # by 8x, which is precisely how that bug shipped.
+        x = np.asarray(x0, dtype=np.float64).reshape(S, d).copy()
     cos, sin = rope_tables(S, C.head_dim, C.theta)
     pos = np.arange(S)
     keepm = np.ones(S, dtype=bool) if keep is None else np.asarray(keep, dtype=bool)
@@ -403,6 +413,8 @@ def head(t, ids, markers, qtype, keep=None):
         h = h + (f @ t[p + "linear2.weight"].astype(np.float64).T
                  + t[p + "linear2.bias"].astype(np.float64))
 
+    global _HEAD_STATE
+    _HEAD_STATE = h
     m = h[np.asarray(markers, dtype=int)]
     global _GATHERED
     # The gathered rows, returned alongside the logits. Comparing the logits
@@ -417,6 +429,36 @@ def head(t, ids, markers, qtype, keep=None):
                    + t["scorer.1.bias"].astype(np.float64))
     return (m @ t["scorer.3.weight"].astype(np.float64).T
             + t["scorer.3.bias"].astype(np.float64)).reshape(-1)
+
+
+def head_input(t, ids):
+    """The state the head starts from: token embeddings, post-LN. [S, d].
+
+    Hand this to the engine's `Head::forward` and to `head_state` on the same
+    `t`, and the two post-head states are directly comparable -- which is the
+    only way to test the head's ATTENTION rather than its readout.
+    """
+    x = t["encoder.embeddings.tok_embeddings.weight"][list(ids)].astype(np.float64)
+    C = Config(json.load(open(os.path.join(t["_root"], t["_cfg"], "config.json"))))
+    return _ln(x, *_gb(t, "encoder.embeddings.norm.weight",
+                       "encoder.embeddings.norm.bias"), eps=C.eps)
+
+
+def head_state(t, ids, x0=None):
+    """The post-head, pre-gather state for one row: [S, d].
+
+    This exists because `head()` returns the SCORER's output and discards the
+    tensor it gathered from, so the head's two ATTENTION layers had no oracle to
+    be compared against. That gap is not academic: the head's Q scaling was
+    wrong by 8x, and every comparison available at the time went through the
+    readout or through a cosine on the gathered rows, both of which it passed --
+    the readout at SEVEN significant figures.
+
+    Callers get the whole [S, d] state, so a test can drive the engine's
+    `Head::forward` on the same input and compare elementwise-ish.
+    """
+    head(t, ids, [0], 0, keep=[True] * len(ids), x0=x0)
+    return _HEAD_STATE
 
 
 def main():

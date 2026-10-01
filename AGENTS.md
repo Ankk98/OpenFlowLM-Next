@@ -27,13 +27,50 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
 
 <available_skills>
   <skill>
-    <name>npu_offload_pipeline</name>
-    <description>End-to-end workflow for offloading dense GEMM operations to AMD NPU2 via mlir-aie/iron. Use when: compiling NPU xclbins, integrating NPU backends into embedding/LLM engines, validating NPU vs CPU reference, debugging XRT dispatch issues, or extending to new model architectures.</description>
-    <location>.opencode/skill/npu_offload_pipeline.md</location>
+    <name>npu-offload-pipeline</name>
+    <description>AMD NPU2 Iron/mlir-aie kernel compilation, XCLBIN and closed-library replacement, open model engine integration, XRT dispatch, and CPU/NPU validation. Use when investigating or replacing precompiled NPU artifacts, building family XCLBIN bundles, extending q4nx-build, or debugging NPU offload.</description>
+    <location>.agents/skills/npu-offload-pipeline/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>upstream-prior-art</name>
+    <description>Check upstream for merged, open and in-flight work before starting a task, before editing anything in a synced or vendored directory, and again before any PR-ready verdict. Use at task start, when porting or rebasing a branch, on resume after a pause, and before declaring anything new or ship-ready.</description>
+    <location>.agents/skills/upstream-prior-art/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>host-discipline</name>
+    <description>Run heavy builds, model loads, test suites and benchmarks on a shared workstation without filling its disk or exhausting its RAM. Use when a job writes gigabytes, when choosing a scratch directory, setting -j, backgrounding long work, or setting up a benchmark. Also for "the disk is full", "the machine froze", "the screen went blank but it is still running".</description>
+    <location>.agents/skills/host-discipline/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>npu-profiling</name>
+    <description>Profile the NPU stack at every level that has a working tool - host C++, host/NPU boundary, AIE kernel, AIE graph, whole-system - and know which tools are present but inert. Use when asking where time goes, why an encode is slow, which host phase dominates, or when a profiling attempt produced artifacts but no data.</description>
+    <location>.agents/skills/npu-profiling/SKILL.md</location>
   </skill>
   <skill>
     <name>open-granite-kernels</name>
-    <description>Build, verify and ship the open XDNA2 kernel sets (dx ln lm_head_q4) that run IBM Granite 4.2 3B on the dense recipe. Use when rebuilding those xclbins, adding another Granite size, debugging "no open kernels found" for granite:3b, or when a Granite container's attention_multiplier is refused at load.</description>
-    <location>.opencode/skill/open-granite-kernels/SKILL.md</location>
+    <description>Build, verify and ship the open XDNA2 kernel sets (dx ln lm_head_q4) that run IBM Granite 4.2 3B on the dense recipe. Use when rebuilding those xclbins, adding another Granite size, debugging "no open kernels found" for a Granite tag installed with oflm-add, or when a Granite container's attention_multiplier is refused at load.</description>
+    <location>.agents/skills/open-granite-kernels/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>open-phi3-nanbeige-kernels</name>
+    <description>Build, verify and serve the open XDNA2 kernel sets for Phi-4-mini (the phi3 recipe: a 96-of-128 rotation and longrope) and Nanbeige4.1-3B (the llama3 recipe at 20 heads over 4). Use when re-exporting either, adding another Phi-3 or Nanbeige size, or when `oflm serve` segfaults on the first request for a model whose adapter casts to its closed engine class.</description>
+    <location>.agents/skills/open-phi3-nanbeige-kernels/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>open-qwen36-kernels</name>
+    <description>Build, verify and ship the open XDNA2 kernel sets (lx0 lx1 ax0 ax1 ln lm_head_q8) that the open Qwen3.6-MoE engine (src/open_qwen36) loads. Use when rebuilding those xclbins after a design change, checking a rebuild against a previous one, packaging them for a release, or debugging "no open kernels found" at model load.</description>
+    <location>.agents/skills/open-qwen36-kernels/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>openflowlm-packaging</name>
+    <description>Build and ship the OpenFlowLM Linux distribution (engine + open xclbins + bundled utilities) as RPM/TGZ (and DEB on Debian/Ubuntu). Use when producing a release, changing the install prefix or PATH handling, editing src/CMakeLists.txt install/CPack rules or CMakePresets package/workflow presets, or debugging "no manual steps" install problems.</description>
+    <location>.agents/skills/openflowlm-packaging/SKILL.md</location>
   </skill>
 </available_skills>
+
+Skills live in `.agents/skills/<name>/SKILL.md` as the single source (the Agent Skills
+open standard). `.claude/skills/<name>` and `.opencode/skill` are checked-in
+symlinks to it, never copies. Cursor, Codex and Gemini read `.agents/skills/`
+natively. The flat `npu_offload_pipeline.md` became
+`.agents/skills/npu-offload-pipeline/references/full-workflow.md`, which the
+skill references; skill bodies stay under 500 lines.

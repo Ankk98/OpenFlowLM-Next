@@ -24,9 +24,12 @@ Requirements (assumed present, or set up here):
   * third_party/mlir-aie cloned here (best-effort; only used for toolchain.json
     version metadata).
 
-Why Python 3.11: the installed XRT build ships pyxrt (its Python binding) for
-3.11 only, and the open_npue export needs it. mlir-aie 1.4.2 and the llvm-aie
-(Peano) wheel support 3.11, so one venv serves both families.
+Why Python 3.14: the XRT build on this host ships pyxrt (its Python binding)
+for 3.14 only (a cpython-314 .so under /opt/xilinx/xrt/python), and the
+open_npue export needs it. mlir-aie 1.4.2 and the llvm-aie (Peano) wheel
+support 3.14, so one venv serves both families. If your XRT ships pyxrt for
+a different Python, set PYTHON below to match (check /opt/xilinx/xrt/python
+for the cpython-*.so tag).
 
 This SCRIPT is Linux-only -- its venv/path handling (`/opt/xilinx/xrt`,
 `bin/python`, `lib/python*/site-packages/...`) is POSIX-specific, so the CMake
@@ -36,7 +39,7 @@ it drives is not: `open_kernels/export_qwen36_kernels.py` and
 win_amd64 wheels, and a native Windows toolchain (`iron_setup.py`, a
 downloaded XRT SDK zip -- see mlir-aie's `docs/buildHostWinNative.md`, no WSL
 and no source build required) has built and run open_kernels sets on
-hardware (`.opencode/skill/open-granite-kernels/SKILL.md`). `open_npue`'s
+hardware (`.agents/skills/open-granite-kernels/SKILL.md`). `open_npue`'s
 export additionally needs pyxrt and an installed NPU, which the Windows XRT
 SDK also supplies (for its own pyxrt-compatible Python version).
 """
@@ -66,8 +69,9 @@ XRT_ROOT = Path("/opt/xilinx/xrt")
 XRT_BIN = XRT_ROOT / "bin"
 XRT_PY = XRT_ROOT / "python"
 
-# pyxrt is built for 3.11 by the installed XRT; pin the venv to match.
-PYTHON = "3.11"
+# pyxrt is built for 3.14 by this host's XRT (see /opt/xilinx/xrt/python);
+# pin the venv to match. Adjust if your XRT ships a different cpython-*.so.
+PYTHON = "3.14"
 
 
 def venv_python() -> Path:

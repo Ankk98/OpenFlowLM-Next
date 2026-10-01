@@ -1,0 +1,425 @@
+---
+name: npu-profiling
+description: Profile this repo's NPU stack at every level that has a working tool - host C++, host/NPU boundary, AIE kernel, AIE graph, and whole-system. Use when asking where time goes, why an encode is slow, which host phase dominates, whether a kernel is efficient, what a dispatch actually does, or when a profiling attempt produced artifacts but no data. Records what was measured working and what is present-but-inert, so a dead end is not re-explored.
+---
+
+# NPU profiling, by level
+
+**The thesis, and it is the whole skill:** on this stack you can profile the host
+thoroughly, inspect the NPU statically, and read exactly **one** NPU-side runtime
+signal -- the power rail. There is **no AIE activity percentage, no per-kernel
+timer, and no working trace**.
+
+That is narrower than a first pass suggests, and getting it narrower is the point.
+A source-level survey of `~/repos/xdna-driver` (which matches the installed module
+exactly -- see §5.4) found that the driver *holds* a per-column busy counter,
+`u16 npu_busy[AMDXDNA_NPU_MAX_PMF_COLUMNS]`, and exposes it as
+`AMDXDNA_SENSOR_TYPE_COLUMN_UTILIZATION`. So the data exists. What is missing is
+anything that reads it: hwmon wires up only power and temperature, `amd-smi` does
+not report the AIE at all, and the ioctl path is not wired to a tool here. §4.3
+has the ABI so the next person can finish it.
+
+That is a property of the build, not of the tooling in general -- and it was
+established by measurement, not by absence of evidence. The evidence is in §5.
+
+Read `host-discipline` for the whole-system level (power, DRAM bandwidth, clocks,
+one-run-at-a-time). This skill covers everything below that.
+
+---
+
+## 1. The map
+
+| level | tool | status | gives you |
+|---|---|---|---|
+| whole system | `amd-smi metric`, `sensors` | works | DRAM MB/s, package W, per-core clocks/residency |
+| application | the `utilities/*_rig.cpp` rigs | works | phase timers, and the ids/markers the oracle needs |
+| **host C++** | **gprof** (`-pg` build) | **works -- richest** | function-level host ranking with call counts |
+| host C++ | `gdb` sampling | available | poor-man's profile, no rebuild |
+| host C++ | `strace -c` | works | syscall/ioctl counts per dispatch |
+| **host->NPU boundary** | in-repo phase timers | **partly broken** | `t_npu` reads **0.0000**; host phases are fine |
+| host->NPU boundary | `/proc/<pid>/fdinfo` | works | per-client NPU **memory** only |
+| **AIE kernel** | **`aiebu-dump -p/-d -m aie2ps`** | **works** | opcode histogram, full disassembly, group binding |
+| **AIE graph** | **`xclbinutil --dump-section :JSON:`** | **works** | `ip_layout`, `connectivity`, `group_topology` |
+| AIE graph | `mlir_aie` Python API | **broken here** | see §5.2 |
+| **NPU device counters** | hwmon power only | **one signal** | power in mW; temperature N/A; activity % unreachable |
+| NPU trace | `xrt-capture` / `xrt-replay` | **inert** | copies the xclbin, records nothing (§5.1) |
+
+---
+
+## 2. Host C++ -- gprof is the best tool here
+
+The in-repo timers give phases; **gprof gives functions**, and it contradicts
+them. Build the rig with `-pg`:
+
+```bash
+S="${XDG_CACHE_HOME:-$HOME/.cache}/scratch-prof"; mkdir -p "$S"   # never tmpfs
+R=/home/ankk98/repos/OpenFlowLM-Next; cd "$R"
+U="npue_encoder npue npu_device npue_pack json_min xlmr_tokenizer_gen \
+gemma_tokenizer_gen bbpe_tokenizer_gen tokenizer_bbpe tokenizer_xlmr \
+tokenizer_gemma tokenizer gemma_kernels gemma_encode"
+SRC=""; for u in $U; do SRC="$SRC src/open_npue/$u.cpp"; done
+g++ -std=c++17 -O2 -pg -g -mavx512f -mavx2 -mfma -o "$S/rigpg" \
+    utilities/laya_preln_rig.cpp $SRC -Isrc/open_npue -I/opt/xilinx/xrt/include \
+    -L/opt/xilinx/xrt/lib64 -lxrt_coreutil -Wl,-rpath,/opt/xilinx/xrt/lib64
+(cd "$S" && ./rigpg <container> $R/src/xclbins/<family> ids.txt >/dev/null)
+gprof -b -p "$S/rigpg" "$S/gmon.out" | head -20
+```
+
+Measured on the Laya bf16 family, 1024 tokens, 88 dispatches:
+
+```
+ %  self s   calls  name
+39.41  0.80    161  Encoder::softmax_cpu(...)::{lambda(int,int)#1}
+22.66  0.46    160  Encoder::av_impl<8>(...)::{lambda(int,int)#1}
+12.32  0.25    158  Encoder::qk_impl<8>(...)::{lambda(int,int)#1}
+ 7.88  0.16    169  Encoder::swiglu_cpu(...)::{lambda(int,int)#1}
+ 6.40  0.13     88  Encoder::gemm(...)            1.48 self / 2.40 total ms/call
+ 2.96  0.06    346  Encoder::layer_norm_cpu(...)
+```
+
+**Softmax is the top host cost, not GELU** -- the in-repo timer ranks
+`hostgelu` (0.36 s) above `hostsm` (0.145 s), gprof ranks softmax at 0.80 s. Both
+can be right: the timers are **wall-clock per section**, gprof is **CPU-time
+sampled process-wide**, and the encoder is threaded. **Never compare the two
+directly**, and say which one a number came from.
+
+`gemm`'s 88 calls x 2.40 ms ≈ **211 ms of NPU-path cost** -- which is also the
+answer to "why does `t_npu` say zero" (§3).
+
+Notes: gprof needs the `-pg` build, so it is a *separate binary*; `-O2` is fine and
+the ranking is what matters, not the absolute numbers. Because the hot code is
+`std::function` lambdas in headers, symbol names are long -- `c++filt` helps.
+`gprof` with no `-pg` binary produces an empty profile, silently.
+
+---
+
+## 3. The in-repo phase timers -- and the `t_npu` trap
+
+`npue_encoder.hpp` accumulates a genuinely good decomposition. **The rigs are the
+only place it is reported**; `src/` accumulates and never prints.
+
+```bash
+$S/rig <container> <designs> ids.txt 2>&1 >/dev/null
+```
+
+```
+timers  npu 0.0000  attn 0.1180 (qk 0.0480  av 0.0700)  hostln 0.0090
+        hostsm 0.1453  hostgelu 0.3602  dispatches 88
+```
+
+Fields: `t_npu` (memcpy+sync+dispatch), `t_attn` split `t_qk`/`t_av`, host
+`t_hostln`/`t_hostsm`/`t_hostgelu`, and further splits `t_conv` (fp32↔bf16),
+`t_in` (`sync_to_device`), `t_disp` (`kernel()`+wait), `t_out`
+(`sync_from_device`), `t_bias`, plus `n_dispatch` (88 = 22 layers x 4 ops).
+
+### `t_npu` reads 0.0000, reproducibly
+
+Two independent runs: `npu 0.0000` both times, while everything else moved
+within noise (`attn` 0.1180/0.1200, `hostgelu` 0.3602/0.3527). So in the
+fused-epilogue configuration **the host↔device time is not being measured at
+all**, and the single most important number for an NPU-offload profile is the one
+that is absent.
+
+Consequences, and they are the practical reason to care:
+
+* You **cannot** split the encode into memcpy / conversion / sync / dispatch with
+  these counters. The fields exist and are zero.
+* Wall minus the host timers is where the device time hides, but it is a
+  *remainder*: it contains the DMA, the sync, the dispatch and anything
+  unaccounted, and nothing in the tree separates them.
+* **gprof is the workaround**: `gemm`'s per-call total (2.40 ms x 88) puts a
+  number on the NPU path that `t_npu` refuses to report.
+
+Do not "fix" a profile by trusting `t_npu`, and do not conclude the NPU is free.
+
+---
+
+## 4. Static views -- the NPU kernel and the AIE graph
+
+These are the only NPU-level views that work, and they are **static**: a profile
+of the compiled code, not of a run.
+
+### 4.1 AIE kernel: `aiebu-dump`
+
+The per-tier, per-op instruction binaries under a family's `gemm_rtp/` are the
+kernel-level artifacts (`insts_qkv_b4.bin`, `insts_attn_out_b16.bin`, …).
+
+```bash
+A=/opt/xilinx/xrt/bin            # NOT on PATH
+I=src/xclbins/BERT-h768-gated-i1152-bf16/gemm_rtp/insts_qkv_b4.bin
+
+$A/aiebu-dump -p -m aie2ps $I    # opcode frequency
+$A/aiebu-dump -d -m aie2ps $I    # full disassembly
+```
+
+```
+v0.1, gen4
+6x8 M1
+35856B, 992ops
+XAIE_IO_WRITE                352      XAIE_IO_MASKPOLL        0
+XAIE_IO_BLOCKWRITE           256      XAIE_IO_PREEMPT         0
+XAIE_IO_MASKWRITE             64      XAIE_IO_NOOP            0
+XAIE_IO_CUSTOM_OP_TCT         64      XAIE_IO_CUSTOM_OP_RECORD_TIMER  0
+XAIE_IO_CUSTOM_OP_DDR_PATCH  256      XAIE_IO_CUSTOM_OP_MERGE_SYNC   0
+```
+
+Read it as: the kernel is a **6x8** AIE2P design in 992 ops; it streams in with
+`BLOCKWRITE` and issues `TCT` (token control) 64 times; and it contains
+**no `NOOP`, no `PREEMPT`, no polling** -- a tight kernel with no idle spin.
+
+**`XAIE_IO_CUSTOM_OP_RECORD_TIMER` is 0.** That is the important line: the compiled
+kernels carry **no hardware timer instrumentation**, so per-kernel cycle counts
+would require rebuilding with timer ops. There is no post-hoc way to get them.
+
+`-m aie2ps` is required (the device is AIE2P / "NPU Strix Halo"). **With no flags
+`aiebu-dump` exits 0 and prints nothing** -- silent, not an error.
+
+### 4.2 AIE graph: `xclbinutil` on the shipped xclbin
+
+This works on the **built artifact**, so it answers "what did we actually ship".
+
+```bash
+X=src/xclbins/BERT-h768-gated-i1152-bf16/gemm_rtp/final.xclbin
+/opt/xilinx/xrt/bin/unwrapped/xclbinutil --dump-section ":JSON:$S/meta.json" --input $X
+# -> ip_layout, connectivity, group_connectivity, group_topology
+```
+
+`group_topology` is the graph-level counterpart of the `.attach_to_group 0..7`
+lines in the disassembly -- the same eight groups seen from both sides. The wrapper
+at `/opt/xilinx/xrt/bin/xclbinutil` does **not** support `--dump-partinfo`; use
+the `unwrapped/` binary and the empty-section `:JSON:` form.
+
+---
+
+### 4.3 NPU column utilisation: the ABI, and a half-finished probe
+
+`utilities/npu-sensors.cpp` is a started probe for this. It builds and runs, but
+**it currently reads 0 records** -- so treat it as a specification, not a tool.
+
+What is known, from the driver source that matches the running module:
+
+```c
+/* drivers/accel/amdxdna/amdxdna_sensors.h */
+struct amdxdna_sensors {
+        u16 npuclk_freq;
+        u16 npu_busy[AMDXDNA_NPU_MAX_PMF_COLUMNS];   /* <-- per-column busy */
+        u16 npu_power;                                 /* milliwatts */
+        u16 mpnpuclkfreq, npu_temp;
+};
+```
+
+`amdxdna_query_sensors()` (same file, `amdxdna_sensors.c:49`) fills a
+caller-supplied buffer with `struct amdxdna_drm_query_sensor` records:
+
+| record | `type` | `units` | `unitm` |
+|---|---|---|---|
+| Total Power | `AMDXDNA_SENSOR_TYPE_POWER` | `mW` | -3 |
+| Temperature | `AMDXDNA_SENSOR_TYPE_TEMPERATURE` | `C` | 0 |
+| Column %d Utilization (one per column) | `AMDXDNA_SENSOR_TYPE_COLUMN_UTILIZATION` | `%` | 0 |
+
+Reached with the standard DRM info ioctl:
+
+```c
+struct amdxdna_drm_get_info { __u32 param; __u32 buffer_size; __u64 buffer; };
+info.param = DRM_AMDXDNA_QUERY_SENSORS;      /* include/uapi/drm/amdxdna_accel.h */
+/* pass buffer_size = 0 first: the kernel writes the size it needs */
+ioctl(fd, DRM_IOCTL_AMDXDNA_GET_INFO, &info);
+```
+
+Header for the ABI: `~/repos/xdna-driver/include/uapi/drm/amdxdna_accel.h`.
+
+**Two open questions, in order:**
+
+1. **Why 0 records?** `amdxdna_get_sensors()` demonstrably *works* -- hwmon reads
+   power from it -- so a 0-byte reply is about the ioctl path, not the data. Likely
+   candidates: the `param` value, a required hwctx, or `total_col` being 0 for the
+   node the probe opened. `aie2_pci.c:855` passes `ndev->total_col`, so a probe on
+   the wrong node would report no columns.
+2. **`amdxdna_drm_query_sensor.label` is not NUL-terminated** (the driver
+   `scnprintf`s into a fixed 64-byte field). `%s` on it runs into the rest of the
+   record. The probe copies it into a bounded buffer; keep that.
+
+If this is finished, it replaces the biggest gap in this skill: a real NPU
+utilisation number, per column, while a run is in flight.
+
+**Until then, the honest NPU-side runtime picture is: power, and nothing else.**
+Presence is still available via `xrt-smi examine -r aie-partitions`.
+
+## 5. What is present but inert -- do not re-explore these
+
+### 5.1 `xrt-capture` / `xrt-replay` capture nothing
+
+```bash
+/opt/xilinx/xrt/bin/unwrapped/xrt-capture --frames 3 --output-dir $S/cap -- ./rig ...
+# rc=0, two artifacts, 130711 bytes. Looks like a profile.
+```
+
+It is not one:
+
+```
+final.xclbin  : 130526 bytes  md5=d6646add2f2159c0d655045635fe3c41
+capture_0.bin : 130526 bytes  md5=d6646add2f2159c0d655045635fe3c41   IDENTICAL
+replay.json   : frames/threads/buffers/hwctxs/kernels/runs = all null
+```
+
+`capture_0.bin` **is the xclbin, byte for byte**, and the replay manifest is empty.
+XRT's profiling support is not compiled into this build -- consistent with
+`pyxrt` containing **zero** profile-related strings. So there is no AIE execution
+trace, no PC sampling, and no way to get one without an XRT rebuild.
+
+**This is the cleanest example in the repo of the rule in §6: exit 0 plus
+plausible artifacts is not measurement.** Always `md5sum` the capture and check it
+is not the input.
+
+### 5.2 The `mlir_aie` Python API does not import
+
+```python
+import mlir_aie   # succeeds
+len([x for x in dir(mlir_aie) if not x.startswith('_')])   # -> 0
+```
+
+Three faults, all silent:
+
+1. both `ironvenv/lib*/python3.14/site-packages/aie.pth` contain the **relative**
+   path `mlir_aie/python`, so they resolve only from some CWDs;
+2. there are two site-packages trees (`lib` and `lib64`) and the `.pth` is
+   duplicated across both;
+3. `mlir_aie/python/aie/compiler/` has **no `__init__.py`**, so
+   `from aie.compiler import compile_xclbin` fails with *unknown location* -- a
+   namespace package, not a real one.
+
+The package is also named **`aie`**, not `mlir_aie`. An empty import is the symptom
+of all three.
+
+**This does not block kernel building**, because the repo does not use the Python
+API: `utilities/export-kernels.py` shells out to **`clang` (Peano), `xclbinutil`
+and `aiebu-asm`**, and uses `third_party/mlir-aie` only for `MLIR_AIE_ROOT`.
+
+### 5.3 Two claims this skill previously made, both of which were MY measurement errors
+
+Recorded because the corrections are more useful than the claims were.
+
+**"NPU power is 1000x wrong."** It is not. The driver is correct and the channel
+works:
+
+```
+/sys/class/hwmon/hwmon12/power1_input   0 -> 885000 -> 25000   (µW)
+sensors -> NPU_power                    0.00 mW -> 885.00 mW -> 25.00 mW
+```
+
+`amdxdna_sensors.c` does `npu_power * MICROWATT_PER_MILLIWATT` into hwmon's µW
+convention, and the field is a `u16` of milliwatts, so 885 mW is 0.885 W of NPU
+rail. The "755 W" that started this was a shell line of mine that read the number
+and then appended a hardcoded `W`:
+
+```bash
+printf "%s W" "$(sensors | grep NPU_power | grep -oE '[0-9.]+')"   # 755 mW -> "755 W"
+```
+
+**Print the unit the tool gives you.** The bug was in the measurement.
+
+**"The fdinfo busy counter is frozen."** Not established. The accounting *is*
+wired -- `amdxdna_io_stats_job_start()` at `drivers/accel/amdxdna/aie2_ctx.c:448`,
+`job_done()` at `:298` and `:353` -- and the accessor adds in-flight time whenever
+`job_depth > 0`. The counter is per-`drm_file` and reads
+`job->hwctx->client`, so it belongs to **the client that owns the hardware
+context**. My sampling read only the *first* `/dev/accel/accel0` fd it found, and
+XRT opens several; I was probably reading a context that was not dispatching. To
+settle it, sample **every** accel fd of the process, twice.
+
+### 5.4 Where the source is, and that it matches what is running
+
+`~/repos/xdna-driver` is the open driver stack, and the correspondence is exact:
+
+```
+installed module : amdxdna 2.25.0_20260628,e2d8f832ad1745bab50b236bff4d8550c85b7f78
+local HEAD       : e2d8f83  (origin https://github.com/amd/xdna-driver.git)
+```
+
+So source-level conclusions from that tree apply to the running driver without
+version anxiety. It also carries `xrt/` as a submodule of `https://github.com/Xilinx/XRT.git`,
+and that submodule is **exactly the installed XRT**:
+
+```
+submodule HEAD : 0026185de81a179dc7d886197d3e35f9a179b4e8
+installed XRT  : XRT Build Version: 2.25.0 (HEAD)
+                 Hash ID: 0026185de81a179dc7d886197d3e35f9a179b4e8
+```
+
+(`xclbinutil` prints the hash on any invocation, which is how to check this
+without guessing.) Its `CHANGELOG.rst` stops at 2.17.0, so **the changelog is
+stale, not the checkout** -- an earlier version of this file said the submodule was
+out of date on the strength of that changelog, and was wrong. So source-level
+conclusions from this tree apply to the running driver *and* the running XRT.
+
+
+
+| thing | symptom |
+|---|---|
+| `aiebu-dump` with no `-p`/`-d` and no `-m` | exit 0, **empty output** |
+| `aiebu-dump`, `aiebu-asm`, `xclbinutil` | **not on PATH**; `/opt/xilinx/xrt/bin/{,unwrapped/}` |
+| `aiebu-dump` (bare name) | "No such file or directory" -- the PATH entry that looks right is `bin/`, and the tool is in `unwrapped/` for some, `bin/` for others. Check both. |
+| `AGENTS.md`'s `source utilities/mlir-aie/utils/env_setup.sh` | **that path does not exist.** Peano is `ironvenv/lib/python3.14/site-packages/llvm-aie/bin` (21 tools, `clang` 21.0.0 Xilinx llvm-aie), and AGENTS.md also says Python 3.12 where it is 3.14. |
+| `/sys/kernel/debug/amdxdna/` | debugfs is mounted but **empty** -- no driver counters |
+| `intel-rapl` | present, `enabled=0`, reads nothing on AMD |
+| `sensors` -> `NPU_power` | ~1000x too large; see `host-discipline` §7.2.1 |
+| `drm-engine-amdxdna_accel_driver` in fdinfo | per-**file** submit time; you must read the fd owning the hwctx |
+| `perf`, `valgrind`, `py-spy`, `ltrace`, `turbostat`, `sysstat`, `numactl`, `cpupower`, `ryzen_smu` | **all absent** -- no uncore/IMC hardware counters, no `mpstat`/`pidstat` |
+
+---
+
+## 6. The rule that keeps this from wasting a day
+
+> **A tool that produced artifacts has not measured anything. Check the artifact.**
+
+Every false positive here looked fine:
+
+* `xrt-capture` -> rc 0, 130 KB of artifacts, all nulls, and a byte-identical copy
+  of the input;
+* `aiebu-dump` -> rc 0, no output, because it needed flags;
+* `sensors` NPU power -> a confident two-digit number, 1000x wrong;
+* fdinfo busy time -> a plausible nanosecond counter that never moved;
+* the in-repo `t_npu` -> present, named, documented, and zero.
+
+The checks that catch all five: `md5sum` the artifact against the input; sample a
+counter **twice during known work** and confirm it moves; cross-check a magnitude
+against an independent source; and treat a documented field that always reads zero
+as absent, not as a fast path.
+
+---
+
+## 7. A working recipe, end to end
+
+For "where does the encode go", on this stack:
+
+1. **One run at a time** (`host-discipline` §3), scratch on a real filesystem.
+2. **gprof** for the host function ranking (§2). This is the primary tool.
+3. **The rig's timers** for the phase view, **knowing `t_npu` is 0** (§3), and take
+   `gemm`'s per-call total from gprof as the NPU-path number.
+4. **`strace -c -e trace=ioctl,mmap,openat`** for the dispatch shape. Measured:
+   265 `mmap`, **504 `ioctl`** for 88 dispatches (~5.7 per dispatch), 69 `openat`.
+   A sudden change in the ioctl-per-dispatch ratio means the command queue changed
+   shape, which matters more than the absolute count.
+5. **`aiebu-dump -p -m aie2ps`** per kernel to confirm the shipped code is the code
+   you think (§4.1).
+6. **`xclbinutil` metadata** to confirm the shipped graph/tile layout (§4.2).
+7. **`amd-smi metric`** for DRAM MB/s and package W during the run, so "the host is
+   the bottleneck" and "the device is starved of bandwidth" can be told apart
+   (`host-discipline` §7.2).
+8. **Repeat interleaved, >=3 reps, and report the spread.** If arms overlap within
+   noise, the answer is "no measurable difference".
+
+## 8. Rules
+
+- **One run at a time; scratch never on tmpfs** (`host-discipline`).
+- **gprof needs its own `-pg` binary**; never run it against a non-instrumented one.
+- **Never compare gprof's CPU-time to the timers' wall-clock.** Label which.
+- **Treat `t_npu == 0` as "not measured"**, and take the NPU-path number from
+  `gemm`'s per-call total instead.
+- **AIE kernel and graph inspection are static.** They describe the artifact, never
+  the run.
+- **There is no runtime NPU counter.** Do not promise one, and do not synthesise a
+  substitute from a counter that does not move.
+- **Check the artifact, not the exit code** (§6).
+- **Keep a "dead ends" list** -- §5 exists so the next person does not spend a day
+  re-proving that `xrt-capture` is inert.

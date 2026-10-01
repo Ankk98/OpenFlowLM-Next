@@ -245,9 +245,35 @@ void Head::forward(std::vector<float> &h, const std::vector<float> &pad,
     // in_proj is fused) and not inside the reduction (which rounds every
     // product separately). The encoder's packer folds the same factor into its
     // Q block; this one is packed plain, so the fold happens here.
+    //
+    // ONE ROW AT A TIME, and Q's third of THAT row.
+    //
+    // This was one flat loop over the first `R * S * d` elements of a
+    // `[R * S, 3*d]` buffer. A flat prefix of that length is not "every token's
+    // Q": it is the first R*S/3 tokens' Q, K AND V, and nothing at all for the
+    // rest. With head_dim 64 the factor is 1/8, so an early token's scores came
+    // out 8x too small (Q and K both scaled, so 1/64 of the intended product)
+    // with its V also 8x too small, and every LATE token kept an unscaled Q,
+    // making its scores 8x too large. The attention was wrong in both
+    // directions, on different tokens -- not approximately right.
+    //
+    // It survived because COSINE CANNOT SEE IT. The post-head residual has RMS
+    // 199 with outliers past 240, so a corrupted attention CONTRIBUTION is a
+    // small perturbation of a large stream: the gathered marker rows still
+    // measured 0.999 against the float64 oracle. The argmax gate did see it --
+    // 0.60 agreement over 60 pairs -- and that was written off as "datapath
+    // error versus model margin". This bug is not that, and the margin claim
+    // has to be re-measured now it is gone.
+    //
+    // The oracle's equivalent is `q = q / np.sqrt(Dh)` on the `[S, Nh, Dh]` Q
+    // slice: per token, Q only. This is the same operation, and the stride is
+    // the whole point.
     {
       const float sc = 1.0f / std::sqrt(static_cast<float>(head_dim_));
-      for (int64_t i = 0; i < R * S * d; ++i) qkv_[static_cast<size_t>(i)] *= sc;
+      for (int64_t i = 0; i < R * S; ++i) {
+        float *row = qkv_.data() + i * 3 * d;
+        for (int64_t j = 0; j < d; ++j) row[j] *= sc;
+      }
     }
     parallel(workers, [&](int wi, int ni) {
       const int64_t pairs = R * heads_;
