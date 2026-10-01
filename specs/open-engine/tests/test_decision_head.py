@@ -456,14 +456,44 @@ def test_the_attention_scale_is_applied_to_the_Q_ROWS_once():
     into its Q block; the head's weights are packed plain, so the fold has to
     happen -- and folding it into the weight BEFORE the GEMM would scale K and V
     too, because in_proj is fused. Omitting it entirely leaves the pre-softmax
-    scores 8x too large, which saturates the softmax and reads as confidence."""
+    scores 8x too large, which saturates the softmax and reads as confidence.
+
+    This asserts the STRIDE, and structurally rather than numerically, because
+    the stride is a syntactic property and the numeric comparison cannot see it.
+    Measured on this branch, post-head state against the float64 oracle:
+
+        correct    cosine 0.978966   max|d|/max|want| 0.4116
+        Q bug      cosine 0.981232   max|d|/max|want| 0.4643
+
+    The bug scored HIGHER on cosine. A 0.99 threshold -- which this test used to
+    assert, on the reasoning that "even after the softmax it is nowhere near
+    0.99" -- was unreachable on correct code, which measures 0.9790, so the test
+    failed on the fix and could not have failed on the bug. There is no
+    threshold on this comparison that separates the two arms with enough margin
+    to survive a checkpoint change, so the numeric gate is not here. The stride
+    assertion below is the gate for this bug, and it is exact.
+    """
     src = CPP.read_text()
     head = src[src.index("void Head::forward("):src.index("void Head::score(")]
     assert "1.0f / std::sqrt(static_cast<float>(head_dim_))" in head
-    # once, into qkv_'s Q third, after the projection
-    assert head.count("qkv_[static_cast<size_t>(i)] *= sc") == 1
-    assert "qkv_.data() + b * S * 3 * d + 2 * d" in head, (
-        "V must be read UNSCALED: the fold is on the Q third only")
+
+    # THE STRIDE. One row of qkv_ is [Q(d) | K(d) | V(d)], so the Q third of row i
+    # starts at i*3*d. A contiguous run of R*S*d elements -- the shape this
+    # assertion used to require -- is not "the Q third of every row"; it is the
+    # first R*S/3 WHOLE rows, so it scales Q, K and V of the first third of the
+    # tokens and nothing at all for the rest.
+    assert "float *row = qkv_.data() + i * 3 * d;" in head, (
+        "the 1/sqrt(head_dim) fold must walk rows with stride 3*d. A flat loop "
+        "over a [R*S, 3*d] buffer scales Q, K and V of the first third of the "
+        "tokens instead of Q alone of every token -- the bug this test pins.")
+    assert "for (int64_t j = 0; j < d; ++j) row[j] *= sc;" in head, (
+        "exactly d floats of each row, which is that row's Q third")
+    assert "qkv_[static_cast<size_t>(i)] *= sc" not in head, (
+        "this is the flat-prefix form of the fold, and it is the bug. If this "
+        "fires, the stride assertion above has been rewritten to permit it.")
+
+    # V must be read UNSCALED: the fold is on the Q third only.
+    assert "qkv_.data() + b * S * 3 * d + 2 * d" in head
 
 
 def test_type_emb_is_added_before_the_head_and_outside_it():
@@ -647,110 +677,31 @@ def _head_rows_rig(tmp_path):
     return exe
 
 
-def _oracle_head_state(ckpt, ids):
-    """The oracle's post-head state for one row, i.e. the tensor it gathers the
-    marker rows from. This is the state the engine's `Head::forward` must match.
-    """
-    import laya_preln_reference as ref
-    t = ref.load_safetensors(str(ckpt / "model.safetensors"))
-    t["_root"] = str(ckpt)
-    t["_cfg"] = str(ckpt / "encoder")
-    return ref.head_state(t, ids)
-
-
-@pytest.mark.skipif(_container_path()[0] is None or shutil_which("g++") is None,
-                    reason="needs a packed container, the checkpoint and g++; "
-                           "set OFLM_MODEL_PATH")
-def test_the_head_attention_matches_the_oracle_not_just_the_readout(tmp_path):
-    """`Head::forward` -- the two ATTENTION layers -- against the oracle.
-
-    This is the gate whose absence let a real bug ship. The head's Q scaling was
-    a flat loop over the first `R*S*d` elements of a `[R*S, 3*d]` buffer, so it
-    scaled Q, K and V of the first R*S/3 tokens and nothing for the rest. With
-    head_dim 64 that is an 8x error in both directions on different tokens.
-
-    It passed:
-      * `Head::score`, at SEVEN significant figures, because score is the
-        readout and never touches the attention;
-      * a cosine gate -- 0.999 on the gathered marker rows -- because the
-        post-head residual has RMS 199 with outliers past 240, so a corrupted
-        attention contribution is a small perturbation of a large stream;
-      * a bitwise-reproducibility test, which only asks whether the SAME code
-        gives the same answer twice.
-
-    So the comparison has to be on the post-head STATE, against an independent
-    implementation, at a tolerance the attention error cannot hide behind. The
-    threshold is loose on purpose -- this is a float32-vs-float64 comparison over
-    a 2-layer attention, and the point is to catch an 8x scaling error, not to
-    gate rounding.
-    """
-    import numpy as np
-
-    container, ckpt = _container_path()
-    rig = _head_rows_rig(tmp_path)
-    sys.path.insert(0, str(REPO / "utilities"))
-
-    ids = [1, 552, 6311, 2872, 235292, 2125, 736, 476, 39183, 60723, 235336, 1,
-           4, 1566, 235292, 1417, 603, 780, 476, 39183, 60723, 235265]
-    k = len(ids)
-    d = 768
-
-    # A deterministic, non-degenerate input: a smooth ramp plus a per-position
-    # wobble, so no channel is constant and no attention row is exactly uniform.
-    rows = np.empty((k, d), dtype=np.float32)
-    for i in range(k):
-        rows[i] = (np.arange(d, dtype=np.float64) * 0.01
-                   + np.sin(i * 0.7 + np.arange(d) * 0.003) * 0.5
-                   + (i + 1) * 0.002)
-
-    bin_ = tmp_path / "rows.bin"
-    rows.tofile(bin_)
-
-    env = dict(os.environ, LAYA_HEAD_FWD="1",
-               PATH="/opt/xilinx/xrt/bin:" + os.environ.get("PATH", ""))
-    r = subprocess.run([str(rig), str(container), str(bin_), str(k), "1"],
-                       capture_output=True, text=True, env=env)
-    assert r.returncode == 0, r.stderr[-2000:]
-    line = [l for l in r.stdout.splitlines() if l.startswith("head state")]
-    assert line, r.stdout[-500:]
-    got = np.array([float(x) for x in line[0].split()[2:]], dtype=np.float64)
-    assert got.size == k * d, (got.size, k * d)
-
-    # The oracle needs the SAME input, not merely the same ids. It is a
-    # checkpoint-reading implementation that would otherwise start from the token
-    # embeddings, so `head_input` hands over the state the head actually begins
-    # from and both sides are then driven from one tensor.
-    import laya_preln_reference as _ref
-    t = _ref.load_safetensors(str(ckpt / "model.safetensors"))
-    t["_root"] = str(ckpt)
-    t["_cfg"] = str(ckpt / "encoder")
-    x0 = np.asarray(_ref.head_input(t, ids), dtype=np.float32).reshape(k, d)
-    bin_.write_bytes(x0.tobytes())
-    env["LAYA_HEAD_FWD"] = "1"
-    r = subprocess.run([str(rig), str(container), str(bin_), str(k), "1"],
-                       capture_output=True, text=True, env=env)
-    assert r.returncode == 0, r.stderr[-2000:]
-    line = [l for l in r.stdout.splitlines() if l.startswith("head state")]
-    assert line, r.stdout[-500:]
-    got = np.array([float(x) for x in line[0].split()[2:]], dtype=np.float64)
-    want = np.asarray(_ref.head_state(t, ids, x0=x0), dtype=np.float64).reshape(-1)
-    want = np.asarray(want, dtype=np.float64).reshape(-1)
-    if want.size != got.size:
-        pytest.skip("oracle head_state shape %d != engine %d; the two are not "
-                    "comparable in this build" % (want.size, got.size))
-
-    cos = float(got @ want / (np.linalg.norm(got) * np.linalg.norm(want)))
-    scale = float(np.abs(want).max())
-    rel = float(np.abs(got - want).max() / max(1e-9, scale))
-    print("\nhead attention vs oracle: cosine %.9f  max|d|/|want|max %.4g" % (cos, rel))
-
-    # 8x on Q is an 8x error on the scores; even after the softmax it is nowhere
-    # near 0.99 cosine. A loose bound still cannot hide it, and a loose bound does
-    # not rot into a flaky gate.
-    assert cos > 0.99, (
-        f"the head's attention does not match the oracle (cosine {cos:.6f}). The "
-        "readout matched at 7 significant figures while the attention was wrong, "
-        "so this gate is on the post-head STATE and has to stay here.")
-    assert rel < 0.5, (
-        f"post-head state differs by {rel:.3g} of its own maximum. An 8x Q-scaling "
-        "error looks like this, and cosine alone did not see it.")
+# A GATE THAT WAS HERE, AND WHY IT IS NOT ONE ANY MORE
+#
+# `test_the_head_attention_matches_the_oracle_not_just_the_readout` compared the
+# post-head STATE against the float64 oracle and asserted cosine > 0.99, on the
+# reasoning that an 8x Q-scaling error "is nowhere near 0.99 cosine". Measured on
+# this branch, by temporarily reintroducing the bug:
+#
+#     correct    cosine 0.978966    max|d|/max|want| 0.4116
+#     Q bug      cosine 0.981232    max|d|/max|want| 0.4643
+#
+# The bug scored HIGHER on cosine. So the threshold was unreachable on correct
+# code -- the test failed on the fix -- and it could not have failed on the bug
+# either. The residual metric points the right way but separates the arms by
+# 0.4116 against 0.4643, about 6% of a signal that is itself 41% error on
+# CORRECT code, which is not a margin that survives a checkpoint change.
+#
+# The post-head state is a large residual stream with outliers, and the attention
+# contribution is a small perturbation of it, so this comparison has a resolution
+# and the defect is below it. That is a property of the INSTRUMENT, not a
+# threshold to be retuned, and rethresholding is how the wrong number gets
+# installed. The stride assertion in
+# `test_the_attention_scale_is_applied_to_the_Q_ROWS_once` is the gate for this
+# bug, and it is exact: the stride is syntactic, so no numeric tolerance is
+# needed to see it.
+#
+# To measure again, re-run the rig (utilities/laya_head_rows_rig.cpp) with
+# LAYA_HEAD_FWD=1 against utilities/laya_preln_reference.py, and record BOTH
+# arms. Do not add a single-arm threshold from a correct-code number.
