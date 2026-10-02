@@ -310,6 +310,65 @@ Running `attn_fa.py` directly also works and takes the same values as
 `--lq/--lk/...` flags, but it writes `fa_iron.xclbin` into the current directory
 and does not use `SPECIALIZE`; `build_design.py` is the supported path.
 
+### Integration: an end-to-end Laya decision now runs on the NPU
+
+Done 2026-10-02, which unblocks everything below.
+
+The model is **not** installed with `oflm-add` (that needs `model.q4nx`, the Q4NX
+container for decoder LLMs; Laya uses `.npue`) and **not** with `q4nx-build`
+(GGUF->Q4NX, decoder-only configs, no encoder architecture). The working path
+needs no new code:
+
+1. Download the five files the registry entry lists into
+   `~/.config/oflm/models/laya/`, keeping the nested layout
+   (`multilingual/{encoder/config.json, model.safetensors, tokenizer/...,
+   rl_agent_config.json}`).
+2. `NpueDecision` packs the container on first load via
+   `npue::prepare_model_auto` -- it finds `model.safetensors` and writes
+   `laya.npue`. The `npue_checkpoint_subdir` / `npue_config_subdir` /
+   `npue_tokenizer_subdir` keys exist *because of Laya*: config, weights and
+   tokenizer are at three different depths and none can be guessed.
+3. Link the family design set the entry names:
+   `ln -s <repo>/src/xclbins/BERT-h768-gated-i1152-bf16/gemm_rtp \
+        ~/.config/oflm/models/laya/npue_designs/gemm_rtp`
+
+Packed and ran:
+
+```
+[NPUE]  packing .../multilingual/ -> .../laya.npue (arch=modernbert_rope_geglu)
+  hidden=768 heads=12 head_dim=64 layers=22 inter=1152 ffn_up=2304
+  window=64 (local_attention/2, NOT +1)  8 full / 14 sliding
+  tensors 307, data 1080.61 MB
+  designs ONE xclbin, 12 streams (3 batch tiers), one hw_context
+  tiers 4, 16, 32   (requests are right-sized, not padded)
+  gelu / softmax on the HOST (fp32) -- 22 fewer NPU dispatches
+  layernorm on the HOST (fp32) -- 45 fewer NPU dispatches
+  weights 220.59 MB staged on the device once
+
+$ oflm decide laya-decision:multilingual -i req.json
+  supplier_choice  choice=contoso  confidence=0.517991
+  is_urgent        noul=false      p(true)=0.489608
+```
+
+**Engagement: column utilisation peaked at 21%** during the request, 18 of 40
+samples non-zero. The encoder really executed on the AIE.
+
+21% rather than the 98% a saturated kernel reaches is the *expected* number and
+it is the point of this whole plan: the NPU is only carrying the 88 projection
+GEMMs while qk, softmax, av, GELU and 45 LayerNorms run on the host. Moving
+LayerNorm and fused attention onto the NPU is what moves this number, and it is
+now measurable rather than inferred.
+
+Corrections worth recording: Laya's `model_type` **is `modernbert`**, so it
+packs as `arch=modernbert_rope_geglu`. I had assumed arch 4 was a different
+model because its comment quotes `ffn_up 3072`; at `intermediate=1152` the
+packed geometry is `ffn_up=2304` and this is Laya's own path. Also `oflm decide`
+takes `-i <file>`, not `--input-file` as its own header comment claimed, and
+`questions` is an object keyed by question key, not an array -- for a choice the
+`criteria` key order *is* the answer space.
+
+---
+
 ## 4. Step 3 — GELU, then a banded-softmax design
 
 Gated GeGLU, so the host applies GELU to the gate half before the elementwise
