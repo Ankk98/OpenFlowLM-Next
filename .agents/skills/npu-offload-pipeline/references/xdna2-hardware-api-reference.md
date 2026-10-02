@@ -341,6 +341,31 @@ change and the run to fail. For the LayerNorm 768 kernel, good = state 4 in
 0.295 ms, corrupted = state 8 after a 4087 ms timeout. Without that arm a
 numerical pass could come from a host fallback.
 
+### The run_kernel cfg grammar
+
+The harness fails in ways that read like missing files. Three things to get
+right, each of which cost a round trip:
+
+```bash
+device
+xclbin G <abs path to final.xclbin>     # G is the xclbin's NAME
+kernelx fa G <abs path to insts.bin>    # 3 tokens: kernel name, xclbin name, path
+buf <name> <bytes> <path>
+run <kernel> <bufs...>
+```
+
+- `kernelx` takes **three** tokens. Give it two and it reports
+  `missing kernelx insts.bin` while echoing your real path back at you.
+- The middle token of `kernelx` is the **name** given to `xclbin`, not a kind.
+  Mismatched names give `no xclbin G`.
+- Relative paths resolve against the cfg file's directory, so a cfg written to
+  `/tmp` will not find the artifacts. Use absolute paths, or put the cfg beside
+  the design.
+
+Successful loads print `kernelx <name> (<path>, <N> words)`; `DONE runs=0` means
+everything loaded and nothing was executed, which is the expected result for a
+load-only check.
+
 ---
 
 ## 11. The honest gap

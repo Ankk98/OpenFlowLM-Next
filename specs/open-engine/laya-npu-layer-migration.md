@@ -149,6 +149,47 @@ Wire the built xclbin into the family bundle and set `host_ln=false` for the
 unified path, then re-measure. The numerical and engagement gates above are
 satisfied; what remains is integration, not kernel work.
 
+---
+
+## 3a. Step 2 (flash attention) — builds and loads at Laya's shape
+
+Done 2026-10-02, and the boundary is worth stating precisely.
+
+```bash
+export FA_LQ=1024 FA_LK=1024 FA_VALID_LEN=1024 FA_LQP=256 FA_LKP=64 \
+       FA_DK=64 FA_DV=64 FA_NUM_HEADS=12 FA_HEADS_PER_UNROLL=2 FA_CASCADE_STAGES=4
+python3 open_kernels/build_design.py open_kernels/designs/whisper_fa/attn_fa.py \
+       open_kernels/designs/whisper_fa/build_laya
+# BUILD_OK -> final.xclbin 500110 B, insts.bin 100624 B
+```
+
+| property | result |
+|---|---|
+| compiles at seq 1024 x 12 heads | **yes** |
+| xclbin accepted by the device | **yes** (`xclbin G`) |
+| instruction stream accepted | **yes**, 25,156 words |
+| executed with real buffers | **not yet** |
+| numerical correctness | **unverified** |
+
+**What this does and does not prove.** It proves the shape is legal: the column
+budget is exactly `FA_HEADS_PER_UNROLL * NQ` = 2 x 4 = **8**, which is precisely
+AIE2P's 8 columns, and the design's own device selection is
+`_device_for(dev, num_heads_per_unroll * 4)`. Laya is smaller than the verified
+Whisper point on every axis that presses memtile budget, and it compiles and
+loads.
+
+It does **not** prove correctness, and `DONE runs=0` is not a pass. Unlike
+LayerNorm there is no `make_test.py` / `compare.py` pair for this design —
+Whisper validates fused attention through a packed model plus
+`fa_guards.hpp::check_fa_geometry` at load. So the missing piece is a
+**fp64 reference and a host-side harness** for fused non-causal attention at
+this shape, which does not exist yet. That harness is the next piece of work,
+and it is also what would settle the `valid_len` padding question below.
+
+`export_whisper_kernels.py` notes that `FA_*` env overrides exist precisely as a
+"debugging/smoke-shape convenience", so this build is that: a shape smoke test,
+not a production artifact. Production shapes are owned by the exporter.
+
 Hardware notes for the build, all from `AIETargetModel.h`
 `BaseNPU2TargetModel` and the kernel driver's own documentation:
 
