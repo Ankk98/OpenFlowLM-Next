@@ -55,6 +55,9 @@ open_kernels/designs/**/insts.bin
 open_kernels/designs/**/insts.elf
 open_kernels/designs/*/*.bin
 open_kernels/designs/*/*.cfg
+# FA harness: float64 reference (make_test.py) and its shape sidecar
+open_kernels/designs/*/*.npy
+open_kernels/designs/*/*_meta.json
 open_kernels/designs/*/*.log
 open_kernels/harness/out/
 open_kernels/model/out*/

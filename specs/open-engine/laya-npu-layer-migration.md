@@ -151,9 +151,10 @@ satisfied; what remains is integration, not kernel work.
 
 ---
 
-## 3a. Step 2 (flash attention) — builds and loads at Laya's shape
+## 3a. Step 3 (flash attention) — VALIDATED at Laya's shape
 
-Done 2026-10-02, and the boundary is worth stating precisely.
+Done 2026-10-02. Builds, runs, and is numerically correct on the AIE, with the
+padding semantics settled empirically.
 
 ```bash
 export FA_LQ=1024 FA_LK=1024 FA_VALID_LEN=1024 FA_LQP=256 FA_LKP=64 \
@@ -163,28 +164,75 @@ python3 open_kernels/build_design.py open_kernels/designs/whisper_fa/attn_fa.py 
 # BUILD_OK -> final.xclbin 500110 B, insts.bin 100624 B
 ```
 
-| property | result |
-|---|---|
-| compiles at seq 1024 x 12 heads | **yes** |
-| xclbin accepted by the device | **yes** (`xclbin G`) |
-| instruction stream accepted | **yes**, 25,156 words |
-| executed with real buffers | **not yet** |
-| numerical correctness | **unverified** |
+| gate | valid_len=1024 | valid_len=700 (324 pad rows) |
+|---|---|---|
+| device state | **4**, 3.93 ms | **4**, 3.95 ms |
+| max rel err vs fp64 | 2.925e-02 | 4.134e-02 |
+| p99 rel err | 9.885e-03 | 1.159e-02 |
+| cosine | 0.99962830 | 0.99963657 |
+| gates | max<6e-2, p99<2e-2, cos>0.999 | same |
+| output tail rows | 0 padded rows | 1.31e-1, **not gated** — see below |
 
-**What this does and does not prove.** It proves the shape is legal: the column
-budget is exactly `FA_HEADS_PER_UNROLL * NQ` = 2 x 4 = **8**, which is precisely
-AIE2P's 8 columns, and the design's own device selection is
-`_device_for(dev, num_heads_per_unroll * 4)`. Laya is smaller than the verified
-Whisper point on every axis that presses memtile budget, and it compiles and
-loads.
+Builds: `final.xclbin` 500,110 B, `insts.bin` 100,624 B, 25,156 instruction
+words, all accepted by the device. Runtime ~3.9 ms for 12 heads x seq 1024 fused
+attention, i.e. qk + softmax + av in one dispatch with no host round trip.
 
-It does **not** prove correctness, and `DONE runs=0` is not a pass. Unlike
-LayerNorm there is no `make_test.py` / `compare.py` pair for this design —
-Whisper validates fused attention through a packed model plus
-`fa_guards.hpp::check_fa_geometry` at load. So the missing piece is a
-**fp64 reference and a host-side harness** for fused non-causal attention at
-this shape, which does not exist yet. That harness is the next piece of work,
-and it is also what would settle the `valid_len` padding question below.
+A new harness lives beside the design: `designs/whisper_fa/make_test.py`
+(vectors + float64 reference + `run.cfg`) and `designs/whisper_fa/compare_fa.py`
+(the gate), mirroring the `designs/ln/` pair. The reference is computed from the
+**bf16 values that were written**, not from the pre-rounding floats, so the
+tolerance measures the kernel rather than input rounding.
+
+### The error budget, and why the gate is where it is
+
+bf16 output quantisation alone — round the float64 reference to bf16 and change
+nothing else — gives, at this shape:
+
+| | max | p99 | mean |
+|---|---|---|---|
+| bf16 output floor | 2.315e-03 | 6.027e-04 | 1.424e-04 |
+| kernel, valid_len=1024 | 2.925e-02 | 9.885e-03 | 2.821e-03 |
+
+The ~12x excess is the documented bf16 score accumulation plus the **bf16
+online-softmax rescale factor** (`attn_npu2.cc`: *"all in float except the bf16
+rescale factor r"*). So the gates sit roughly 2x above the measured maximum
+rather than just above it. A gate fitted to the observed number catches nothing
+and makes the next run look like a failure. `max_rel` is noise-sensitive — one
+outlier element sets it — so the p99 gate carries most of the signal.
+
+### Padding: `valid_len` masking works, and the output tail is the host's job
+
+**The kernel masks correctly.** At a compiled-in `valid_len=700` with 324 padded
+rows, the real rows match a reference that reads only rows `[0, 700)` within the
+same error budget as the unpadded case (rel 4.1e-2 vs 2.9e-2, cos 0.99964 vs
+0.99963). The design states `apply_length_mask (valid_len)` is *"the only mask,
+unconditional"* (`attn_fa.py:44`), and that is confirmed.
+
+**The output tail is not the kernel's contract.** The kernel writes real values
+into rows `[t, seq_pad)` (1.31e-1 at valid_len=700). That is harmless: the host
+contract never reads them — `FaAttention::dispatch_and_scatter` calls
+`scatter_output()` for rows `[0, t)` and then `zero_pad_rows(out, t, m_padded, d)`
+for the tail. My harness gated on the tail at first and reported FAIL for a
+kernel that was in fact correct; the gate was removed and the value is now an
+observation. **A gate that rejects correct work is worse than no gate.**
+
+### Two traps that would have produced plausible-looking wrong answers
+
+1. **`valid_len` is compile-time.** `attn_fa.py:255` declares
+   `valid_len: CompileTime[int]` and bakes it via `-Dvalid_len=` at line 311. I
+   first built at 1024 and then ran the harness with `valid_len=700`. The result
+   was `cos = 0.99943` — apparently fine — with `max rel = 0.208`. Cosine is
+   scale-free, so a uniformly shrunken output sails through it while being badly
+   wrong. **Changing `valid_len` requires a rebuild, and cosine alone will not
+   tell you.** This is the single most dangerous property of this design.
+2. **The kernel applies `1/sqrt(dk)` itself.** `attn_npu2.cc:357` defines
+   `log2e (1.44269504089 / constexpr_sqrt_dk)` with `constexpr_sqrt_dk = 8.0` at
+   dk=64, folding the attention scale into the exp2 argument. Pre-scaling Q in
+   the harness divides the scores by 8 **twice** — and because 1/8 is a power of
+   two it survives bf16 rounding exactly, so the inputs look perfectly reasonable
+   and only the output is wrong: rms 0.604x the reference, cos 0.667. I found
+   this by checking whether the head mapping was still identity (it was), which
+   pointed at a temperature mismatch rather than a layout error.
 
 `export_whisper_kernels.py` notes that `FA_*` env overrides exist precisely as a
 "debugging/smoke-shape convenience", so this build is that: a shape smoke test,

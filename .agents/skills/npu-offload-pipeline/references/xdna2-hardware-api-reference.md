@@ -389,6 +389,27 @@ run_kernel run.cfg                                  # device state per run
 python3 compare.py                                  # the gate; exit 0 = pass
 ```
 
+**Compile-time shape parameters are not runtime arguments.** `whisper_fa`
+declares `valid_len: CompileTime[int]` and bakes it with `-Dvalid_len=`, so
+running a kernel built at one `valid_len` against data padded to another does
+not error — it returns plausible numbers. At `valid_len=1024` built, fed 700 real
+rows, cosine was 0.99943 while max relative error was 0.208: cosine is
+scale-free, so a uniformly shrunken output passes it while being badly wrong.
+**Any shape a design treats as `CompileTime` requires a rebuild to change, and a
+cosine gate will not catch the mismatch.** Gate on a scale-sensitive error too.
+
+**Watch for a scale the kernel applies internally.** `whisper_fa` folds
+`1/sqrt(dk)` into its exp2 argument (`attn_fu2.cc`-style: `log2e /
+constexpr_sqrt_dk`), so a harness that pre-scales Q divides the scores by 8
+twice. Because 1/8 is a power of two it survives bf16 rounding exactly, so the
+inputs look fine and only the output is wrong. Read the kernel for its internal
+scaling before writing the reference.
+
+**Check who owns a buffer region before gating on it.** The kernel writes real
+values into output rows past `valid_len`, but the host contract reads only
+`[0, t)` and then calls `zero_pad_rows()` for the tail — so that region is dead
+data and gating on it rejects a correct kernel.
+
 `make_test.py` honours `LN_N` and `LN_BUILD`, and `run.cfg` pins the buffer
 widths — a good check that the width really reached the design. Always run the
 corruption arm: flip 36 bytes of `insts.bin`, and require the device state to
