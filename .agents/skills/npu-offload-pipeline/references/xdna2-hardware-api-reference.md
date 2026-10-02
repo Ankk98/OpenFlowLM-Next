@@ -241,6 +241,27 @@ Two traps that make working instruments look dead:
    `..._TEMPERATURE` does not compile, and the driver skips temperature without
    `HAVE_7_2_AMD_PMF_NPU_METRICS_NPU_TEMP` anyway.
 
+### Reading the ERT command state
+
+`run_kernel` and the engine both report a state number. The enum is in
+`src/include/hrx_cpp/hrx_cpp.hpp`, and two values carry most of the signal:
+
+| state | name | meaning |
+|---|---|---|
+| **4** | `ERT_CMD_STATE_COMPLETED` | the run finished |
+| **8** | `ERT_CMD_STATE_TIMEOUT` | it never signalled completion |
+
+This makes the corruption test self-interpreting. The LayerNorm 768 kernel
+returns **state 4** in 0.295 ms with intact instructions and **state 8** after a
+4087 ms timeout with 36 bytes flipped — the kernel started and hung, rather
+than faulting cleanly. So a state-8 result is not automatically "the driver is
+broken"; it is what a kernel that spins without completing looks like. Always
+compare against the known-good state for the same design before concluding
+anything from the number.
+
+The full enum: NEW 1, QUEUED 2, RUNNING 3, COMPLETED 4, ERROR 5, ABORT 6,
+SUBMITTED 7, TIMEOUT 8, NORESPONSE 9, SKERROR 10, SKCRASHED 11.
+
 **Never use a power dose-response as engagement evidence.** Scaling the batch
 scales host work too; a rising reading may be entirely host. To prove a kernel
 ran, corrupt its instruction stream and require a device error — no host
@@ -291,12 +312,46 @@ Dependency notes:
 2. **`oflm-add` requires `model.q4nx`.** Registry entries pointing at *unconverted*
    upstream repos (`convaiinnovations/laya`, `sentence-transformers/*`, `BAAI/*`)
    cannot be installed; only the converted `Atomic-Germ/*-NPU2` repos can.
-3. **`oflm-add` does not download loose `.xclbin` files.** Those repos carry
-   kernels *both* inside `model.q4nx` and as loose `*.xclbin`, and the tool skips
-   the loose ones. Without them a run dies with
-   `No such file '<xclbin_root>/<model-dir>/layer.xclbin'`. Fetch them to
-   `$OFLM_XCLBIN_PATH/<model-dir>/` and set `OFLM_XCLBIN_PATH`.
+3. **`oflm-add` does not download loose `.xclbin` files**, and this host has no
+   system install for it to symlink from. The tool's own comment says custom
+   models "never ship xclbins (they are closed source)", so it expects them at
+   `<prefix>/xclbins/<model-dir>/` in an *installed* OpenFlowLM and skips the
+   step otherwise. The converted HF repos *do* ship loose kernels; fetch them to
+   `$OFLM_XCLBIN_PATH/<model-dir>/` yourself, or a run dies with
+   `No such file '<xclbin_root>/<model-dir>/layer.xclbin'`. Kernel counts differ
+   per model — Qwen3-0.6B ships 4 (`attn`, `dequant`, `layer`, `mm`), LFM2-1.2B
+   ships 5 (adds `conv`).
+   `model.q4nx` is a **weights** container, not a kernel container: a `u32`
+   length then a JSON tensor map (`data_offsets`, `dtype`, `shape`) followed by
+   the blobs. So there is no second copy of the kernels to fall back on.
    A build-tree binary also needs `OFLM_MODELINFO_PATH=src/model_info.json`.
+
+### Open: freshly installed converted models time out on first dispatch
+
+Both `qwen3:0.6b` and `lfm2:1.2b`, installed and sha256-verified, with the
+loose kernels placed in the layout the tool expects, fail identically:
+
+```
+[OFLM] Prefill chunk 1/1 with 20 tokens
+[ERROR] Insertion error: runlist failed execution (ERT_CMD_STATE_TIMEOUT)
+Kernel Instance: MLIR_AIE
+txn_op_idx = 0xFFFFFFFF
+ctx_pc = 0x28B060AD
+```
+
+Systematic, not model-specific: two different architectures, two different
+kernel sets (4 and 5 xclbins), same failure at the same point. And it is *not* an
+idle device — column utilisation ramps 2 -> 98% during the attempt, so the array
+genuinely executes and then never signals completion. `txn_op_idx = 0xFFFFFFFF`
+is a sentinel rather than a real opcode index.
+
+Unresolved. Ruled out so far: the xclbins are correct (sha256 matches the hub's
+`lfs.sha256`); the layout matches what `link_xclbins` would create; there is no
+second kernel copy to mismatch against. Not yet ruled out: stale kernels in the
+repos relative to their `model.q4nx` runlists, or a closed-kernel/firmware
+incompatibility against FW 1.1.2.65. Worth knowing before spending time on it:
+the repo's own open-kernel path (`designs/`) is unaffected and is what the Laya
+migration uses.
 
 ---
 
