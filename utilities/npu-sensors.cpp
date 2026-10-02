@@ -48,7 +48,14 @@ const char *type_name(unsigned t) {
   switch (t) {
     case AMDXDNA_SENSOR_TYPE_POWER: return "power";
     case AMDXDNA_SENSOR_TYPE_COLUMN_UTILIZATION: return "column_util";
-    case AMDXDNA_SENSOR_TYPE_TEMPERATURE: return "temp";
+    // There is deliberately NO AMDXDNA_SENSOR_TYPE_TEMPERATURE case.
+    //
+    // The installed uapi header (/usr/include/drm/amdxdna_accel.h) defines only
+    // POWER and COLUMN_UTILIZATION, so naming TEMPERATURE here did not compile --
+    // this file had never been built against the installed header. It matches
+    // the hardware: amdxdna_sensors.c:75 skips the temperature record unless
+    // HAVE_7_2_AMD_PMF_NPU_METRICS_NPU_TEMP is defined, which this kernel does
+    // not, and hwmon temp1_input correspondingly reads EOPNOTSUPP.
     default: return "?";
   }
 }
@@ -65,40 +72,39 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Call 1: ask how many bytes the kernel will write.
+  // ONE call, with a full-size buffer.
+  //
+  // There is NO size-query pass. `amdxdna_query_sensors()` does
+  // `if (args->buffer_size < sizeof(sensor)) goto out;` per record and then, at
+  // `out:`, sets `args->buffer_size = sensors_count * sizeof(sensor)`. So a
+  // size-probe with buffer_size == 0 skips every record, counts zero, and
+  // returns 0 records AND rc 0 -- which is exactly the "0 records, no error"
+  // this tool used to report as "PMF sensors unavailable".
+  //
+  // Maximum records = 1 power + AMDXDNA_NPU_MAX_PMF_COLUMNS (0x8) column
+  // utilization + 1 temperature. Passing 16 is generous and costs nothing; the
+  // driver returns however many it actually has and writes the real count back
+  // into buffer_size.
+  const unsigned kMaxRec = 16;
+  void *buf = calloc(kMaxRec, sizeof(amdxdna_drm_query_sensor));
+  if (!buf) { perror("calloc"); close(fd); return 1; }
+
   amdxdna_drm_get_info info{};
   info.param = DRM_AMDXDNA_QUERY_SENSORS;
-  info.buffer_size = 0;
+  info.buffer_size = kMaxRec * sizeof(amdxdna_drm_query_sensor);
+  info.buffer = (unsigned long long)(unsigned long)buf;
   if (ioctl(fd, DRM_IOCTL_AMDXDNA_GET_INFO, &info) < 0) {
-    fprintf(stderr, "GET_INFO(size) on %s: %s\n", node, strerror(errno));
+    fprintf(stderr, "GET_INFO(sensors) on %s: %s\n", node, strerror(errno));
     fprintf(stderr,
             "If this is EPERM/EINVAL the accel node may need a render-group "
             "hand-off; the NPU node is normally /dev/accel/accelN owned by group "
             "'render'.\n");
-    close(fd);
-    return 1;
-  }
-  const unsigned nrec = info.buffer_size / sizeof(amdxdna_drm_query_sensor);
-  if (nrec == 0) {
-    fprintf(stderr, "kernel reported 0 sensor bytes -- PMF sensors unavailable "
-                    "(idle device, or a platform without PMF telemetry)\n");
-    close(fd);
-    return 1;
-  }
-
-  // Call 2: fetch them.
-  void *buf = calloc(nrec, sizeof(amdxdna_drm_query_sensor));
-  if (!buf) { perror("calloc"); close(fd); return 1; }
-  info.buffer_size = nrec * sizeof(amdxdna_drm_query_sensor);
-  info.buffer = (unsigned long long)(unsigned long)buf;
-  if (ioctl(fd, DRM_IOCTL_AMDXDNA_GET_INFO, &info) < 0) {
-    fprintf(stderr, "GET_INFO(fetch): %s\n", strerror(errno));
     free(buf); close(fd); return 1;
   }
 
   const unsigned got = info.buffer_size / sizeof(amdxdna_drm_query_sensor);
   if (!quiet) {
-    printf("node %s  records %u/%u\n", node, got, nrec);
+    printf("node %s  records %u/%u\n", node, got, kMaxRec);
   }
   for (unsigned i = 0; i < got; ++i) {
     const auto &s = static_cast<const amdxdna_drm_query_sensor *>(buf)[i];
