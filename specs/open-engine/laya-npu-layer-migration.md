@@ -151,7 +151,7 @@ satisfied; what remains is integration, not kernel work.
 
 ---
 
-## 3a. Step 3 (flash attention) — VALIDATED at Laya's shape
+## 3. Step 2 — fused encoder flash attention: VALIDATED at Laya's shape
 
 Done 2026-10-02. Builds, runs, and is numerically correct on the AIE, with the
 padding semantics settled empirically.
@@ -260,7 +260,7 @@ Hardware notes for the build, all from `AIETargetModel.h`
 
 ---
 
-## 3. Step 2 — fused encoder flash attention
+
 
 This is the largest single win, and a verified design already exists.
 
@@ -296,25 +296,19 @@ of receiving them. Second, each workload context costs a **64 MB host-resident
 instruction buffer** regardless of design size, so a multi-design family pays that
 per context, not per dispatch. Strix Point supports 16 concurrent contexts.
 
+Build (from the repo root; see the reference for why `/opt/xilinx/xrt/bin` must be
+on `PATH`, and note the output dir is `argv[2]`):
+
 ```bash
-cd open_kernels/designs/whisper_fa
-FA_LQ=1024 FA_LK=1024 FA_VALID_LEN=1024 FA_LQP=256 FA_LKP=64 \
-FA_DK=64 FA_DV=64 FA_NUM_HEADS=12 FA_HEADS_PER_UNROLL=2 FA_CASCADE_STAGES=4 \
-python3 attn_fa.py
+export FA_LQ=1024 FA_LK=1024 FA_VALID_LEN=1024 FA_LQP=256 FA_LKP=64 \
+       FA_DK=64 FA_DV=64 FA_NUM_HEADS=12 FA_HEADS_PER_UNROLL=2 FA_CASCADE_STAGES=4
+python3 open_kernels/build_design.py open_kernels/designs/whisper_fa/attn_fa.py \
+       open_kernels/designs/whisper_fa/build_laya
 ```
 
-**Open question that must be settled before integration:** Whisper is non-causal
-with no padding, so `FA_VALID_LEN` is a pure length. Laya pads to `seq=1024`
-with a prefix mask. Whether `FA_VALID_LEN=1024` (full) or the true unpadded
-length is correct — and how the pad mask reaches the kernel at all — is
-**unverified**. Get this wrong and attention silently attends to pad tokens.
-Settle it by feeding a deliberately pad-heavy batch and comparing against the
-host reference, not by reading the code.
-
-Fusing `qk + softmax + av` in one kernel also collapses the 1.61 GB score tensor
-into per-stage tiles, which is what actually removes the 6.04 GB peak.
-
----
+Running `attn_fa.py` directly also works and takes the same values as
+`--lq/--lk/...` flags, but it writes `fa_iron.xclbin` into the current directory
+and does not use `SPECIALIZE`; `build_design.py` is the supported path.
 
 ## 4. Step 3 — GELU, then a banded-softmax design
 
