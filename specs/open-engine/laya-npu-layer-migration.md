@@ -405,6 +405,54 @@ So neither existing path gets LayerNorm onto the NPU as things stand:
 
 Two ways forward, and the choice is architectural rather than mechanical:
 
+### The catch that changes (a)'s size: the LN kernel interface does not match
+
+Before doing (a), the *existing* NPU LayerNorm dispatch path was read, and it
+does not want the kernel that was built and validated in step 1.
+
+```cpp
+// layer_norm(), the !host_ln branch
+bf16_fill((uint16_t *)layernorm.host_ptr(0) + lo, x.data() + lo, ...);  // bf16 in
+layernorm.sync_to_device(0);
+layernorm.dispatch_only();
+layernorm.sync_from_device(2);
+bf16_read(x.data() + lo, (const uint16_t *)layernorm.host_ptr(2) + lo, ...); // bf16 out
+```
+
+So the engine expects a **3-buffer bf16-in / bf16-out** LayerNorm — activation in
+`host_ptr(0)`, weights staged from the container, activation out of
+`host_ptr(2)`. It does the residual add separately (`add_plain`).
+
+`designs/ln`, which step 1 built and validated, is a different interface:
+
+```
+in  = [x fp32[N], add fp32[N], w bf16[N]]
+out = [y fp32[N], xn bf16[N]]          # designs/ln/ln.py, docstring
+```
+
+Five buffers, fp32 in and fp32 out, with the add **fused in**. Dropping it into
+`art + "/layernorm"` unchanged would bind the wrong buffers and produce
+correct-looking nonsense — which is the trap 7c failure mode this project has
+already paid for five times.
+
+So (a) splits again, and this is the part that actually costs:
+
+- **(a1) Give `designs/ln` a no-add, bf16-in/bf16-out mode.** The fused `add` is
+  an optimisation over the engine's current `add_plain` + LN pair; dropping it
+  gives a 3-buffer kernel that matches `layer_norm()` as written. The kernel
+  already has the reduction and the weight multiply, so this is a port of the
+  existing data path, not new mathematics — and it reuses the fp64 oracle and
+  the corruption test that step 1 established.
+- **(a2) Write a fresh bf16 LayerNorm kernel.** More control, more risk, and it
+  discards a validated design.
+
+(a1) is the smaller change and keeps the oracle. Either way the *engine* half of
+(a) is still the two lines described below.
+
+Note the same question will have to be answered for fused attention before that
+step is real work: the engine has **no `fa` Design at all**, so unlike LayerNorm
+there is nothing to bind.
+
 **(a) Let unified mode bind an eltwise design when one is present.** Keep
 `gemm_rtp/` as-is and additionally emit `layernorm/` beside it; change the
 forcing so it becomes `if (unified && !eltwise_design_present)`. This is
