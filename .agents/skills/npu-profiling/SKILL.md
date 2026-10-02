@@ -279,8 +279,15 @@ where `command_submissions` comes from
 against a 40.6 ms host wait. Note `HW_CONTEXT_ALL` is **root-only**; unprivileged,
 read the submissions count from the same fdinfo block instead.
 
-Column utilization (`DRM_AMDXDNA_QUERY_SENSORS`, 8 records, reaches 100% under
-load with an ~8 s ramp) is the second usable instrument. Two traps:
+Column utilization (`DRM_AMDXDNA_QUERY_SENSORS`, 8 records) is the second
+usable instrument. Measured under a real `oflm run` on 2026-10-02, sampling
+every 0.35 s: **2 -> 31 -> 52 -> 66 -> 83 -> 92 -> 98% peak at t~5.6 s**, then
+decay 81 -> 56 -> 40 -> 28 -> 14 -> 5 -> 1% over a further ~5 s. So the rise is
+~4 s to a **98%** peak, not 100%; an earlier "~8 s ramp to 100%" was a guess from
+a different sampling interval. All 8 columns report the *identical* value -- it
+is partition-wide, replicated per column, so it is a busy/idle signal and not a
+per-column load balancer's view. **Warmup is mandatory**: a short burst reads as
+idle, which is how this instrument gets wrongly declared broken. Two traps:
 
 - **There is no size-query pass.** `amdxdna_query_sensors()` guards each record
   with `if (args->buffer_size < sizeof(sensor)) goto out;` and then writes

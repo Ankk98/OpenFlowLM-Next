@@ -651,7 +651,8 @@ printf(<span class="m">"  designs    7 resident xclbins\n"</span>);   <span clas
     <b>Two corrections.</b> I previously recorded <code>drm-engine-amdxdna_accel_driver</code> as an inert
     counter reading 0 ns, and column utilisation as registered-but-never-read. <b>Both were wrong.</b>
     The first is a per-client NPU-busy accumulator that tracks occupancy to within
-    <b>0.8%</b> across four runs; the second is registered and readable, and reaches 100% under load.
+    <b>0.8%</b> across four runs; the second is registered and readable, and reaches a
+      <b>98% peak</b> under load after ~4 s of warmup (measured; it does not reach 100%).
     The original zero reading was <b>sampling the wrong process</b> &mdash; <code>pgrep -f layaacc</code>
     matched the bash wrapper, because the shell's own command line contains the rig's path.
   </div>
@@ -800,9 +801,14 @@ delta_dispatch = Δ command_submissions        <span class="m">// GET_ARRAY HW_C
       <code>amdxdna_query_sensors()</code> with <code>buffer_size == 0</code> returns rc 0 and
       <b>zero bytes</b>. <code>utilities/npu-sensors.cpp</code> uses exactly that two-call protocol,
       which is why it always reports 0 records. Pass a full 16-record buffer &rarr; 9 records return.</p>
-      <p><b>2. Utilisation has an ~8 s ramp.</b> It climbs 0&rarr;37&rarr;63&rarr;78&rarr;87&rarr;92&rarr;99&rarr;100%.
-      A 40-dispatch burst only reached 18%. <b>Warmup is mandatory</b> or every short run reads as idle
-      &mdash; which is exactly how this instrument gets wrongly declared broken.</p>
+      <p><b>2. Utilisation needs ~4 s of warmup to reach a 98% peak, then decays over ~5 s.</b>
+      Measured 2026-10-02 during a real <code>oflm run</code>, sampling every 0.35 s:
+      2 &rarr; 31 &rarr; 52 &rarr; 66 &rarr; 83 &rarr; 92 &rarr; <b>98% at t&asymp;5.6 s</b>, then
+      81 &rarr; 56 &rarr; 40 &rarr; 28 &rarr; 14 &rarr; 5 &rarr; 1%.
+      An earlier note here said "~8 s ramp to 100%"; that was inferred from a coarser sampling
+      interval and the peak is 98%, not 100%. A 40-dispatch burst only reached 18%.
+      <b>Warmup is mandatory</b> or every short run reads as idle &mdash; which is exactly how this
+      instrument gets wrongly declared broken.</p>
       <p class="note">All 8 columns report the <i>identical</i> value: it is partition-wide, replicated
       per column, not 8 distinguishable signals.</p>
     </div>
@@ -841,7 +847,7 @@ delta_dispatch = Δ command_submissions        <span class="m">// GET_ARRAY HW_C
   <div class="badbox">
     <h3 style="margin-top:0;color:var(--bad)">Wrong: the dispatch counters are inert</h3>
     <p><code>drm-engine-amdxdna_accel_driver</code> tracks NPU occupancy to within <b>0.8%</b> over four
-    runs, and column utilisation reaches 100%. Neither is broken. The zero readings came from sampling
+    runs, and column utilisation reaches 98%. Neither is broken. The zero readings came from sampling
     the <b>wrong process</b>: <code>pgrep -f layaacc</code> matched the bash wrapper, so 35 samples were
     taken of a shell whose only device fd was <code>/dev/null</code>.</p>
     <p class="note">The lesson was already in the skill I wrote that session &mdash; under a different
