@@ -369,6 +369,66 @@ takes `-i <file>`, not `--input-file` as its own header comment claimed, and
 
 ---
 
+## 3b. BLOCKED: how LayerNorm actually reaches the NPU
+
+Investigated 2026-10-02. The answer is not "set `host_ln=false`", and the reason
+matters, because the plan above assumed it was.
+
+**`unified` is decided by one file, and it forces the eltwise ops to the host:**
+
+```cpp
+// npue_encoder.hpp Stack::Stack
+const bool unified = std::ifstream(art + "/gemm_rtp/design.json").good();
+...
+if (unified) { host_ln = host_sm = host_gelu = true; }   // forced
+```
+
+The non-unified branch loads **seven** design directories:
+
+```cpp
+ld_qkv = ... art + "/qkv";        ld_ao = ... art + "/attn_out";
+ld_fu  = ... art + "/ffn_up";     ld_fd = ... art + "/ffn_down";
+ld_gelu= ... art + "/gelu";       ld_ln = ... art + "/layernorm";
+ld_sm  = ... art + "/softmax";
+printf("  designs    7 resident xclbins\n");
+```
+
+So neither existing path gets LayerNorm onto the NPU as things stand:
+
+- **Unified** (what ships): one xclbin, 12 streams, and the eltwise ops are
+  *forced* onto the host regardless of `StackOptions::host_ln`.
+- **Non-unified**: needs four *separate* GEMM design directories, and the repo
+  ships none — `open_kernels/designs/` has no `qkv`, `attn_out`, `ffn_up` or
+  `ffn_down`. Those kernels exist only inside the unified `gemm_rtp` set, and
+  `build-design-sets.py` calls `export_gemm_rtp.py` alone with no mechanism for
+  extra designs.
+
+Two ways forward, and the choice is architectural rather than mechanical:
+
+**(a) Let unified mode bind an eltwise design when one is present.** Keep
+`gemm_rtp/` as-is and additionally emit `layernorm/` beside it; change the
+forcing so it becomes `if (unified && !eltwise_design_present)`. This is
+**fail-safe**: a model without the directory keeps today's behaviour exactly,
+because the condition is the absence of a file the build controls. The family
+build gains one extra design, and the engine gains a presence check. It also
+composes with fused attention later, since FA would ride the same mechanism.
+
+**(b) Build the full seven-design set.** Emit four standalone GEMM designs
+alongside `layernorm`, `gelu` and `softmax`, and switch this model to
+non-unified. No engine change at all, but four new GEMM design builds per family
+and a second code path to keep correct — and the 7-xclbin switch cost is a real
+regression against unified's "zero switches".
+
+(a) is the smaller change and keeps the single-xclbin benefit. It is proposed,
+not done, because it alters dispatch semantics for every model that uses unified
+mode, which is not a call to make silently.
+
+Note also that the non-unified list has **no `fa` entry** either. Fused attention
+needs a new `Design` member plus a dispatch branch in `qk()`/`av()` either way —
+the placement work above does not come with it.
+
+---
+
 ## 4. Step 3 — GELU, then a banded-softmax design
 
 Gated GeGLU, so the host applies GELU to the gate half before the elementwise
