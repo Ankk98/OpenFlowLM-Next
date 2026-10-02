@@ -1,4 +1,6 @@
-// `oflm decide <tag> --input-file <f.json>` -- the CLI surface for a decision
+// `oflm decide <tag> -i <f.json>` -- the CLI surface for a decision
+// (`-i` / `--prompt`, per vm_args.hpp; this comment previously said
+// `--input-file`, which the parser does not accept.)
 // model, and the FIRST of the two Phase 8 surfaces. It is here, and the server
 // route is written second, so that the route's only untested part is HTTP: a
 // route that wraps an unverified engine is one more layer between a bug and

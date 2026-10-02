@@ -326,6 +326,56 @@ Dependency notes:
    the blobs. So there is no second copy of the kernels to fall back on.
    A build-tree binary also needs `OFLM_MODELINFO_PATH=src/model_info.json`.
 
+### Laya / `.npue` models are NOT installed with `oflm-add`
+
+This cost a wrong turn, so it is worth stating flatly. `oflm-add` requires
+`model.q4nx`, the Q4NX container used by decoder LLMs, and refuses with *"Model
+is missing required files: ['model.q4nx']"*. A decision model like
+`laya-decision` uses a **`.npue`** container instead, and its registry entry
+points at the *unconverted* upstream repo. `q4nx-build` is no help either: it
+converts **GGUF** to Q4NX and its configs are all decoder-only LLMs (Gemma, GPT-OSS,
+LFM2, LLaMA, Phi-4, Qwen 2/2.5/3/3.5/3.6, Granite, Hunyuan) — there is no encoder
+or BERT-shaped architecture in it at all.
+
+The path that works is three steps, and none of it is new code:
+
+1. Download exactly the files the registry entry lists, into
+   `~/.config/oflm/models/<name>/`, preserving the nested layout.
+2. `NpueDecision` packs the container **itself on first load** by calling
+   `npue::prepare_model_auto(PrepareOptions)`. It needs no `.npue` to exist; it
+   looks for `model.safetensors` and writes `<name>.npue` next to it. The three
+   subdirectory keys exist *because of Laya* — its tree is
+   `multilingual/{encoder/config.json, model.safetensors, tokenizer/tokenizer.json,
+   rl_agent_config.json}`, so config, weights and tokenizer sit at three different
+   depths and none can be guessed.
+3. Link the design set the entry names in `npue_design_family` to
+   `<model_dir>/npu_designs/gemm_rtp`. Without it the engine refuses with
+   *"no design set for this model"*.
+
+Verified end to end on 2026-10-02: packed `laya.npue` (307 tensors, 1080.61 MB),
+one xclbin with 12 streams over 3 batch tiers, and answered a decision request
+with **column utilisation peaking at 21%** — the NPU really ran the encoder. 21%
+rather than 98% is the expected shape while qk/softmax/av/GELU/LayerNorm are all
+still host-side, and it is the number the migration is trying to move.
+
+Two things this corrected:
+
+- Laya's `model_type` **is `modernbert`**, so it packs as
+  `arch=modernbert_rope_geglu`. I had assumed arch 4 was a different model
+  because its comment quotes `ffn_up 3072`; with `intermediate=1152` the packed
+  geometry is `ffn_up=2304` and it is Laya's own path. The packing banner
+  reports the truth: `hidden=768 heads=12 head_dim=64 layers=22 inter=1152
+  ffn_up=2304 ... window=64 ... 8 full / 14 sliding`.
+- The pooling line says `mean (FICTION -- ModernBERT pools by marker gather)`.
+  For a decision model the marker gather is what runs; the `mean` is the
+  inherited default and the note says so.
+
+The decision request schema is easy to get wrong and the CLI's own header comment
+was wrong about the flag: it is `oflm decide <tag> -i <f.json>` (`-i` /
+`--prompt`), not `--input-file`. `questions` is an **object keyed by question
+key**, not an array, and each entry needs `type`, `instructions` and a `criteria`
+object whose key order *is* the answer space for a choice.
+
 ### Open: freshly installed converted models time out on first dispatch
 
 Both `qwen3:0.6b` and `lfm2:1.2b`, installed and sha256-verified, with the
