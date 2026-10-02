@@ -118,6 +118,100 @@ else()
             set(XRT_LIB_DIR     /opt/xilinx/xrt/lib     CACHE PATH "Where XRT libs live")
         endif()
 
+        # ———————————————————————————————————————————————
+        # XRT version gate.
+        #
+        # A host can easily carry two XRT installs at once — this workstation has
+        # 2.20 under /usr/include/xrt (via distro packaging) and 2.25 under
+        # /opt/xilinx/xrt. Nothing else in this file pins a version, so a distro
+        # upgrade, an xrt.pc appearing, or a fresh configure without the cache
+        # can compile some translation units against one and link the other. The
+        # headers are not ABI-compatible across that gap.
+        #
+        # The two layouts do NOT expose the same macros, which is the subtle part:
+        #   2.20 -> xrt/detail/version.h defines XRT_VERSION_MAJOR / _MINOR / _PATCH
+        #   2.25 -> xrt/detail/version-slim.h defines XRT_VERSION_CODE
+        #           XRT_VERSION(2, 25) and xrt_build_version[] = "2.25.0",
+        #           and defines NO XRT_VERSION_MAJOR at all.
+        # So a check that only greps for XRT_VERSION_MINOR passes vacuously
+        # against 2.25. Read xrt_build_version first, then fall back.
+        # ———————————————————————————————————————————————
+        set(OFLM_XRT_EXPECTED_VERSION "2.25" CACHE STRING
+            "XRT major.minor this build is verified against")
+
+        function(_oflm_xrt_version_from_inc inc outvar)
+            set(${outvar} "" PARENT_SCOPE)
+            foreach(h "${inc}/xrt/detail/version-slim.h"
+                        "${inc}/xrt/detail/version.h")
+                if(EXISTS "${h}")
+                    file(READ "${h}" _txt)
+                    # Preferred: the built-in string, e.g. xrt_build_version[] = "2.25.0".
+                    # CMake's regex has no \s and treats "." as any character, so
+                    # use [ \t]* and [.] explicitly.
+                    string(REGEX MATCH "xrt_build_version\\[\\][ \t]*=[ \t]*\"([0-9]+)[.]([0-9]+)"
+                           _m "${_txt}")
+                    if(_m)
+                        set(${outvar} "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}" PARENT_SCOPE)
+                        return()
+                    endif()
+                    # Fallback: the older explicit macros.
+                    # NOTE: read CMAKE_MATCH_* out IMMEDIATELY after each
+                    # string(REGEX MATCH). A second match resets CMAKE_MATCH_1/2,
+                    # so capturing both pairs from one variable afterwards yields
+                    # "20." instead of "2.20".
+                    string(REGEX MATCH "XRT_VERSION_MAJOR[ \t]+([0-9]+)" _mj "${_txt}")
+                    set(_mj_v "${CMAKE_MATCH_1}")
+                    string(REGEX MATCH "XRT_VERSION_MINOR[ \t]+([0-9]+)" _mn "${_txt}")
+                    set(_mn_v "${CMAKE_MATCH_1}")
+                    if(_mj_v AND _mn_v)
+                        set(${outvar} "${_mj_v}.${_mn_v}" PARENT_SCOPE)
+                        return()
+                    endif()
+                endif()
+            endforeach()
+        endfunction()
+
+        if(XRT_INCLUDE_DIRS)
+            list(GET XRT_INCLUDE_DIRS 0 _xrt_inc0)
+        else()
+            set(_xrt_inc0 "${XRT_INCLUDE_DIR}")
+        endif()
+
+        _oflm_xrt_version_from_inc("${_xrt_inc0}" _xrt_ver)
+        if(_xrt_ver STREQUAL "")
+            message(WARNING
+                "Could not determine an XRT version from '${_xrt_inc0}'. "
+                "Expected ${OFLM_XRT_EXPECTED_VERSION}. Refusing to guess.")
+        elseif(NOT _xrt_ver VERSION_EQUAL OFLM_XRT_EXPECTED_VERSION)
+            message(FATAL_ERROR
+                "XRT version mismatch.\n"
+                "  resolved include dir : ${_xrt_inc0}\n"
+                "  found version        : ${_xrt_ver}\n"
+                "  expected version     : ${OFLM_XRT_EXPECTED_VERSION}\n"
+                "A stale CMakeCache.txt is the usual cause — reconfigure, or set "
+                "XRT_INCLUDE_DIR to the intended install. To override "
+                "deliberately, pass "
+                "-DOFLM_XRT_EXPECTED_VERSION=${_xrt_ver}.")
+        else()
+            message(STATUS "XRT version ${_xrt_ver} (expected ${OFLM_XRT_EXPECTED_VERSION}) from ${_xrt_inc0}")
+        endif()
+
+        # Warn about the split specifically, because a wrong /usr copy is the
+        # failure mode that actually bites: the gate above only inspects the
+        # directory this build resolved to.
+        foreach(_probe /usr/include /usr/local/include /opt/xilinx/xrt/include)
+            if(NOT _probe STREQUAL "${_xrt_inc0}" AND IS_DIRECTORY "${_probe}/xrt")
+                _oflm_xrt_version_from_inc("${_probe}" _other)
+                if(_other AND NOT _other VERSION_EQUAL _xrt_ver)
+                    message(WARNING
+                        "A second XRT install exists: ${_probe} is ${_other}, but "
+                        "this build resolved ${_xrt_inc0} (${_xrt_ver}). If a "
+                        "dependency pulls headers from the other one, you will "
+                        "compile against ${_other} and link ${_xrt_ver}.")
+                endif()
+            endif()
+        endforeach()
+
         # Portable XRT build: statically link FFmpeg (and zlib) so the self-
         # contained tarball does not depend on the host having libavformat/
         # libavcodec/... installed. FFmpeg and zlib are fetched and built from
