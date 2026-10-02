@@ -21,7 +21,20 @@ For each successfully packed model, create or update a skill to ensure the next 
 
 Note: Peano (llvm-aie) has not been added to PATH to avoid conflict with
       system clang/clang++. It can be found in:
-      ./ironvenv/lib/python3.12/site-packages/llvm-aie/bin
+      ./ironvenv/lib/python3.*/site-packages/llvm-aie/bin
+
+      The interpreter minor version tracks the system Python and has moved before
+      (it was python3.12, and is python3.14 as of 2026-10-02), so glob the `3.*`
+      rather than hardcoding it. Verify what you actually got before trusting a
+      toolchain path:
+          ls -d ./ironvenv/lib/python3.*/site-packages/llvm-aie/bin
+          ./ironvenv/lib/python3.*/site-packages/llvm-aie/bin/clang --version
+
+      As of 2026-10-02 that reports clang 21.0.0 from Xilinx/llvm-aie commit
+      c9c5ecb, with targets aie, aie2, aie2p and aie2ps. This repo builds
+      `--target=aie2p-none-unknown-elf` exclusively (XDNA2 / Strix Halo);
+      aie2-none-unknown-elf is the older XDNA part (Phoenix, Hawk Point) and is
+      not what any design here wants.
 
 Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setup.sh also *if needed*
 

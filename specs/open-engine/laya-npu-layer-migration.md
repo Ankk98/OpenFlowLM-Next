@@ -102,10 +102,25 @@ Then, in order, with no step skipped:
    variance, mixed sign) before trusting any timing.
 3. **Only then** set `host_ln=false` for the unified path and re-measure.
 
-Hardware note for the build: `rsqrt` is scalar-only on AIE2P (no `vexp2`/`vtanh`
-path here — this is `srsqrt`), so the reduction dominates the kernel. Expect the
-768 build to be latency-bound on the horizontal reduction, which AIE2P has no
-single instruction for.
+Hardware notes for the build, all from `AIETargetModel.h`
+`BaseNPU2TargetModel` and the kernel driver's own documentation:
+
+- `rsqrt` is scalar-only on AIE2P (this is `srsqrt`), so the reduction dominates
+  the kernel. Expect the 768 build to be latency-bound on the horizontal
+  reduction, which AIE2P has no single instruction for.
+- **`getComputeTileMaxVectorAlignBits() = 512`.** A full-width vector access needs
+  512-bit alignment even though the load/store bus is 256-bit. A buffer that is
+  only 256-bit aligned will split or fault. This is a new constraint relative to
+  AIE2 and is easy to trip.
+- The L2 budget is **512 KB per column**, not the 3 MB an earlier note claimed:
+  there is exactly one memtile row (`getNumMemTileRows() = 1`) and
+  `getMemTileSize() = 0x80000`. The kernel docs independently state 4096 KB total
+  for Strix Point, i.e. 8 × 512 KB. At `LN_N=768` the whole layer plus its
+  weights is about 4.6 KB, so capacity is not the constraint here — bandwidth and
+  the reduction are.
+- AIE2P exposes **1–7 virtualized column counts**, not just the full 8
+  (`VirtualizedNPU2TargetModel`, `TK_AIE2_NPU2_1Col`..`_7Col`). A design that
+  wants all 8 must ask for them explicitly and cannot assume it.
 
 ---
 
@@ -137,6 +152,13 @@ physical columns, then loops. AIE2P has 8 columns, so `2 * 4 = 8` fits exactly.
 Laya is strictly *smaller* than the verified Whisper point on every axis that
 presses memtile budget (seq 1024 < 1536, heads 12 < 20), which is the good
 direction. Divisibility holds: `12 * 64 = 768`, `768 % (4 * 64) == 0`.
+
+Two cautions the driver documentation adds. First, column allocation is the
+driver's **Resource Solver** decision, made from workload-declared hints plus its
+own heuristics and enforced by firmware — requesting 8 columns is not a guarantee
+of receiving them. Second, each workload context costs a **64 MB host-resident
+instruction buffer** regardless of design size, so a multi-design family pays that
+per context, not per dispatch. Strix Point supports 16 concurrent contexts.
 
 ```bash
 cd open_kernels/designs/whisper_fa
@@ -235,3 +257,12 @@ Verified on this host, so each step can be measured rather than asserted:
   natural way to write this, but the installed build is 1.4.2 and does not
   provide `operators/`. Using it requires approval to change the environment.
 - MSVC and full HRX builds are unavailable here.
+- **AMD publishes no AIE2P architecture manual.** Per-core MAC counts and cascade
+  rules therefore come from generated Peano disassembly and `aie_api` config,
+  which is weaker evidence than the array geometry — the geometry is confirmed by
+  `AIETargetModel.h`, `amdnpu.rst` and `xrt-smi examine` agreeing, but the
+  throughput table has no such triple. Treat it as a working figure.
+- Two commonly-reached sources are **wrong for this chip** and must not be merged:
+  `pp4fpgas.readthedocs.io` describes AIE1 (4 columns, Versal AI Core), and
+  `amd.com/.../ai-engine.html` is Versal AIE/AIE-ML marketing that contradicts
+  itself on INT8 throughput. See *How to read the sources* in the visualization.

@@ -291,13 +291,27 @@
       <div class="hwgrid">
         <div class="hw"><div class="t">Compute tiles</div><div class="v2">32</div><div class="n">8 columns &times; 4 rows</div></div>
         <div class="hw"><div class="t">ShimNOC</div><div class="v2">8</div><div class="n">row 0 &mdash; DDR &harr; NoC</div></div>
-        <div class="hw"><div class="t">Memtiles</div><div class="v2">8</div><div class="n">row 1 &mdash; 512 KB each</div></div>
-        <div class="hw"><div class="t">Total L2</div><div class="v2">4 MB</div><div class="n">3 MB addressable per column</div></div>
+        <div class="hw"><div class="t">Memtiles</div><div class="v2">8</div><div class="n">row 1 &mdash; 512 KB each, 8 banks</div></div>
+        <div class="hw"><div class="t">Total L2</div><div class="v2">4 MB</div><div class="n">512 KB per column &mdash; 8 &times; 512 KB, one memtile row</div></div>
         <div class="hw"><div class="t">L1 per core</div><div class="v2">64 KB</div><div class="n">63 KB usable, 1 KB stack</div></div>
         <div class="hw"><div class="t">Program mem</div><div class="v2">16 KB</div><div class="n">1024 &times; 128-bit instrs</div></div>
       </div>
       <p class="k" style="margin-top:9px">xrt-smi examine: NPU Strix Halo &middot; aie2p &middot; 6&times;8 &middot;
         XRT 2.25.0 &middot; FW 1.1.2.65 &middot; PCI 1022:17f0</p>
+      <p class="note">Confirmed three ways, and they agree.
+        <code>AIETargetModel.h</code> <code>BaseNPU2TargetModel</code> returns
+        <code>rows() = 6</code> &mdash; <i>"1 Shim row, 1 memtile row, and 4 Core rows"</i> &mdash;
+        with <code>getTileType</code> mapping row 0 to ShimNOC, row 1 to MemTile and rows 2&ndash;5
+        to CoreTile (which is exactly why <code>whisper_fa</code> uses <code>row = 2 + ty</code>).
+        <code>NPU2TargetModel</code> returns <code>columns() = 8</code>. AIE2P does <b>not</b> override
+        the memtile size or L1 size; it inherits AIE2's
+        <code>getMemTileSize() = 0x80000</code> (512 KB) and
+        <code>getLocalMemorySize() = 0x10000</code> (64 KB).
+        The kernel's own <code>amdnpu.rst</code> independently states
+        <i>"AMD Strix Point client APU have 4x8 topology"</i> and
+        <i>"AMD Strix Point NPU has a total of 4096 KB of L2 memory"</i> &mdash; 8 &times; 512 KB.
+        An earlier revision of this page claimed <b>3 MB addressable per column</b>. There is one
+        memtile row, so per-column L2 is 512 KB. Corrected.</p>
     </div>
     <div class="card">
       <h3>Matrix throughput per core (higher is better)</h3>
@@ -315,6 +329,14 @@
       bf16 8&times;8&times;8 costs two native 4&times;8&times;8 ops and two accumulators.</p>
       <p class="note">Whole-array bf16 peak &asymp; 50 TOPS at 1.5 GHz nominal (1.76 GHz measured;
       1.8 GHz max per AMD). Achieved: 37.35 TOPS int8 on the best published kernel.</p>
+      <p class="note"><b>Two constraints that bite kernel authors</b>, both from
+      <code>BaseNPU2TargetModel</code>:
+      <code>getComputeTileMaxVectorAlignBits() = 512</code>, so a full-width vector access needs
+      <b>512-bit alignment even though the load/store bus is 256-bit</b> &mdash; a buffer that is
+      merely 256-bit aligned will fault or silently split.
+      And the array is <b>virtualizable</b>: <code>VirtualizedNPU2TargetModel</code> exists for
+      <code>TK_AIE2_NPU2_1Col</code> through <code>_7Col</code>, so a design may claim 1&ndash;7 columns
+      instead of all 8. A design that wants all 8 must say so, and cannot assume it.</p>
     </div>
   </div>
 
@@ -634,6 +656,105 @@ printf(<span class="m">"  designs    7 resident xclbins\n"</span>);   <span clas
     matched the bash wrapper, because the shell's own command line contains the rig's path.
   </div>
 
+  <h2>Device runtime, per the kernel driver documentation</h2>
+  <p class="note">Not microarchitectural guesses &mdash; these are what <code>amdnpu.rst</code> states
+  the driver and firmware do, and they bound what a host program may assume.</p>
+  <div class="grid g2">
+    <div class="card">
+      <h3>Concurrency and memory</h3>
+      <table>
+        <tr><th>property</th><th>value</th><th>consequence</th></tr>
+        <tr><td>Concurrent workload contexts</td><td><b>16</b></td>
+            <td>Strix Point; Phoenix/Hawk Point only 6. Not our limit &mdash; we use one.</td></tr>
+        <tr><td>Instruction buffer</td><td><b>64 MB</b></td>
+            <td>Host-resident, <b>per context</b>, PASID-protected, mapped into ERT <i>and</i> user
+                space. Paid whether or not a design is large.</td></tr>
+        <tr><td>Partitioning</td><td>column granularity</td>
+            <td>Spatial partitions are set up by the microcontroller programming column-isolation
+                registers; each carries its own PASID.</td></tr>
+        <tr><td>Column allocation</td><td>Resource Solver</td>
+            <td>The driver repartitions the array from workload-declared hints plus its own
+                heuristics, and firmware enforces the binding. A design cannot assume it receives the
+                columns it asked for.</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Submission path, end to end</h3>
+      <p class="note">The host compiles an <b>overlay</b> (stream-switch configuration plus per-tile
+      ELF) and a <b><code>ctrlcode</code></b> opcode stream. Userspace opens a context; the Resource
+      Solver provisions columns; MERT creates an ERT and maps the 64 MB instruction buffer; userspace
+      writes <code>ctrlcode</code> into it, submits a command buffer over the mailbox and sleeps.
+      ERT <i>executes</i> <code>ctrlcode</code>, which kicks off DMAs to and from host DDR while the
+      array runs, then raises MSI-X to wake the waiter.</p>
+      <p class="note">DMA is encoded as <code>XAIE_IO_BLOCKWRITE</code> opcodes <i>inside</i>
+      <code>ctrlcode</code> &mdash; which is why the <code>XAIE_IO_*</code> table matters when reading a
+      captured instruction stream, and why a host-side dispatch call is <b>not</b> the same event as a
+      data movement being issued.</p>
+    </div>
+  </div>
+
+  <h2>How to read the sources, and which ones to distrust</h2>
+  <p class="note">Four more sources were surveyed. Two are authoritative and <b>corroborate</b> the
+  numbers above. Two would <b>actively mislead</b> if merged into them, so they are quarantined here
+  with the reason. This table is the point of the section, not a bibliography.</p>
+  <table>
+    <tr><th>source</th><th>standing</th><th>what it settles &mdash; or what it would break</th></tr>
+    <tr><td><code>docs.kernel.org/accel/amdxdna/amdnpu.html</code><br>
+        <span class="pill">kernel doc</span></td>
+        <td><span class="tag t-ok">AUTHORITATIVE</span></td>
+        <td>Corroborates <b>4&times;8 topology</b> and <b>4096 KB L2</b> for Strix Point.
+        Adds: <b>16 concurrent workload contexts</b> (Phoenix/Hawk Point only 6);
+        a <b>64 MB host-resident instruction buffer per context</b>, PASID-protected and mapped into
+        both ERT and user space; a <b>Resource Solver</b> that partitions columns from workload-declared
+        hints; spatial partitioning at column granularity; firmware telemetry
+        (L1 interrupt / DMA / deep-sleep counters) that this box exposes no path to;
+        and the fact that DMA is encoded as <code>XAIE_IO_BLOCKWRITE</code> in <code>ctrlcode</code>.
+        Its worked <code>drm-total-memory</code> example (67632 KiB = heap + internal + external)
+        confirms that figure is a <b>usage sum</b>, which is the correction made on the Data flow tab.</td></tr>
+    <tr><td><code>github.com/Xilinx/llvm-aie</code><br>
+        <span class="pill">compiler source</span></td>
+        <td><span class="tag t-ok">AUTHORITATIVE</span></td>
+        <td>Names the targets: <code>aie2-none-unknown-elf</code> is XDNA (Phoenix/Hawk Point) and
+        <code>aie2p-none-unknown-elf</code> is XDNA2 (Strix Point). This repo builds
+        <b>aie2p exclusively</b> &mdash; 38,609 occurrences, zero of anything else. Local Peano is
+        <b>clang 21.0.0 @ c9c5ecb</b> and registers <code>aie, aie2, aie2p, aie2ps</code>.
+        The architectural statement that matters for scheduling: these are
+        <b>in-order, exposed-pipeline VLIW cores with no stall logic</b> &mdash; instructions retire in
+        program order regardless of the pipeline, so the compiler, not the hardware, hides latency.
+        Also <b>20-bit pointer registers</b>, and varying instruction-slot widths, so branch and return
+        targets carry alignment restrictions. Carries its own caveat: maturity
+        <i>"similar to other Experimental LLVM architectures"</i>.</td></tr>
+    <tr><td><code>pp4fpgas.readthedocs.io/.../project_aie.html</code><br>
+        <span class="pill">third-party</span></td>
+        <td><span class="tag t-warn">DO NOT MERGE NUMBERS</span></td>
+        <td>This is a <b>university course page</b>, not vendor documentation, and it describes
+        <b>AIE1 &mdash; 4 columns, 16 compute tiles, Versal AI Core</b>, not our 8-column AIE2P.
+        Its "512 int8 or 64 int16 MACs in parallel per clock" figure is AIE1's vector width and would
+        silently halve our per-core throughput numbers if quoted.
+        Its <i>concepts</i> are still worth reading, and they are the concepts this repo already uses:
+        ObjectFIFOs as the data-movement and synchronisation primitive, TensorAccessPatterns
+        (the wrap/stride lists in <code>ln.py</code> and <code>attn_fa.py</code> are exactly this),
+        and the two-level tiling idea of (M,K,N) &rarr; (m,k,n) &rarr; (r,s,t). The rest of the page is
+        coursework, cloud-VM setup and a grading rubric.</td></tr>
+    <tr><td><code>amd.com/.../technologies/ai-engine.html</code><br>
+        <span class="pill">marketing</span></td>
+        <td><span class="tag t-bad">MARKETING &mdash; VERSAIL, NOT AIE2P</span></td>
+        <td>Confirms three things <i>directionally</i>: <b>512 KB memory tiles</b>,
+        <b>64 KB local data memory per tile</b>, and explicitly that
+        <b>FP32 is "SW emulation"</b> rather than a native unit &mdash; which independently supports the
+        <code>__AIE_API_FP32_SUPPORT__ = 0</code> finding above. But it describes <b>Versal AIE and
+        AIE-ML</b>, a different silicon family, so its per-tile tables are not AIE2P's.
+        It is also <b>self-inconsistent</b>: the FFT/FIR bullet claims "128 INT8 MACs per tile" while
+        the AIE table two sections up says INT8 256. A page that disagrees with itself is not a source
+        for a number. Treat it as a signpost to the architecture manuals (AM009, AM020, UG1079), which
+        are gated and were not available for this survey.</td></tr>
+  </table>
+  <p class="note"><b>The honest gap.</b> AMD publishes no AIE2P architecture manual, which is why the
+  per-core MAC counts and the cascade rules on this page come from generated Peano disassembly and
+  <code>aie_api</code> config rather than from a spec. Three independent sources agreeing on the
+  array geometry raises confidence in the geometry specifically &mdash; it does not upgrade the
+  throughput table to the same standing, and this page does not claim it does.</p>
+
   <h2>What works, verified</h2>
   <table>
     <tr><th>instrument</th><th>unit</th><th>verdict</th><th>how</th></tr>
@@ -754,11 +875,16 @@ delta_dispatch = Δ command_submissions        <span class="m">// GET_ARRAY HW_C
 </div>
 
 <footer>
-  Generated 2026-10-01. Sources: driver <code>~/repos/xdna-driver</code> @ e2d8f83 &middot;
+  Generated 2026-10-02. Sources: driver <code>~/repos/xdna-driver</code> @ e2d8f83 &middot;
   XRT 2.25.0 @ <code>/opt/xilinx/xrt</code> &middot; mlir-aie 1.4.2 &middot; IRON upstream @ 3fc9a60 &middot;
-  AMD's <i>Striking the Balance</i> (arXiv 2512.13282) &middot; Peano aie2p disassembly generated locally.
-  Hardware figures from <code>AIETargetModel.h</code>; instruction figures from disassembly, since AMD
-  publishes no XDNA2 architecture manual.
+  AMD's <i>Striking the Balance</i> (arXiv 2512.13282) &middot; Peano aie2p disassembly generated locally &middot;
+  Peano <b>clang 21.0.0 @ c9c5ecb</b>, target <code>aie2p-none-unknown-elf</code> &middot;
+  <code>docs.kernel.org/accel/amdxdna/amdnpu.html</code> (authoritative) &middot;
+  <code>Xilinx/llvm-aie</code> (authoritative).
+  Hardware figures from <code>AIETargetModel.h</code>, corroborated by the kernel driver documentation;
+  instruction figures from disassembly, since AMD publishes no XDNA2 architecture manual.
+  Two surveyed sources are deliberately <b>not</b> merged into any figure here &mdash; see
+  <i>How to read the sources</i> on the Profiling tab.
 </footer>
 
 <script>

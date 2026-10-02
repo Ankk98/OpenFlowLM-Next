@@ -29,6 +29,15 @@ Read these project references before changing NPU kernels or model engines:
    validates and does nothing), and this workstation's disk/RAM limits. Read it
    before adding a regression gate or running any build that writes gigabytes.
 
+7. `references/sources-and-standing.md` records which sources may be quoted for
+   NPU facts: the kernel driver's `amdnpu.rst` and in-tree `AIETargetModel.h` are
+   authoritative; the Peano README names the `aie2` vs `aie2p` targets and the
+   exposed-pipeline scheduling model; and two commonly-reached pages describe a
+   *different* chip (AIE1 course notes, Versal AIE-ML marketing) and must not be
+   merged into AIE2P numbers. Read it before quoting any hardware figure, because
+   AMD publishes no XDNA2 architecture manual and the standing of the evidence
+   varies a lot by which number you mean.
+
 Required rules:
 
 - Put reusable binary/XCLBIN investigation tools under `utilities/`.
@@ -40,3 +49,7 @@ Required rules:
   error rather than silently depending on the closed component.
 - After compiling new XCLBINs or libraries, record exact commands, toolchain
   versions, shapes, hashes, and validation results in a new or updated skill.
+- State the standing of every hardware figure you rely on: authoritative source,
+  or the weaker provenance you actually have ("from disassembly"). Three
+  corroborating sources raise confidence in *that* number only, never in its
+  neighbours. Record disagreements in the artifact rather than only the verdict.
