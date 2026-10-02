@@ -300,6 +300,49 @@ Dependency notes:
 
 ---
 
+## 10a. Building a design: the recipe, and three undocumented traps
+
+```bash
+source ironvenv/bin/activate
+export PATH="$PATH:/opt/xilinx/xrt/bin"        # aiebu-asm + xclbinutil
+export LN_N=768 LN_EPS=1e-5                     # whatever the design reads
+python3 open_kernels/build_design.py <design>.py <out_dir>
+```
+
+1. **`/opt/xilinx/xrt/bin` must be on `PATH`.** `aiebu-asm` and `xclbinutil`
+   are not on it by default and `aiecc` dies with a bare "tool not found" deep
+   in the pipeline (step 27/38 and 38/38 respectively), which reads like a
+   kernel bug. That directory holds `aiebu-asm`, `aiebu-dump`,
+   `aiebu-transform`, `xclbinutil` and `xrt-smi`; prefer it to the copies in
+   the driver's XRT build tree. Note `AGENTS.md` points at
+   `utilities/mlir-aie/utils/env_setup.sh`, which does not exist.
+2. **The output directory is `argv[2]`**, defaulting to `designs/<name>/build`.
+   Omit it and the build silently overwrites whatever was in `build/`. Outputs
+   are gitignored, so nothing reaches git either way.
+3. **The on-hardware harness is behind an option that defaults OFF:**
+   `-DOFLM_BUILD_OPEN_KERNELS_HARNESS=ON`. Also pass `-DOFLM_BUILD_KERNELS=OFF`
+   to skip the long kernel compile when you only want the harness, and expect to
+   supply `-DOFLM_VERSION` and `-DNPU_VERSION`, which are required with no
+   defaults.
+
+Validation, once built, needs no packed model:
+
+```bash
+cd open_kernels/designs/<design>
+LN_N=<N> LN_BUILD=<out_dir> python3 make_test.py    # fp64 reference + run.cfg
+run_kernel run.cfg                                  # device state per run
+python3 compare.py                                  # the gate; exit 0 = pass
+```
+
+`make_test.py` honours `LN_N` and `LN_BUILD`, and `run.cfg` pins the buffer
+widths — a good check that the width really reached the design. Always run the
+corruption arm: flip 36 bytes of `insts.bin`, and require the device state to
+change and the run to fail. For the LayerNorm 768 kernel, good = state 4 in
+0.295 ms, corrupted = state 8 after a 4087 ms timeout. Without that arm a
+numerical pass could come from a host fallback.
+
+---
+
 ## 11. The honest gap
 
 **AMD publishes no XDNA2 architecture manual.** Consequences, stated plainly:

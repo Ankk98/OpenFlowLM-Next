@@ -84,23 +84,70 @@ passes** (kHalf=384, 384 % 32 = 0). Existing builds are 2048, 2560, 3072, 3840,
 4096 — all satisfy it too, so this is a normal parameterisation, not a new shape
 class.
 
-Build:
+### DONE 2026-10-02 — built and validated
+
+`LN_N=768` is built, numerically correct on real hardware, and proven to have
+actually executed on the NPU. Results:
+
+| gate | result | threshold |
+|---|---|---|
+| `y` (fp32 add) max rel err | **5.38e-08** | < 1e-6 |
+| `xn` (bf16) cosine | **0.99999999** | > 0.999999 |
+| `xn` max rel err | **1.263e-03** | < 8e-3 |
+| bf16 element mismatches | **1 / 768** | < 5% |
+| device state, good kernel | **4**, 0.295 ms then 0.087 ms | — |
+| device state, 36 bytes corrupted | **8**, 4087 ms, `run k FAILED` | must differ |
+
+The corruption arm is what makes the rest mean something: the same harness on
+the same buffers returns state 4 in under a millisecond when the instructions
+are intact and state 8 after a timeout when they are not. No host fallback can
+produce a device kernel state, so the numbers above came from the AIE.
+
+Build recipe (note the PATH entry — see below):
 
 ```bash
-cd open_kernels/designs/ln
-LN_N=768 LN_EPS=1e-5 python3 ln.py
+source ironvenv/bin/activate
+export PATH="$PATH:/opt/xilinx/xrt/bin"     # aiebu-asm + xclbinutil, see below
+export LN_N=768 LN_EPS=1e-5
+python3 open_kernels/build_design.py open_kernels/designs/ln/ln.py \
+       open_kernels/designs/ln/build_768_1e-05
 ```
 
-Then, in order, with no step skipped:
+Three build facts that cost time and are not documented anywhere:
 
-1. **Prove engagement.** Flip 36 bytes of the emitted `insts.bin` and confirm the
-   run refuses (`kernel state 5`). A kernel that silently produces the same
-   output is worse than one that crashes. This is the corruption test already
-   used for the projection GEMMs.
-2. **Prove correctness.** `utilities/laya_preln_reference.py` is the float64
-   oracle; compare against it on adversarial inputs (large mean, near-zero
-   variance, mixed sign) before trusting any timing.
-3. **Only then** set `host_ln=false` for the unified path and re-measure.
+- **`/opt/xilinx/xrt/bin` must be on `PATH`.** `aiebu-asm` and `xclbinutil` are
+  not on it by default, and `aiecc` fails with a bare "tool not found" at steps
+  27/38 and 38/38. `AGENTS.md` points at `utilities/mlir-aie/utils/env_setup.sh`,
+  which **does not exist**. `/opt/xilinx/xrt/bin` has all four tools
+  (`aiebu-asm`, `aiebu-dump`, `aiebu-transform`, `xclbinutil`, `xrt-smi`), so
+  prefer it over the copy in the driver's XRT build tree.
+- **`build_design.py` takes the output directory as `argv[2]`** and otherwise
+  writes to `designs/ln/build`, silently overwriting whatever was there. Build
+  outputs are gitignored, so nothing lands in git either way.
+- **The harness is behind a CMake option that defaults OFF:**
+  `-DOFLM_BUILD_OPEN_KERNELS_HARNESS=ON` (plus `-DOFLM_BUILD_KERNELS=OFF` to
+  skip the long kernel compile, and `-DOFLM_VERSION` / `-DNPU_VERSION`, which
+  are both required and have no defaults).
+
+### The width assert has teeth — verified
+
+```bash
+LN_N=100 LN_EPS=1e-5 python3 open_kernels/build_design.py \
+    open_kernels/designs/ln/ln.py /tmp/ln-teeth
+# ln.h:24:15: error: static assertion failed due to requirement 'kHalf % kV == 0'
+```
+
+So the constraint is live rather than compiled out, and the build fails loudly
+instead of silently producing a wrong kernel. `build_768_1e-05/insts.bin` is
+836 bytes, sha256 `3c45bcd9...`, and differs from the pre-existing
+`build_2048_1e-05/insts.bin` (same size, sha256 `2e9e5937...`) — the width
+reached the kernel rather than defaulting.
+
+### Still to do
+
+Wire the built xclbin into the family bundle and set `host_ln=false` for the
+unified path, then re-measure. The numerical and engagement gates above are
+satisfied; what remains is integration, not kernel work.
 
 Hardware notes for the build, all from `AIETargetModel.h`
 `BaseNPU2TargetModel` and the kernel driver's own documentation:

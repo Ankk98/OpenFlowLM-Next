@@ -549,12 +549,16 @@ printf(<span class="m">"  designs    7 resident xclbins\n"</span>);   <span clas
       <div class="n">2</div>
       <div>
 
-        <h4>LayerNorm <span class="tag t-build">BUILD ONLY</span> <span class="pill">cheapest</span></h4>
+        <h4>LayerNorm <span class="tag t-ok">BUILT + VALIDATED</span> <span class="pill">cheapest</span></h4>
         <p><b>No new host code.</b> <code>open_kernels/designs/ln/</code> already holds a fused
         add+norm design (<code>ln.cc</code>, <code>ln.h</code>) parameterised by <code>LN_N</code> and
         <code>LN_EPS</code>, and <code>catalogue.py</code> already has an <code>ln</code> template.
-        Eight widths are built (2048&ndash;4096); <b>768 is not</b>. Build it at
-        <code>LN_N=768 LN_EPS=1e-5</code>.</p>
+        Eight widths were built (2048&ndash;4096); <b>768 is now built and validated</b>
+        (<code>build_768_1e-05</code>, 2026-10-02). Against the fp64 oracle on real hardware:
+        <code>y</code> maxrel <b>5.4e-08</b> (gate 1e-6) and <code>xn</code> cos <b>0.99999999</b>,
+        1/768 bf16 element mismatches (gates 8e-3 / &gt;0.999999 / &lt;5%). Corrupting 36 bytes of
+        <code>insts.bin</code> flips the device state from 4 to <b>8</b> and fails, so those numbers
+        came from the NPU and not from a host fallback.</p>
         <p class="note">Watch the <code>rsqrt</code> scalar trap &mdash; see Hardware. 45 dispatches
         per request (1 + 2&times;22). Expect the reciprocal to dominate.</p>
       </div>
@@ -899,7 +903,7 @@ const OPS={
    b:["<code>npue_encoder.hpp:3300</code> &mdash; <code>layer_norm(x, s_ln[0])</code>",
       "The NPU branch <b>already exists</b>: <code>bind &rarr; bf16_fill &rarr; sync_to_device &rarr; dispatch_only &rarr; sync_from_device</code>.",
       "Gated only by <code>host_ln</code>, forced <code>true</code> because the unified xclbin has no eltwise designs.",
-      "<b>Needs a build, not code.</b> <code>designs/ln/</code> is a fused add+norm parameterised by LN_N / LN_EPS; 768 is not among the 8 built widths.",
+      "<b>BUILT and validated 2026-10-02.</b> <code>designs/ln/</code> is a fused add+norm parameterised by LN_N / LN_EPS; 768 is now built (<code>build_768_1e-05</code>) and passes the fp64 oracle on hardware: <code>y</code> maxrel 5.4e-08, <code>xn</code> cos 0.99999999 with 1/768 bf16 mismatches. Corrupting <code>insts.bin</code> gives device state 8 and a hard fail.",
       "<b>Trap:</b> LayerNorm needs <code>rsqrt</code>, which is scalar-only on AIE2P &mdash; 83 emitted ops per 32 lanes."]},
  qkv:{t:"gemm(qkv) &mdash; fused QKV projection",s:"NPU",
    b:["<code>npue_encoder.hpp:3327</code> &mdash; <code>[32768&times;768] @ [768&times;2304] &rarr; qkvbuf</code>",
