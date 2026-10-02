@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Laya multilingual &mdash; NPU data flow, hardware, and the layer-by-layer migration</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2b313d;
+    --ink:#e6e9ef; --dim:#98a2b3; --faint:#6b7484;
+    --npu:#3fb950; --npu-d:#1a3d24; --cpu:#f0883e; --cpu-d:#3d2415;
+    --none:#6b7484; --warn:#d29922; --bad:#f85149; --info:#58a6ff;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+  code,.mono{font-family:var(--mono);font-size:12.5px}
+  a{color:var(--info)}
+  header{padding:20px 24px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{margin:0 0 4px;font-size:19px;font-weight:650}
+  header p{margin:0;color:var(--dim);font-size:13px}
+  .wrap{max-width:1500px;margin:0 auto;padding:0 24px 80px}
+  nav{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:1px solid var(--line);
+      display:flex;gap:2px;flex-wrap:wrap;padding:8px 0;margin-bottom:20px}
+  nav button{background:none;border:1px solid transparent;color:var(--dim);padding:6px 11px;
+      border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit}
+  nav button:hover{color:var(--ink);background:var(--panel)}
+  nav button.on{color:var(--ink);background:var(--panel2);border-color:var(--line)}
+  section{display:none} section.on{display:block}
+  h2{font-size:15px;margin:26px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line);
+     text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:600}
+  h3{font-size:13.5px;margin:18px 0 8px;color:var(--ink)}
+  p{margin:9px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:14px 16px;margin:12px 0}
+  .grid{display:grid;gap:12px}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+  .g3{grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+  .g4{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+  td.num,th.num{text-align:right;font-family:var(--mono);font-size:12px}
+  .k{font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+  .tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;font-weight:600;
+       font-family:var(--mono);letter-spacing:.03em;white-space:nowrap}
+  .t-npu{background:var(--npu-d);color:var(--npu);border:1px solid #2c5c38}
+  .t-cpu{background:var(--cpu-d);color:var(--cpu);border:1px solid #6b4520}
+  .t-no{background:#2a2e37;color:var(--faint);border:1px solid var(--line)}
+  .t-ok{background:var(--npu-d);color:var(--npu);border:1px solid #2c5c38}
+  .t-warn{background:#3d3215;color:var(--warn);border:1px solid #5c4c20}
+  .t-bad{background:#3d1a1a;color:var(--bad);border:1px solid #6b2a2a}
+  .t-build{background:#1d2b3a;color:#7fb2e5;border:1px solid #2c4a6b}
+  .t-code{background:#241f33;color:#b39ddb;border:1px solid #453a63}
+  .t-new{background:#1a2a3d;color:var(--info);border:1px solid #2c4a6b}
+  .stat{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:11px 13px}
+  .stat .v{font-family:var(--mono);font-size:19px;font-weight:600;line-height:1.2}
+  .stat .l{color:var(--dim);font-size:11.5px;margin-top:3px}
+  .stat .d{color:var(--faint);font-size:11px;margin-top:2px}
+  .warnbox{background:#2a1f10;border:1px solid #5c4c20;border-left:3px solid var(--warn);
+           border-radius:7px;padding:11px 14px;margin:11px 0}
+  .badbox{background:#2a1414;border:1px solid #6b2a2a;border-left:3px solid var(--bad);
+          border-radius:7px;padding:11px 14px;margin:11px 0}
+  .okbox{background:#14251a;border:1px solid #2c5c38;border-left:3px solid var(--npu);
+         border-radius:7px;padding:11px 14px;margin:11px 0}
+  .layers{display:flex;flex-wrap:wrap;gap:3px;margin:10px 0}
+  .layers b{width:26px;height:26px;display:grid;place-items:center;border-radius:5px;font-size:11px;
+            font-family:var(--mono);background:var(--npu-d);color:var(--npu);border:1px solid #2c5c38;cursor:pointer}
+  .layers b.g{background:var(--npu);color:#06210e;font-weight:700}
+  .layers b:hover{outline:2px solid var(--info);outline-offset:1px}
+  .flow{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:16px;overflow-x:auto}
+  .op{display:flex;align-items:center;gap:9px;padding:5px 9px;border-radius:6px;margin:3px 0;
+      border:1px solid var(--line);background:var(--panel2);cursor:pointer}
+  .op:hover{border-color:var(--info)}
+  .op.sel{border-color:var(--info);background:#16233a}
+  .op .w{width:112px;font-family:var(--mono);font-size:11.5px;flex-shrink:0}
+  .op .d{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+        font-family:var(--mono);font-size:12px}
+  .op .ln{font-family:var(--mono);font-size:11px;color:var(--faint);flex-shrink:0;width:140px;
+        text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .op .st{width:64px;flex-shrink:0;text-align:center}
+  .arrow{color:var(--faint);margin-left:20px;font-size:12px}
+  .detail{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:13px;margin-top:11px}
+  .detail:empty{display:none}
+  .detail h4{margin:0 0 8px;font-size:13px;color:var(--info)}
+  pre{background:#0c0e12;border:1px solid var(--line);border-radius:7px;padding:11px;overflow-x:auto;
+      font-size:12px;line-height:1.5;margin:9px 0}
+  pre .n{color:var(--npu)} pre .c{color:var(--cpu)} pre .m{color:var(--faint)} pre .s{color:var(--info)}
+  .ladder{display:flex;flex-direction:column;gap:0}
+  .step{display:grid;grid-template-columns:44px 1fr;gap:13px;padding:13px 0;border-bottom:1px solid var(--line)}
+  .step .n{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);
+           font-size:12px;font-weight:700;background:var(--panel2);border:1px solid var(--line)}
+  .step.done .n{background:var(--npu-d);color:var(--npu);border-color:#2c5c38}
+  .step.build .n{background:#1a2a3d;color:var(--info);border-color:#2c4a6b}
+  .step.code .n{background:var(--cpu-d);color:var(--cpu);border-color:#6b4520}
+  .step h4{margin:0 0 4px;font-size:13.5px}
+  .step p{margin:4px 0;color:var(--dim);font-size:12.5px}
+  .note{color:var(--faint);font-size:12px;margin-top:5px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin:9px 0;font-size:12px;color:var(--dim)}
+  .legend span{display:flex;align-items:center;gap:5px}
+  .sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+  input[type=search]{background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+      padding:6px 10px;border-radius:6px;font:13px inherit;width:220px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11.5px;background:var(--panel2);
+        border:1px solid var(--line);color:var(--dim);margin:2px 3px 2px 0}
+  .hwgrid{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+  .hw{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:10px 12px}
+  .hw .t{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  .hw .v2{font-family:var(--mono);font-size:14px;font-weight:600;margin:3px 0}
+  .hw .n{font-size:11.5px;color:var(--faint)}
+  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:5px}
+  .bar i{display:block;height:100%}
+  footer{border-top:1px solid var(--line);padding:16px 24px;color:var(--faint);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Laya multilingual &mdash; data flow, AIE2P hardware, and the layer-by-layer NPU migration</h1>
+  <p>Every number on this page was measured on this box or read from source. Sources are cited inline;
+     nothing here is from vendor marketing unless labelled as such.</p>
+</header>
+
+<div class="wrap">
+<nav id="nav">
+  <button data-t="flow" class="on">Data flow</button>
+  <button data-t="layer">Layer explorer</button>
+  <button data-t="hw">AIE2P hardware</button>
+  <button data-t="api">APIs</button>
+  <button data-t="ladder">Migration ladder</button>
+  <button data-t="prof">Profiling</button>
+  <button data-t="fix">Corrections</button>
+</nav>
+
+<!-- ==================== DATA FLOW ==================== -->
+<section id="flow" class="on">
+  <div class="grid g4">
+    <div class="stat"><div class="v">22</div><div class="l">encoder layers</div><div class="d">mmBERT-base</div></div>
+    <div class="stat"><div class="v">88</div><div class="l">NPU dispatches</div><div class="d">4 GEMM/layer &times; 22</div></div>
+    <div class="stat"><div class="v">6</div><div class="l">op groups on CPU</div><div class="d">per layer</div></div>
+    <div class="stat"><div class="v">1.61 GB</div><div class="l">scores, fp32, batch 32</div><div class="d">never leaves host</div></div>
+  </div>
+
+  <h2>Why it looks like an idle NPU</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3>Attention is 23.9% of the MACs &mdash; and 100% of it is on the CPU</h3>
+      <table>
+        <tr><th>per layer, one row-block</th><th class="num">MACs</th><th>where</th></tr>
+        <tr><td>4 projections (qkv, attn_out, ffn_up, ffn_down)</td><td class="num">5,013,504</td><td><span class="tag t-npu">NPU</span></td></tr>
+        <tr><td>qk<sup>T</sup> + PV (2 &times; 12 heads &times; 64 &times; 1024)</td><td class="num">1,572,864</td><td><span class="tag t-cpu">CPU</span></td></tr>
+        <tr><td><b>total</b></td><td class="num"><b>6,586,368</b></td><td></td></tr>
+      </table>
+      <p class="note">Attention is <b>O(seq&sup2;)</b> and materialises its score matrix in host fp32.
+      Projections are <b>O(seq)</b> and already on the AIE. FLOP share and wall time disagree &mdash;
+      that is the whole story. Measured: NPU 0.93&ndash;1.99&nbsp;W (microwatts, see Corrections),
+      host CPU saturated, 6.04&nbsp;GB peak RSS at batch 32.</p>
+    </div>
+    <div class="card">
+      <h3>The constraint is not capacity</h3>
+      <p><code>drm-total-memory: 495.9 MB</code> is a <b>usage counter</b>, not a ceiling.
+      The driver's own comment says "Total memory in use = internal-alloc + external-alloc".</p>
+      <p>There is <b>no carve-out</b> on this module (<code>amdxdna_use_carveout()</code> returns
+      <code>!!xdna-&gt;carveout</code>, and no <code>carveout</code> parameter exists), so every
+      buffer object goes to <code>drm_gem_shmem_create()</code> &mdash; <b>plain system RAM</b>.</p>
+      <p>The NPU DMAs against the same 32&nbsp;GB the CPU uses. <code>XRT_BO_FLAGS_HOST_ONLY</code>
+      takes the ubuf path: the host allocates the pages, the driver pins them. The
+      "220.59&nbsp;MB staged on the device" was never device-local.</p>
+      <p class="k">amdxdna_gem.c:960 &middot; amdxdna_pci_drv.c:382 &middot; npu_device.cpp:136</p>
+    </div>
+  </div>
+
+  <h2>Host buffers at batch 32 &middot; seq 1024 &middot; fp32</h2>
+  <table>
+    <tr><th>buffer</th><th>shape</th><th class="num">elements</th><th class="num">MB</th><th>note</th></tr>
+    <tr><td><code>hbuf</code></td><td>32 &times; 1024 &times; 768</td><td class="num">25,165,824</td><td class="num">96.0</td><td>hidden stream</td></tr>
+    <tr><td><code>qkvbuf</code></td><td>32 &times; 1024 &times; 2304</td><td class="num">75,497,472</td><td class="num">288.0</td><td>fused QKV</td></tr>
+    <tr style="background:#2a1414"><td><code>scores</code></td><td>32 &times; 12 &times; 1024 &times; 1024</td><td class="num">402,653,184</td><td class="num"><b>1536.0</b></td><td><b>the monster</b> &mdash; O(seq&sup2;), fp32</td></tr>
+    <tr><td><code>ctx</code></td><td>32 &times; 1024 &times; 768</td><td class="num">25,165,824</td><td class="num">96.0</td><td>attention output</td></tr>
+    <tr><td><code>up</code> / <code>gated</code></td><td>32 &times; 1024 &times; 1152</td><td class="num">37,748,736</td><td class="num">144.0</td><td>gated GeGLU, gate half packed SECOND</td></tr>
+    <tr><td><code>proj</code>, <code>down</code></td><td>32 &times; 1024 &times; 768</td><td class="num">25,165,824</td><td class="num">96.0</td><td>FFN / attn residual</td></tr>
+  </table>
+  <div class="warnbox">
+    <b>This is why tiers cap at 32 and there is no batch-64 tier.</b>
+    <code>scores</code> alone is 1.61&nbsp;GB at batch 32 and 3.22&nbsp;GB at batch 64, on the host,
+    alongside the kernel. Measured peak RSS: 1.47&nbsp;GB at batch 2, 1.48 at batch 8, <b>6.04 at batch 32</b>.
+    The 495&nbsp;MB "usage" figure you may see is the device-side view and is unrelated.
+  </div>
+
+  <h2>The whole request, end to end</h2>
+  <div class="flow">
+<pre>
+<span class="m">── host ──</span>  request JSON  {state, questions[{type, instructions, criteria}]}
+<span class="m">── host ──</span>  prompt assembly    [CLS] "choice question: &lt;ins&gt;" [SEP] [MASK] opt0 [MASK] opt1 [SEP] &lt;state&gt; [SEP]
+<span class="m">── host ──</span>  XLM-R tokenizer    ids + per-option MARKER positions (the gather list)
+<span class="m">── host ──</span>  type_emb[3,768] added to the encoder output at every position
+                                  |
+<span class="n">══ NPU ══</span>   22 &times; [ qkv GEMM → qk → softmax → av → attn_out GEMM → ffn_up GEMM → gelu → ffn_down GEMM ]
+                                  |                                    ↑ qk/softmax/av/gelu are HOST today
+<span class="m">── host ──</span>  marker gather  → post-head rows at MARKER positions
+<span class="m">── host ──</span>  scorer MLP  LayerNorm(768) → Linear(768,768) → GELU → Linear(768,1)
+<span class="m">── host ──</span>  temperature  t = by_options.get(bucket, per_type[qtype])   k&lt;=2 → "2"
+<span class="m">── host ──</span>  softmax(z/t) float32  →  choice: argmax  score: Σ i·pᵢ  noul: p[1]
+<span class="m">── host ──</span>  response  {model: tag_that_ANSWERED, answers, usage}
+</pre>
+  </div>
+  <p class="note">Sequence contract from <code>laya/common.py:build_head</code> &mdash; the qtype is
+  the <i>literal string</i>, not a special token; every encode is <code>add_special_tokens=False</code>;
+  each option is <code>[mask_id] + encode(" "+text)[:48]</code>. Truncation's three stages do
+  <b>not</b> count the three structural tokens, so the head can reach <code>head_max_len + 3</code>.</p>
+</section>
+
+<!-- ==================== LAYER EXPLORER ==================== -->
+<section id="layer">
+  <div class="card">
+    <h3>Pick a layer</h3>
+    <div class="layers" id="layerBtns"></div>
+    <p class="note">Green = global (full) attention, every 3rd layer per
+      <code>global_attn_every_n_layers: 3</code>. All other layers use a &plusmn;64 band
+      (<code>local_attention: 128</code>). Click any op for its detail.</p>
+  </div>
+
+  <div class="flow">
+    <div class="op" data-o="ln0"><span class="w">layer_norm</span><span class="d">x &rarr; x</span>
+      <span class="st"><span class="tag t-cpu">CPU</span></span><span class="ln">npue_encoder.hpp:3300</span></div>
+    <div class="op" data-o="qkv"><span class="w">gemm(qkv)</span><span class="d">hbuf[32768&times;768] @ [768&times;2304] &rarr; qkvbuf</span>
+      <span class="st"><span class="tag t-npu">NPU</span></span><span class="ln">:3327</span></div>
+    <div class="op" data-o="rope"><span class="w">apply_rope_qkv</span><span class="d">rotate Q,K by position</span>
+      <span class="st"><span class="tag t-no">SKIPPED</span></span><span class="ln">:3329</span></div>
+    <div class="op" data-o="qk"><span class="w">qk</span><span class="d">Q @ K<sup>T</sup> &rarr; scores  &larr; 1.61 GB</span>
+      <span class="st"><span class="tag t-cpu">CPU</span></span><span class="ln">:3337</span></div>
+    <div class="op" data-o="sm"><span class="w">softmax_cpu</span><span class="d">scores &rarr; probabilities (fp32, in place)</span>
+      <span class="st"><span class="tag t-cpu">CPU</span></span><span class="ln">:3343</span></div>
+    <div class="op" data-o="av"><span class="w">av</span><span class="d">P @ V &rarr; ctx</span>
+      <span class="st"><span class="tag t-cpu">CPU</span></span><span class="ln">:3350</span></div>
+    <div class="op" data-o="ao"><span class="w">gemm(attn_out)</span><span class="d">ctx[32768&times;768] @ [768&times;768] &rarr; proj</span>
+      <span class="st"><span class="tag t-npu">NPU</span></span><span class="ln">:3353</span></div>
+    <div class="op" data-o="add1"><span class="w">add_plain</span><span class="d">x += proj   (no norm &mdash; pre-LN)</span>
+      <span class="st"><span class="tag t-cpu">CPU</span></span><span class="ln">:3359</span></div>
+    <div class="op" data-o="ln1"><span class="w">layer_norm</span><span class="d">hbuf &rarr; hbuf  (pre-FFN)</span>
+      <span class="st"><span class="tag t-cpu">CPU</span></span><span class="ln">:3325</span></div>
+    <div class="op" data-o="fu"><span class="w">gemm(ffn_up)</span><span class="d">hbuf[32768&times;768] @ [768&times;2304] &rarr; up (gated)</span>
+      <span class="st"><span class="tag t-npu">NPU</span></span><span class="ln">:3363</span></div>
+    <div class="op" data-o="gelu"><span class="w">gelu_cpu</span><span class="d">GeGLU on the gated half</span>
+      <span class="st"><span class="tag t-cpu">CPU</span></span><span class="ln">:3372</span></div>
+    <div class="op" data-o="fd"><span class="w">gemm(ffn_down)</span><span class="d">gated[32768&times;1152] @ [1152&times;768] &rarr; down</span>
+      <span class="st"><span class="tag t-npu">NPU</span></span><span class="ln">:3374</span></div>
+    <div class="op" data-o="add2"><span class="w">add_plain</span><span class="d">x += down</span>
+      <span class="st"><span class="tag t-cpu">CPU</span></span><span class="ln">:3379</span></div>
+  </div>
+
+  <div class="legend">
+    <span><i class="sw" style="background:var(--npu)"></i> dispatches to the AIE</span>
+    <span><i class="sw" style="background:var(--cpu)"></i> host only</span>
+    <span><i class="sw" style="background:var(--faint)"></i> not applicable for this model</span>
+    <span><span class="tag t-build" style="display:none"></span></span>
+  </div>
+
+  <div class="detail" id="opDetail"></div>
+
+  <h2>Per-layer accounting</h2>
+  <div class="grid g3">
+    <div class="card">
+      <h3>NPU dispatches</h3>
+      <table>
+        <tr><td>qkv</td><td class="num">22</td></tr>
+        <tr><td>attn_out</td><td class="num">22</td></tr>
+        <tr><td>ffn_up</td><td class="num">22</td></tr>
+        <tr><td>ffn_down</td><td class="num">22</td></tr>
+        <tr><td><b>total</b></td><td class="num"><b>88</b></td></tr>
+      </table>
+      <p class="note">One hw_context, one xclbin, 12 streams (4 shapes &times; 3 batch tiers).</p>
+    </div>
+    <div class="card">
+      <h3>Weights staged on the device once</h3>
+      <div style="font-family:var(--mono);font-size:22px;font-weight:600">220.59 MB</div>
+      <p class="note">Not per call. Printed by the rig banner at startup.</p>
+    </div>
+    <div class="card">
+      <h3>Tiers</h3>
+      <div style="font-family:var(--mono);font-size:22px;font-weight:600">4, 16, 32</div>
+      <p class="note">Requests are right-sized, not padded. <b>No batch-64 tier</b>: 3.22 GB of scores
+      on the host for one tensor.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== HARDWARE ==================== -->
+<section id="hw">
+  <div class="grid g2">
+    <div class="card">
+      <h3>Array</h3>
+      <div class="hwgrid">
+        <div class="hw"><div class="t">Compute tiles</div><div class="v2">32</div><div class="n">8 columns &times; 4 rows</div></div>
+        <div class="hw"><div class="t">ShimNOC</div><div class="v2">8</div><div class="n">row 0 &mdash; DDR &harr; NoC</div></div>
+        <div class="hw"><div class="t">Memtiles</div><div class="v2">8</div><div class="n">row 1 &mdash; 512 KB each</div></div>
+        <div class="hw"><div class="t">Total L2</div><div class="v2">4 MB</div><div class="n">3 MB addressable per column</div></div>
+        <div class="hw"><div class="t">L1 per core</div><div class="v2">64 KB</div><div class="n">63 KB usable, 1 KB stack</div></div>
+        <div class="hw"><div class="t">Program mem</div><div class="v2">16 KB</div><div class="n">1024 &times; 128-bit instrs</div></div>
+      </div>
+      <p class="k" style="margin-top:9px">xrt-smi examine: NPU Strix Halo &middot; aie2p &middot; 6&times;8 &middot;
+        XRT 2.25.0 &middot; FW 1.1.2.65 &middot; PCI 1022:17f0</p>
+    </div>
+    <div class="card">
+      <h3>Matrix throughput per core (higher is better)</h3>
+      <table>
+        <tr><th>datatype</th><th class="num">MAC/cycle</th><th>status</th></tr>
+        <tr><td>int8</td><td class="num">512</td><td><span class="tag t-ok">native 8&times;8&times;8</span></td></tr>
+        <tr><td>bfp16 (block float)</td><td class="num">512</td><td><span class="tag t-warn">native 8&times;8&times;8</span></td></tr>
+        <tr><td><b>bf16</b></td><td class="num"><b>256</b></td><td><span class="tag t-ok">native 4&times;8&times;8</span></td></tr>
+        <tr><td>int16</td><td class="num">256</td><td><span class="tag t-ok">native 4&times;4&times;8</span></td></tr>
+        <tr><td>fp32</td><td class="num">0</td><td><span class="tag t-bad">EMULATED via bf16</span></td></tr>
+      </table>
+      <p class="note"><code>__AIE_API_FP32_SUPPORT__ = 0</code> in aie_api/aie2p/config.hpp.
+      <b>This is the single most important fact for an fp32 host op:</b> moving a
+      float32 op to the AIE costs you an emulation, not a native unit.
+      bf16 8&times;8&times;8 costs two native 4&times;8&times;8 ops and two accumulators.</p>
+      <p class="note">Whole-array bf16 peak &asymp; 50 TOPS at 1.5 GHz nominal (1.76 GHz measured;
+      1.8 GHz max per AMD). Achieved: 37.35 TOPS int8 on the best published kernel.</p>
+    </div>
+  </div>
+
+  <h2>What the hardware can and cannot do &mdash; measured from Peano disassembly</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3>Native, single instruction</h3>
+      <table>
+        <tr><td><code>vexp2</code></td><td>exp2, 512-bit, 16 fp32 lanes</td></tr>
+        <tr><td><code>vtanh</code></td><td>tanh, 512-bit</td></tr>
+        <tr><td><code>VMAC.F</code></td><td>one per cycle, latency 6</td></tr>
+        <tr><td><code>vldb/vst</code></td><td>vector load/store, 7c / 1c</td></tr>
+        <tr><td><code>vconv</code></td><td>fp32 &harr; bf16</td></tr>
+      </table>
+      <p class="note">Good news: <b>tanh being native makes a tanh-approximation GELU two
+      instructions.</b></p>
+    </div>
+    <div class="card">
+      <h3>Scalar-only or absent &mdash; the traps</h3>
+      <table>
+        <tr><td><code>inv</code>, <code>invsqrt</code></td><td><span class="tag t-bad">SCALAR</span> 83 ops per 32 lanes</td></tr>
+        <tr><td><code>sqrt</code></td><td><span class="tag t-bad">SCALAR</span> 13 ops per 32 lanes</td></tr>
+        <tr><td><code>sin</code>, <code>cos</code></td><td><span class="tag t-bad">NOT IMPLEMENTED</span> TODO CRVO-7950</td></tr>
+        <tr><td><code>sigmoid</code>, <code>log2</code></td><td><span class="tag t-bad">DOES NOT EXIST</span> in aie_api</td></tr>
+        <tr><td>horizontal reduce</td><td><span class="tag t-warn">NO INSTRUCTION</span> O(log n) shuffle tree</td></tr>
+      </table>
+      <div class="warnbox" style="margin-bottom:0">
+        <b>This is the LayerNorm finding.</b> LayerNorm needs <code>rsqrt</code>, and <code>invsqrt</code>
+        is scalar-only &mdash; 83 emitted instructions for a 32-lane vector. A native LayerNorm design
+        would be <b>dominated by the reciprocal square root</b>. Either pay it, or use a
+        power-of-two seed plus Newton iterations on the <code>vexp2</code>/shift path.
+        This is measurable and unclaimed work.
+      </div>
+    </div>
+  </div>
+
+  <h2>Movement and reduction paths</h2>
+  <div class="grid g3">
+    <div class="card">
+      <h3>DDR</h3>
+      <p><b>~50 GB/s</b> effective for the NPU, measured. System LPDDR5x is 256 GB/s and
+      <b>shared</b> with CPU and iGPU &mdash; so the NPU ceiling is ~20% of system bandwidth and is
+      contended, not dedicated.</p>
+      <p class="note">AIE cores cannot address DDR directly. The only path is shim DMA:
+      shim NoC &rarr; SoC fabric &rarr; DDR.</p>
+    </div>
+    <div class="card">
+      <h3>Cascade flow</h3>
+      <p><b>512 bit/cycle</b> fixed, one accumulator beat per cycle. Direction is N/W &rarr; S/E;
+      one in, one out; endpoints cardinally adjacent.</p>
+      <p class="note"><b>Shim and memtiles have no cascade interface</b> &mdash; a cascade can never
+      reach host memory. The last core must land the result in L1 for a normal ObjectFifo DMA.
+      Caps a vertical chain at 4 cores/column, which is exactly what our
+      <code>FA_CASCADE_STAGES=4</code> uses.</p>
+    </div>
+    <div class="card">
+      <h3>Channel budget</h3>
+      <p>Shim and compute tile: <b>2 MM2S + 2 S2MM</b> each. Memtile: <b>6 + 6</b>.</p>
+      <p class="note">A 2-input kernel already consumes both shim MM2S channels of a column.
+      A 3-input mapping <b>cannot</b> be fed from a compute tile. ObjectFifo depth rule:
+      <code>depth &ge; producer_outstanding + consumer_outstanding</code>.</p>
+    </div>
+  </div>
+
+  <h2>Buffer-descriptor limits (inherited from AIE2)</h2>
+  <table>
+    <tr><th>tile</th><th class="num">BDs</th><th class="num">address dims</th><th class="num">max transfer</th><th>notes</th></tr>
+    <tr><td>memtile</td><td class="num">48</td><td class="num">4</td><td class="num">131,071</td><td>24/24 split by direction</td></tr>
+    <tr><td>compute</td><td class="num">16</td><td class="num">3</td><td class="num">16,383</td><td>8-bit BD wrap, 13-bit stride</td></tr>
+    <tr><td>shim</td><td class="num">16</td><td class="num">3</td><td class="num">2&sup3;&sup2;-1</td><td>20-bit stride; only 15 resident while 3 retire</td></tr>
+  </table>
+  <div class="warnbox">
+    <b>Address generation is 32-bit granular.</b> A DMA can never perform a layout transform at
+    sub-32-bit element granularity, so an int8 or bf16 swizzle must be done with in-core
+    <code>vshuffle</code>. Locks: 64 per memtile, 16 per core/shim, 6-bit (max 63).
+    Practical ObjectFifo guidance: <b>&asymp;8 objects max in L1</b>; deeper buffering goes to a
+    memtile ObjectFifo with depth &ge; 4.
+  </div>
+</section>
+
+<!-- ==================== APIS ==================== -->
+<section id="api">
+  <div class="warnbox">
+    <b>Version trap.</b> <code>/usr/include/xrt</code> is XRT <b>2.20.0</b>.
+    <code>/opt/xilinx/xrt</code> is <b>2.25.0</b> (hash <code>0026185d</code>) and is what this
+    repo builds against (<code>src/CMakeLists.txt:117-118</code>). All signatures below are from
+    <code>/opt/xilinx/xrt</code>.
+  </div>
+
+  <h2>XRT C++ &mdash; the dispatch path we use</h2>
+  <div class="flow">
+<pre>
+<span class="m">#include &lt;xrt/xrt_device.h&gt; &lt;xrt/xrt_kernel.h&gt; &lt;xrt/xrt_bo.h&gt; &lt;xrt/xrt_hw_context.h&gt;</span>
+
+<span class="s">xrt::device</span> dev{<span class="m">0</span>};                                        <span class="m">// xrt_device.h:204</span>
+<span class="s">xrt::xclbin</span> xcl{<span class="m">dir + "/final.xclbin"</span>};                <span class="m">// reads the xclbin</span>
+<span class="s">xrt::hw_context</span> ctx{<span class="m">dev, uuid</span>};                            <span class="m">// :297  ONE per process</span>
+<span class="s">xrt::kernel</span> k{<span class="m">ctx, "MLIR_AIE"</span>};                          <span class="m">// :304</span>
+
+<span class="s">xrt::bo</span> instr{<span class="m">dev, insts.size(), XCL_BO_FLAGS_CACHEABLE, k.group_id(1)</span>};
+<span class="s">xrt::bo</span> data {<span class="m">dev, bytes, XRT_BO_FLAGS_HOST_ONLY, group</span>};     <span class="m">// ubuf: host pages, AIE DMAs</span>
+
+<span class="s">xrt::run</span> r{<span class="m">k</span>};
+<span class="m">r.</span>set_arg(<span class="m">0, instr</span>); r.set_arg(<span class="m">1, n_words</span>);
+<span class="m">r.</span>set_arg(<span class="m">2..</span>, bos);
+<span class="m">r.</span>start();  r.wait();      <span class="m">// EXEC_CMD then SYNCOBJ_TIMELINE_WAIT</span>
+</pre>
+  </div>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3>BO flags &mdash; all six, and which work here</h3>
+      <table>
+        <tr><td><code>CACHEABLE</code></td><td>1&lt;&lt;24</td><td>documented "embedded only" &mdash; effectively a no-op on NPU</td></tr>
+        <tr><td><code>DEV_ONLY</code></td><td>1&lt;&lt;28</td><td>device-only allocation</td></tr>
+        <tr><td><b><code>HOST_ONLY</code></b></td><td>1&lt;&lt;29</td><td><b>what we use</b> &mdash; host-allocated, NPU-addressable</td></tr>
+        <tr><td><code>P2P</code></td><td>1&lt;&lt;30</td><td>no AIE implementation</td></tr>
+        <tr><td><code>SVM</code></td><td>1&lt;&lt;27</td><td>no AIE implementation</td></tr>
+        <tr><td><code>CARVEOUT</code></td><td>1&lt;&lt;25</td><td>no AIE implementation; no carve-out on this module anyway</td></tr>
+      </table>
+      <p class="note">There is <b>no <code>XRT_BO_FLAGS_HOST_PASID</code></b> anywhere in 2.25.0 or the
+      driver uapi. PASID is per-<i>client</i>, not per-BO.</p>
+    </div>
+    <div class="card">
+      <h3>Two facts that shape any profiling work</h3>
+      <p><b>One accel fd per pid.</b> <code>amdxdna_pci_drv.c:189-193</code> returns
+      <code>-EBUSY</code> on a second <code>open()</code> by the same process. Any ioctl probe
+      must live in a separate or forked process.</p>
+      <p><b>Runtime-parameterised kernels are an ELF-flow concept.</b>
+      <code>xrt::ext::kernel</code> exists, but <code>get_ctrl_scratchpad_bo()</code> throws
+      "No module associated with run object" on our raw-instruction path. Our runtime parameters
+      are baked into the xclbin, not patched at launch.</p>
+    </div>
+  </div>
+
+  <h2>amdxdna ioctls</h2>
+  <table>
+    <tr><th>ioctl</th><th>purpose</th><th>privilege</th></tr>
+    <tr><td><code>CREATE_HWCTX</code></td><td>context + <b>returns the syncobj handle</b> used for every wait</td><td>unprivileged</td></tr>
+    <tr><td><code>CREATE_BO</code></td><td>type &isin; {SHARE, DEV_HEAP, DEV, CMD}; <code>flags</code> is MBZ</td><td>unprivileged</td></tr>
+    <tr><td><code>EXEC_CMD</code></td><td>submit a CMD BO (<code>ert_packet</code> first) &rarr; becomes a <code>drm_sched_job</code></td><td>unprivileged</td></tr>
+    <tr><td><code>GET_ARRAY</code></td><td><code>HW_CONTEXT_ALL</code> &rarr; <b>command_submissions / completions</b>; also AIE_COREDUMP, FW_LOG_CONFIG, FW_TRACE_CONFIG</td><td>mixed</td></tr>
+    <tr><td><code>GET_INFO</code></td><td>clock metadata, sensors, AIE metadata, AIE status, telemetry, resource info</td><td>unprivileged</td></tr>
+    <tr><td><code>SET_STATE</code></td><td>power mode, preempt, AIE tile write, FW log/trace enable</td><td><span class="tag t-bad">DRM_ROOT_ONLY</span></td></tr>
+  </table>
+  <p class="note">A dispatch is exactly <b>two</b> ioctls: <code>EXEC_CMD</code> then
+  <code>SYNCOBJ_TIMELINE_WAIT</code> on the syncobj from <code>CREATE_HWCTX</code>. Measured with
+  strace on the real <code>MLIR_AIE</code> dispatch.</p>
+
+  <h2>IRON &mdash; installed vs upstream, and it is a version gap</h2>
+  <div class="okbox">
+    <b>Correction to my own earlier correction.</b> I wrote a doc claiming the IRON operator library
+    does not exist. It does &mdash; <b>upstream</b>. Cloned at <code>3fc9a60</code>:
+    <code>iron/operators/</code> contains
+    <span class="pill">mha</span><span class="pill">rope</span><span class="pill">rms_norm</span><span class="pill">softmax</span><span class="pill">gemm</span><span class="pill">gemv</span><span class="pill">flm</span><span class="pill">layer_norm</span><span class="pill">silu</span><span class="pill">swiglu_decode</span><span class="pill">swiglu_prefill</span><span class="pill">transpose</span><span class="pill">axpy</span>
+    &mdash; every operator the original survey named. <code>mha/op.py</code> takes
+    <code>num_heads</code>, <code>seq_len</code>, <code>num_KV_heads</code> and has
+    <code>_calculate_seq_padding</code>, i.e. it handles our padding case.
+    <b>The installed build is just older:</b> <code>mlir_aie-1.4.2</code> has <code>aie/iron/kernels/</code>
+    and no <code>operators/</code>. The original survey was right about IRON and wrong about this box.
+  </div>
+  <p class="note">No new dependency would be installed by upgrading an existing one, but that is your
+  call. The installed <code>kernels/</code> equivalents are real and usable:
+  <code>linalg.py:mm</code> (bf16&rarr;bf16 and bf16&rarr;fp32, with AIE2P bfp16 emulation),
+  <code>activation.py:softmax</code> (bf16, fixed 1024 tile), <code>gelu</code>, <code>silu</code>,
+  <code>swiglu</code>, <code>reduce.py:reduce_max/reduce_add</code>, <code>eltwise.py:add/mul/scale</code>,
+  <code>dataflow/objectfifo.py</code>.</p>
+</section>
+
+<!-- ==================== LADDER ==================== -->
+<section id="ladder">
+  <div class="card">
+    <p>The migration is <b>much less code than it looks</b>. Three of the six host op groups already have
+    a written, working NPU dispatch branch in <code>npue_encoder.hpp</code>; they are disabled by a
+    flag that a missing artifact forces on.</p>
+    <pre><span class="c">// npue_encoder.hpp:4998 &mdash; why they are off today</span>
+<span class="m">if (unified) {</span>
+  <span class="c">// The unified artifact has no eltwise designs by construction.</span>
+  host_ln = host_sm = host_gelu = <span class="m">true</span>;
+<span class="m">}</span>
+
+<span class="c">// npue_encoder.hpp:2379 &mdash; the NPU branch is ALREADY WRITTEN</span>
+<span class="m">void</span> layer_norm(std::vector&lt;float&gt; &amp;x, <span class="m">size_t</span> slot) {
+  <span class="m">if</span> (host_ln) { layer_norm_cpu(x, slot - <span class="m">1</span>); <span class="m">return</span>; }
+  layernorm.bind(<span class="m">1</span>, slot);
+  layernorm.sync_to_device(<span class="m">0</span>);
+  layernorm.dispatch_only();          <span class="c">// &lt;-- real dispatch</span>
+  layernorm.sync_from_device(<span class="m">2</span>);
+}
+
+<span class="c">// npue_encoder.hpp:4903 &mdash; the loader already knows these designs</span>
+ld_gelu = <span class="m">std::make_unique</span>&lt;npu::Design&gt;(dev, art + <span class="m">"/gelu"</span>);
+ld_ln   = <span class="m">std::make_unique</span>&lt;npu::Design&gt;(dev, art + <span class="m">"/layernorm"</span>);
+ld_sm   = <span class="m">std::make_unique</span>&lt;npu::Design&gt;(dev, art + <span class="m">"/softmax"</span>);
+printf(<span class="m">"  designs    7 resident xclbins\n"</span>);   <span class="c">// the non-unified path</span></pre>
+  </div>
+
+  <div class="ladder">
+    <div class="step done">
+      <div class="n">1</div>
+      <div>
+
+        <h4>Projection GEMMs <span class="tag t-ok">DONE</span></h4>
+        <p>qkv, attn_out, ffn_up, ffn_down &mdash; 88 dispatches, one xclbin, one hw_context.
+        Proven engaged: corrupting <code>insts_qkv_b4.bin</code> gives
+        <code>REFUSED: gemm_rtp: kernel state 5</code>. Outputs match the float64 oracle.</p>
+      </div>
+    </div>
+    <div class="step build">
+      <div class="n">2</div>
+      <div>
+
+        <h4>LayerNorm <span class="tag t-build">BUILD ONLY</span> <span class="pill">cheapest</span></h4>
+        <p><b>No new host code.</b> <code>open_kernels/designs/ln/</code> already holds a fused
+        add+norm design (<code>ln.cc</code>, <code>ln.h</code>) parameterised by <code>LN_N</code> and
+        <code>LN_EPS</code>, and <code>catalogue.py</code> already has an <code>ln</code> template.
+        Eight widths are built (2048&ndash;4096); <b>768 is not</b>. Build it at
+        <code>LN_N=768 LN_EPS=1e-5</code>.</p>
+        <p class="note">Watch the <code>rsqrt</code> scalar trap &mdash; see Hardware. 45 dispatches
+        per request (1 + 2&times;22). Expect the reciprocal to dominate.</p>
+      </div>
+    </div>
+    <div class="step code">
+      <div class="n">3</div>
+      <div>
+
+        <h4>Attention qk / av <span class="tag t-code">THE REAL WORK</span></h4>
+        <p><code>qk()</code> (:3070) and <code>av()</code> (:3168) dispatch a
+        <code>qk_impl&lt;8&gt;</code> on head_dim and have <b>zero</b> <code>dispatch_only</code> or
+        <code>sync_to_device</code> anywhere in their bodies. There is no branch to enable.</p>
+        <p>Two routes, both already existing code:</p>
+        <p><b>(a) Reuse <code>open_kernels/designs/whisper_fa/</code></b> &mdash; a flash-attention
+        kernel ported from AMD's MLIR-AIR to IRON, hardware-verified byte-identical vs AIR on real
+        Whisper layers, for an <i>encoder</i>. Laya's shape passes all seven of its asserts:
+        <code>FA_LQ=FA_LK=FA_VALID_LEN=1024, FA_LQP=256, FA_LKP=64, FA_DK=FA_DV=64, FA_NUM_HEADS=12, FA_HEADS_PER_UNROLL=2, FA_CASCADE_STAGES=4</code>. The column budget is <code>HEADS_PER_UNROLL &times; NQ</code> = 2&times;4 = 8, exactly AIE2P's 8 columns &mdash; <code>FA_NUM_HEADS</code> is the loop count, not the width. Whisper's point
+        is identical except those three constants. It removes the <code>O(seq&sup2;)</code> tensor
+        entirely rather than relocating it.</p>
+        <p><b>(b) Upgrade ironvenv to current IRON and use <code>operators/mha</code></b>, which takes
+        <code>num_heads</code>/<code>seq_len</code>/<code>num_KV_heads</code> and handles padding.
+        This is the operator the original survey named.</p>
+        <p class="note">Both need one number first: is the padding mask a prefix?
+        <code>valid_len</code> is a prefix mask and Laya pads short states.</p>
+      </div>
+    </div>
+    <div class="step build">
+      <div class="n">4</div>
+      <div>
+
+        <h4>GELU <span class="tag t-build">BUILD, SMALL</span> <span class="pill">easy</span></h4>
+        <p>Dispatch code exists (<code>eltwise(gelu, ...)</code> at <code>:3374</code>). No design and
+        no catalogue template yet. <code>vtanh</code> is a <b>native instruction</b>, so a
+        tanh-approximation GeGLU is roughly two vector ops plus a LUT bias.</p>
+        <p class="note">22 dispatches. Cheapest genuine kernel to write in this set.</p>
+      </div>
+    </div>
+    <div class="step build">
+      <div class="n">5</div>
+      <div>
+
+        <h4>Softmax <span class="tag t-build">BUILD, HARDER</span></h4>
+        <p>Dispatch code exists (<code>eltwise(softmax, ...)</code> at <code>:3346</code>).
+        <code>vexp2</code> is native, but the max and sum reductions are
+        <b>O(log lanes) shuffle trees</b> because there is no horizontal-reduction
+        instruction. One tile = one query row here (seq 1024), so no cascade is needed.</p>
+        <p class="note">22 dispatches. Only worth doing alongside step 3, or as a component of a banded attention kernel &mdash; standalone softmax alone still
+        leaves qk and av on the host.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="n">6</div>
+      <div>
+
+        <h4>Then, optionally <span class="tag t-no">LOW VALUE</span></h4>
+        <p><code>act_head</code> and <code>add_plain</code> residual adds. Upstream records the act
+        head as signal-free (AUROC 0.30) and its index&rarr;action mapping is not derivable from any
+        published file. Residuals are a memory-bandwidth add; the fused
+        <code>designs/ln</code> already absorbs the attention residual into the norm.</p>
+      </div>
+    </div>
+  </div>
+
+  <h2>What is available to build with, in this repo</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3>Catalogue templates (validated points)</h3>
+      <p><span class="pill">gemv_q4</span><span class="pill">gemv_q8</span><span class="pill">gemv_q4_prep_f32</span><span class="pill">attn</span><span class="pill">deltanet</span><span class="pill">short_conv</span><span class="pill">ln</span><span class="pill">router</span><span class="pill">moe</span><span class="pill">lm_head_q8</span><span class="pill">lm_head_q4</span></p>
+      <p><b>No softmax, no gelu, no bidirectional-attention template.</b>
+      <code>attn</code> exists but is <b>decode-shaped</b>: one token, KV cache, position record,
+      RoPE &mdash; none of which Laya has (<code>sans_pos</code>, no cache, bidirectional).</p>
+      <p class="note">A point enters the catalogue <i>after</i> its hardware run, never before.
+      Laya's shape is not in it, so it starts <code>OPEN_KERNELS_UNVALIDATED=1</code>.</p>
+    </div>
+    <div class="card">
+      <h3>Design sources present</h3>
+      <table>
+        <tr><td><code>designs/ln/</code></td><td><span class="tag t-ok">usable</span> fused add+norm, <code>LN_N</code>/<code>LN_EPS</code></td></tr>
+        <tr><td><code>designs/silu_mul/</code></td><td><span class="tag t-warn">adjacent</span> SiLU not GELU</td></tr>
+        <tr><td><code>designs/attn/</code></td><td><span class="tag t-bad">wrong shape</span> decode + RoPE + cache</td></tr>
+        <tr><td><code>designs/whisper_fa/</code></td><td><span class="tag t-ok">usable</span> flash attention, encoder, verified</td></tr>
+        <tr><td><code>designs/gelu,softmax,layernorm</code></td><td><span class="tag t-no">absent</span></td></tr>
+      </table>
+      <p class="note">All 12 shipped specs are <b>decoders</b> (every one has a <code>rotary_dim</code>).
+      There is <b>no encoder recipe</b> in <code>recipes/specs/</code>, so the Laya path is the first
+      encoder these tools have been pointed at.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== PROFILING ==================== -->
+<section id="prof">
+  <div class="okbox">
+    <b>Two corrections.</b> I previously recorded <code>drm-engine-amdxdna_accel_driver</code> as an inert
+    counter reading 0 ns, and column utilisation as registered-but-never-read. <b>Both were wrong.</b>
+    The first is a per-client NPU-busy accumulator that tracks occupancy to within
+    <b>0.8%</b> across four runs; the second is registered and readable, and reaches 100% under load.
+    The original zero reading was <b>sampling the wrong process</b> &mdash; <code>pgrep -f layaacc</code>
+    matched the bash wrapper, because the shell's own command line contains the rig's path.
+  </div>
+
+  <h2>What works, verified</h2>
+  <table>
+    <tr><th>instrument</th><th>unit</th><th>verdict</th><th>how</th></tr>
+    <tr><td><code>drm-engine-amdxdna_accel_driver</code></td><td>nanoseconds</td>
+      <td><span class="tag t-ok">WORKS</span></td><td><code>/proc/&lt;pid&gt;/fdinfo/&lt;accel-fd&gt;</code></td></tr>
+    <tr><td><code>HW_CONTEXT_ALL.command_submissions</code></td><td>count</td>
+      <td><span class="tag t-ok">WORKS</span></td><td><code>GET_ARRAY</code>; gives per-dispatch time</td></tr>
+    <tr><td>column utilisation (PMF)</td><td>% busy</td>
+      <td><span class="tag t-ok">WORKS</span></td><td><code>QUERY_SENSORS</code> with a <b>full 16-record buffer</b></td></tr>
+    <tr><td>NPU power</td><td><b>microwatts</b></td>
+      <td><span class="tag t-ok">WORKS</span></td><td><code>hwmon12/power1_input</code>; <code>u16</code> mW saturates at 65.5 W</td></tr>
+    <tr><td>MP-NPU / H clock</td><td>MHz</td>
+      <td><span class="tag t-ok">WORKS</span></td><td><code>QUERY_CLOCK_METADATA</code>; 1267 / 1810 MHz under load</td></tr>
+    <tr><td><code>xrt::profile::user_event</code></td><td>ns markers</td>
+      <td><span class="tag t-ok">WORKS</span></td><td>writes a VTF trace; the one working XRT profiling API</td></tr>
+    <tr><td><code>get_aie_coredump()</code></td><td>bytes</td>
+      <td><span class="tag t-ok">WORKS</span></td><td>6 rows &times; 8 cols &times; 1 MiB = 50.3 MB, unprivileged</td></tr>
+    <tr><td><code>xrt::aie::profiling</code></td><td>&mdash;</td>
+      <td><span class="tag t-bad">THROWS</span></td><td>"Operation not supported" on NPU</td></tr>
+    <tr><td><code>Debug.aie_profile=true</code></td><td>&mdash;</td>
+      <td><span class="tag t-bad">SIGSEGV</span></td><td>crashes in <code>~AieProfilePlugin</code> at exit, 4/4</td></tr>
+    <tr><td><code>xrt-capture</code></td><td>&mdash;</td>
+      <td><span class="tag t-bad">INERT</span></td><td>output byte-identical to its input; manifest all null</td></tr>
+    <tr><td>tracepoints, debugfs</td><td>&mdash;</td>
+      <td><span class="tag t-no">ROOT</span></td><td>mode 0700; only one debugfs file exists anyway</td></tr>
+    <tr><td><code>SET_STATE</code> (pin clocks)</td><td>&mdash;</td>
+      <td><span class="tag t-bad">ROOT_ONLY</span></td><td>clocks are observable, <b>not settable</b></td></tr>
+  </table>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3>Per-dispatch NPU time &mdash; needs no new code</h3>
+      <pre>delta_ns      = Δ drm-engine-amdxdna_accel_driver
+delta_dispatch = Δ command_submissions        <span class="m">// GET_ARRAY HW_CONTEXT_ALL</span>
+<span class="n">mean_ns_per_dispatch</span> = delta_ns / delta_dispatch</pre>
+      <p class="note">Validated: 40.56 ms/dispatch from the counters against 40.6 ms of independent
+      host wait &mdash; <b>0.2% agreement</b>. This is the instrument the
+      <code>t_npu == 0.0000</code> timer was supposed to be.</p>
+    </div>
+    <div class="card">
+      <h3>Two traps, both measured</h3>
+      <p><b>1. The column-utilisation protocol has no size query.</b>
+      <code>amdxdna_query_sensors()</code> with <code>buffer_size == 0</code> returns rc 0 and
+      <b>zero bytes</b>. <code>utilities/npu-sensors.cpp</code> uses exactly that two-call protocol,
+      which is why it always reports 0 records. Pass a full 16-record buffer &rarr; 9 records return.</p>
+      <p><b>2. Utilisation has an ~8 s ramp.</b> It climbs 0&rarr;37&rarr;63&rarr;78&rarr;87&rarr;92&rarr;99&rarr;100%.
+      A 40-dispatch burst only reached 18%. <b>Warmup is mandatory</b> or every short run reads as idle
+      &mdash; which is exactly how this instrument gets wrongly declared broken.</p>
+      <p class="note">All 8 columns report the <i>identical</i> value: it is partition-wide, replicated
+      per column, not 8 distinguishable signals.</p>
+    </div>
+  </div>
+
+  <h2>The engagement proof that actually works</h2>
+  <div class="card">
+    <p>Not power. <b>Corrupt the instruction stream.</b></p>
+    <pre><span class="m">pristine   cd0ad90a2f20d7724e6b6c23e30eaffb  → completes, logits printed</span>
+<span class="m">corrupted  0adf1b4e3005ecd595780752eee28d56  → REFUSED: gemm_rtp: kernel state 5</span></pre>
+    <p>The device executed the corrupted instructions and reported a bad kernel state. No host fallback
+    can produce a device kernel state, so this is <b>direct proof of dispatch</b> &mdash; strictly
+    stronger than a timing or power signal, and it cannot be confounded by host work.</p>
+    <div class="warnbox" style="margin-bottom:0">
+      <b>A power dose-response does not work here, and I shipped one that appeared to.</b>
+      Scaling the batch scales the host attention too, so a rising reading may be entirely host work.
+      It would have passed with the encoder doing nothing on the NPU.
+    </div>
+  </div>
+</section>
+
+<!-- ==================== CORRECTIONS ==================== -->
+<section id="fix">
+  <p>Recorded because a reader should not have to rediscover them, and because two of them were mine.</p>
+
+  <div class="badbox">
+    <h3 style="margin-top:0;color:var(--bad)">Wrong: NPU power is 1000&times; too high</h3>
+    <p>I recorded a peak of "885 mW" and later read 1,041,000 as mW. <code>power1_input</code> is
+    <b>microwatts</b>. <code>amdxdna_sensors.c:144</code> computes
+    <code>*val = npu_power * MICROWATT_PER_MILLIWATT</code> where <code>npu_power</code> is a
+    <code>u16</code> in milliwatts. The real figure was <b>0.89&ndash;1.05 W</b>, and the field
+    <b>saturates at 65.5 W</b>, so a reading of exactly 1,048,575 &micro;W is a clipped field.
+    I had written "read the sysfs attribute's units" into a skill and then did not.</p>
+  </div>
+
+  <div class="badbox">
+    <h3 style="margin-top:0;color:var(--bad)">Wrong: the dispatch counters are inert</h3>
+    <p><code>drm-engine-amdxdna_accel_driver</code> tracks NPU occupancy to within <b>0.8%</b> over four
+    runs, and column utilisation reaches 100%. Neither is broken. The zero readings came from sampling
+    the <b>wrong process</b>: <code>pgrep -f layaacc</code> matched the bash wrapper, so 35 samples were
+    taken of a shell whose only device fd was <code>/dev/null</code>.</p>
+    <p class="note">The lesson was already in the skill I wrote that session &mdash; under a different
+    heading. The failure was reading my own rules and not applying them.</p>
+  </div>
+
+  <div class="badbox">
+    <h3 style="margin-top:0;color:var(--bad)">Wrong, then over-corrected: the IRON operator library</h3>
+    <p>I wrote a correction document asserting the operator list was fabricated because no
+    <code>operators/</code> directory exists. <b>It exists upstream</b> &mdash; cloned, with
+    <code>mha</code>, <code>rope</code>, <code>rms_norm</code>, <code>softmax</code>, <code>flm</code>
+    and the rest. The original survey was right about IRON and wrong about <i>this box</i>: the installed
+    <code>mlir_aie-1.4.2</code> predates the operator package. <b>A version gap, not a fabrication.</b>
+    Two survey errors in one session, and the second was a correction of the first.</p>
+  </div>
+
+  <div class="badbox">
+    <h3 style="margin-top:0;color:var(--bad)">Wrong: the Q-scaling bug caused the 0.60 agreement</h3>
+    <p>Written in the past tense, in a commit message and a skill, about a re-measurement that had not
+    happened. Measured, both arms: <b>36/60 = 0.600 either way</b>, residual 0.8434 &rarr; 0.6258. The
+    fix is real; it moved agreement by nothing. The disagreements are near-ties, and the fixture has
+    <b>no decided pair</b> (widest reference gap 0.0427 against a 0.20 threshold).</p>
+  </div>
+
+  <div class="warnbox">
+    <b>Right, and worth keeping: dispatch is proven.</b> By corruption, not by power. And there is
+    <b>no host fallback</b> &mdash; an empty design directory exits 1 in 0 s naming the
+    <code>design.json</code> it could not find, so the only route to an answer is through the AIE.
+  </div>
+</section>
+</div>
+
+<footer>
+  Generated 2026-10-01. Sources: driver <code>~/repos/xdna-driver</code> @ e2d8f83 &middot;
+  XRT 2.25.0 @ <code>/opt/xilinx/xrt</code> &middot; mlir-aie 1.4.2 &middot; IRON upstream @ 3fc9a60 &middot;
+  AMD's <i>Striking the Balance</i> (arXiv 2512.13282) &middot; Peano aie2p disassembly generated locally.
+  Hardware figures from <code>AIETargetModel.h</code>; instruction figures from disassembly, since AMD
+  publishes no XDNA2 architecture manual.
+</footer>
+
+<script>
+const OPS={
+ ln0:{t:"LayerNorm &mdash; site 0 (encoder input)",s:"CPU",
+   b:["<code>npue_encoder.hpp:3300</code> &mdash; <code>layer_norm(x, s_ln[0])</code>",
+      "The NPU branch <b>already exists</b>: <code>bind &rarr; bf16_fill &rarr; sync_to_device &rarr; dispatch_only &rarr; sync_from_device</code>.",
+      "Gated only by <code>host_ln</code>, forced <code>true</code> because the unified xclbin has no eltwise designs.",
+      "<b>Needs a build, not code.</b> <code>designs/ln/</code> is a fused add+norm parameterised by LN_N / LN_EPS; 768 is not among the 8 built widths.",
+      "<b>Trap:</b> LayerNorm needs <code>rsqrt</code>, which is scalar-only on AIE2P &mdash; 83 emitted ops per 32 lanes."]},
+ qkv:{t:"gemm(qkv) &mdash; fused QKV projection",s:"NPU",
+   b:["<code>npue_encoder.hpp:3327</code> &mdash; <code>[32768&times;768] @ [768&times;2304] &rarr; qkvbuf</code>",
+      "One dispatch per layer, <b>22 total</b>. bf16 operands, bf16 C.",
+      "This is the design set <code>BERT-h768-gated-i1152-bf16</code>, 12 streams = 4 shapes &times; 3 batch tiers.",
+      "Engagement proof: flip 36 bytes in <code>insts_qkv_b4.bin</code> &rarr; <code>REFUSED: gemm_rtp: kernel state 5</code>."]},
+ rope:{t:"apply_rope_qkv",s:"SKIPPED",
+   b:["Laya declares <code>position_embedding_type: sans_pos</code> &mdash; position enters nowhere.",
+      "<code>g_rope</code> is false, so this is compiled in and never taken.",
+      "<b>Relevant to the other two Laya checkpoints</b>, which declare <code>absolute</code> and carry RoPE (160000 full / 10000 sliding).",
+      "That per-layer theta split is <b>already handled</b>: <code>rope_local_base_freq</code> is written by the packer and read back to build separate local and global rope tables."]},
+ qk:{t:"qk &mdash; Q @ K<sup>T</sup>",s:"CPU",
+   b:["<code>npue_encoder.hpp:3337</code>, implemented at <code>:3070</code> as <code>qk()</code> &rarr; <code>qk_impl&lt;8&gt;</code> on head_dim 64.",
+      "<b>Zero</b> <code>dispatch_only</code> or <code>sync_to_device</code> in the body. There is no branch to enable &mdash; this must be written.",
+      "Writes <code>scores</code> = batch &times; heads &times; seq&sup2; fp32 = <b>1.61 GB</b> at batch 32.",
+      "Route (a): reuse <code>designs/whisper_fa/</code> at lq=lk=1024. Route (b): IRON <code>operators/mha</code>."]},
+ sm:{t:"softmax over the last score axis",s:"CPU",
+   b:["<code>npue_encoder.hpp:3343</code> in place; the NPU branch exists at <code>:3346</code> as <code>eltwise(softmax, ...)</code>.",
+      "Softmax is <b>the op that forces materialisation</b>. Keep it on the host and qk/av must keep the full matrix.",
+      "<b>Trap:</b> no horizontal-reduction instruction. Max and sum are O(log lanes) shuffle trees.",
+      "<b>Lucky fit:</b> seq is exactly 1024 and the installed softmax is a fixed 1024-tile kernel, so one tile = one query row and no cascade is needed."]},
+ av:{t:"av &mdash; probabilities @ V",s:"CPU",
+   b:["<code>npue_encoder.hpp:3350</code>, implemented at <code>:3168</code> as <code>av()</code> &rarr; <code>av_impl&lt;8&gt;</code>.",
+      "Also <b>zero</b> dispatch calls. This and <code>qk</code> are the whole of the attention work.",
+      "Together with qk these are 23.9% of the layer MACs and 100% of the O(seq&sup2;) memory."]},
+ ao:{t:"gemm(attn_out)",s:"NPU",
+   b:["<code>npue_encoder.hpp:3353</code> &mdash; <code>[32768&times;768] @ [768&times;768] &rarr; proj</code>",
+      "22 dispatches. Then <code>add_plain(x, proj)</code> at :3359 &mdash; <b>no norm</b>, which is the difference between pre-LN and post-LN."]},
+ add1:{t:"add_plain &mdash; attention residual",s:"CPU",
+   b:["<code>npue_encoder.hpp:3359</code>, deliberately <code>add_norm_bf16</code>'s opposite.",
+      "The fused <code>designs/ln</code> already absorbs this add into the norm, so if LayerNorm moves ",
+      "to the NPU this add rides along for free."]},
+ ln1:{t:"LayerNorm &mdash; pre-FFN",s:"CPU",
+   b:["<code>npue_encoder.hpp:3325</code> &mdash; <code>layer_norm(hbuf, s_ln[1 + 2*L])</code>",
+      "<b>45 LayerNorm dispatches</b> per request: 1 before the stack plus 2 per layer.",
+      "Same build story as site 0: code exists, artifact does not."]},
+ fu:{t:"gemm(ffn_up) &mdash; gated",s:"NPU",
+   b:["<code>npue_encoder.hpp:3363</code> &mdash; N = <code>2 &times; 1152 = 2304</code> when gated.",
+      "Laya is the reason this family is <b>gated with intermediate 1152</b>, not the usual 3072 for hidden-768.",
+      "The <b>gate half is packed SECOND</b> and moved first at load (<code>add_gemm_b_reorder_rows</code>)."]},
+ gelu:{t:"gelu_cpu &mdash; gated GeGLU",s:"CPU",
+   b:["<code>npue_encoder.hpp:3372</code>; the NPU branch exists at <code>:3374</code> as <code>eltwise(gelu, ...)</code>.",
+      "No design, no catalogue template. <b>Cheapest genuine kernel in the set.</b>",
+      "<code>vtanh</code> is a <b>native single instruction</b> on AIE2P, so a tanh-approximation GELU is ~2 vector ops plus a LUT bias."]},
+ fd:{t:"gemm(ffn_down)",s:"NPU",
+   b:["<code>npue_encoder.hpp:3374</code> &mdash; <code>[32768&times;1152] @ [1152&times;768] &rarr; down</code>",
+      "22 dispatches. K = 1152, which is why the family name carries <code>i1152</code>."]},
+ add2:{t:"add_plain &mdash; FFN residual",s:"CPU",
+   b:["<code>npue_encoder.hpp:3379</code>. After this the layer ends; <code>band_now</code> is reset to 0."]}
+};
+const $=s=>document.querySelector(s);
+function show(t){document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id===t));
+  document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
+  location.hash=t;}
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>show(b.dataset.t));
+if(location.hash)show(location.hash.slice(1));
+
+// layer buttons
+const lb=$('#layerBtns');
+for(let i=0;i<22;i++){const b=document.createElement('b');b.textContent=i;
+  if(i%3===0)b.className='g';b.onclick=()=>selectLayer(i);lb.appendChild(b);}
+function selectLayer(i){
+  document.querySelectorAll('#layerBtns b').forEach((b,j)=>{b.style.outline=(j===i)?'2px solid var(--info)':'none';});
+  const g=i%3===0;
+  $('#opDetail').innerHTML='<h4>Layer '+i+' &mdash; '+(g?'<span class="tag t-ok">global / full attention</span>':'<span class="tag t-warn">local &plusmn;64 band</span>')+'</h4>'+
+   '<p class="note">Per '+(g?'global_attn_every_n_layers: 3':'local_attention: 128, half_window 64')+
+   ' &mdash; read by the packer at <code>npue_pack.cpp:2219-2222</code>. Identical op sequence either way; '+
+   'only the mask applied to <code>scores</code> differs.</p>'+
+   '<p class="note">Banded layers only need '+('<b>16,641</b> of 1,048,576 score cells (1.59%)')+
+   ' &mdash; |i&minus;j| &le; 64 is 129 cells per row &times; 129 rows. But the mask is applied '+
+   '<i>on the host</i> during softmax, so a banded layer still materialises and walks the FULL '+
+   'matrix today. That is the single largest waste in the banded layers: 15 of 22 layers do 98% '+
+   'unnecessary work on the scores.</p>';
+}
+// op detail
+document.querySelectorAll('.op').forEach(o=>o.onclick=()=>{
+  const d=OPS[o.dataset.o];if(!d)return;
+  document.querySelectorAll('.op').forEach(x=>x.classList.toggle('sel',x===o));
+  const tag=d.s==='NPU'?'t-npu':(d.s==='CPU'?'t-cpu':'t-no');
+  $('#opDetail').innerHTML='<h4>'+d.t+' <span class="tag '+tag+'">'+d.s+'</span></h4><ul style="margin:0;padding-left:18px">'+
+    d.b.map(x=>'<li style="margin:5px 0">'+x+'</li>').join('')+'</ul>';
+});
+selectLayer(0);
+</script>
+</body>
+</html>
