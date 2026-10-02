@@ -29,14 +29,22 @@ Read these project references before changing NPU kernels or model engines:
    validates and does nothing), and this workstation's disk/RAM limits. Read it
    before adding a regression gate or running any build that writes gigabytes.
 
-7. `references/sources-and-standing.md` records which sources may be quoted for
+7. `references/xdna2-hardware-api-reference.md` is the consolidated reference for
+   implementing on XDNA2 / AIE2P (Strix Halo): part and target triple, array
+   geometry, memory and BD/lock limits, native vs emulated datatypes, the
+   pre-build constraint checklist, what telemetry actually works, the toolchain
+   and dependency matrix, and a worked activation-vs-parameter sizing example.
+   Read it **before** writing a kernel, so shape and portability constraints are
+   known in advance rather than discovered as a build failure.
+8. `references/sources-and-standing.md` records which sources may be quoted for
    NPU facts: the kernel driver's `amdnpu.rst` and in-tree `AIETargetModel.h` are
    authoritative; the Peano README names the `aie2` vs `aie2p` targets and the
    exposed-pipeline scheduling model; and two commonly-reached pages describe a
    *different* chip (AIE1 course notes, Versal AIE-ML marketing) and must not be
    merged into AIE2P numbers. Read it before quoting any hardware figure, because
    AMD publishes no XDNA2 architecture manual and the standing of the evidence
-   varies a lot by which number you mean.
+   varies a lot by which number you mean. The reference above applies that
+   standing to every figure it quotes.
 
 Required rules:
 

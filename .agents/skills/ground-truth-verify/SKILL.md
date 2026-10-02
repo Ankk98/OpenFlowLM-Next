@@ -143,6 +143,32 @@ Never:
    - A reading with no unit is a units bug until proven otherwise. A value in
      milliwatts compared against an expectation in watts is off by 1000 and
      reads as a hardware fault.
+   - **Documentation is rendered against some release, not necessarily yours.** A
+     vendor or kernel doc page states the version it was built from; your host
+     runs something else. Record both and treat the delta as unverified. Check
+     the running component's own reported version rather than assuming your
+     checkout matches it -- and the reverse: a checkout can sit at a commit the
+     running module never saw. Here the driver checkout and the running module
+     happened to agree exactly, which is worth confirming rather than assuming.
+   - **Resolve toolchain paths by globbing, never by hardcoding a version.**
+     Interpreter minor versions and package install roots both drift. An
+     `AGENTS.md` here named `python3.12` for a venv that had moved to `3.14`,
+     so the documented path did not exist. Glob, then *verify what you got* --
+     print the version, confirm the target triple you need is registered -- rather
+     than assuming the glob matched.
+   - **A version macro may not exist in the version you expect.** Two installs of
+     one library exposed disjoint macros, so a check written against the older
+     layout passed *vacuously* against the newer. Handle every layout you might
+     meet, and treat "macro absent" as a distinct outcome from "version wrong" --
+     they need different fixes. A silently-never-matching regex looks identical
+     to a missing file, so test the matcher against both layouts.
+   - **A hash field may not be a hash of the bytes.** A manifest's `oid` turned
+     out to be a git `blob_id`, which for LFS objects is the hash of the
+     *pointer*, so it cannot be reproduced from a download. Verify against the
+     field that is a content hash (`lfs.sha256`), and confirm your computed
+     digest equals the *live* upstream value. When your own verification
+     disagrees with a manifest, suspect the verification method first -- that is
+     what happened here, twice, before the files turned out to be correct.
 
 8. **No implementation and no bench** until every load-bearing claim has a
    quote with an SHA or a link. Write the stop conditions next to the claims, so
