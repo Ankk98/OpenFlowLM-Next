@@ -567,7 +567,7 @@ printf(<span class="m">"  designs    7 resident xclbins\n"</span>);   <span clas
       <div class="n">3</div>
       <div>
 
-        <h4>Attention qk / av <span class="tag t-code">THE REAL WORK</span></h4>
+        <h4>Attention qk / av <span class="tag t-ok">VALIDATED</span> <span class="pill">biggest win</span></h4>
         <p><code>qk()</code> (:3070) and <code>av()</code> (:3168) dispatch a
         <code>qk_impl&lt;8&gt;</code> on head_dim and have <b>zero</b> <code>dispatch_only</code> or
         <code>sync_to_device</code> anywhere in their bodies. There is no branch to enable.</p>
@@ -581,8 +581,23 @@ printf(<span class="m">"  designs    7 resident xclbins\n"</span>);   <span clas
         <p><b>(b) Upgrade ironvenv to current IRON and use <code>operators/mha</code></b>, which takes
         <code>num_heads</code>/<code>seq_len</code>/<code>num_KV_heads</code> and handles padding.
         This is the operator the original survey named.</p>
-        <p class="note">Both need one number first: is the padding mask a prefix?
-        <code>valid_len</code> is a prefix mask and Laya pads short states.</p>
+        <p class="note"><b>VALIDATED 2026-10-02.</b> Runs at state 4 in <b>3.93 ms</b> for 12 heads &times; seq 1024
+        &mdash; qk+softmax+av in one dispatch, no host round trip. Against a float64 reference:
+        max rel <b>2.93e-02</b>, p99 <b>9.89e-03</b>, cos <b>0.99962830</b>. The ~12&times; excess over the bf16
+        output floor (max 2.3e-03) is the documented bf16 score accumulation plus the bf16
+        online-softmax rescale factor. Harness: <code>make_test.py</code> + <code>compare_fa.py</code>,
+        beside the design.</p>
+        <p class="note"><b>Padding settled.</b> At compiled-in <code>valid_len=700</code> with 324 padded rows the
+        real rows still match a reference reading only rows [0,700), so the length mask works. The
+        output tail is <i>not</i> the kernel's job &mdash; the host calls <code>zero_pad_rows()</code> for it.</p>
+        <p class="note"><b>Two traps, both giving plausible-looking wrong answers.</b>
+        (i) <code>valid_len</code> is <code>CompileTime[int]</code>, baked via <code>-Dvalid_len=</code>. Feed a
+        different one and it does not error; it returns merely-shrunken numbers, and cosine being
+        scale-free sails through &mdash; I measured cos 0.99943 with max rel 0.208. Any
+        <code>CompileTime</code> shape needs a rebuild.
+        (ii) the kernel applies <code>1/sqrt(dk)</code> itself, so a harness that pre-scales Q
+        divides the scores by 8 twice; since 1/8 is a power of two it survives bf16 rounding
+        exactly, leaving the inputs looking fine and the output wrong (rms 0.60&times;, cos 0.667).</p>
       </div>
     </div>
     <div class="step build">
