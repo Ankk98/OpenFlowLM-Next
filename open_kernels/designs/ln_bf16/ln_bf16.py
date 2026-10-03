@@ -49,6 +49,18 @@ STATUS 2026-10-02 -- the kernel is right, the BUFFERING MODEL IS NOT.
   Until that is done, keep host_ln=true. designs/ln (fp32, add fused) is
   validated and is the only LN design the engine can drive.
 
+  This is also a structural finding, bigger than one kernel: no design in
+  open_kernels/designs/ ships the buffer convention the engine's eltwise paths
+  (LN, softmax, gelu) assume -- whole-buffer in arg0, weights chosen per-call
+  from the container via bind(arg1, slot), whole-buffer out in arg2, one
+  dispatch. Every existing design there is row-oriented with the weight passed
+  as a fixed buffer. Which is why the non-unified 7-design branch in
+  npue_encoder.hpp is dead: it names art/ + "/layernorm", "/softmax", "/gelu",
+  but none of those directories exists as a valid pair for its runtime model.
+  Wiring LayerNorm onto the NPU therefore means writing a new whole-buffer LN
+  kernel/design, plus the equivalent for softmax and gelu, not " dropping
+  in" designs/ln.
+
 Two IRON traps hit while building this, both of which surface as a func.call
 operand type mismatch rather than an assert:
 
